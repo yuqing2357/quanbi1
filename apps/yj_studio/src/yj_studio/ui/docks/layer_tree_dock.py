@@ -32,8 +32,14 @@ from yj_studio.scene.undo_commands import (
 from yj_studio.ui.text import layer_kind_label
 
 
+_LAYER_TREE_PRIMARY_KINDS = {
+    "horizon", "fault_surface", "well",
+    "reservoir_grid", "reservoir_property", "reservoir_selection",
+}
+
+
 class LayerTreeDock(QDockWidget):
-    """LayerTree with visibility, rename, right-click menu, all through QUndoStack."""
+    """Focused layer list for currently selected managed objects."""
 
     def __init__(
         self,
@@ -61,12 +67,16 @@ class LayerTreeDock(QDockWidget):
         layer_store.layer_removed.connect(self._remove_item)
         layer_store.layer_changed.connect(self._refresh_item)
         layer_store.selection_changed.connect(self._sync_selection)
+        self._refresh_visible_items(layer_store.selection)
 
     # ------------------------------------------------------------------ items
 
     def _add_item(self, layer_id: str) -> None:
         layer = self._layer_store.get(layer_id)
-        if _is_hidden_layer(layer):
+        if not self._should_show_layer(layer):
+            return
+        if layer_id in self._items:
+            self._set_item_values(self._items[layer_id], layer)
             return
         item = QTreeWidgetItem()
         item.setData(0, Qt.ItemDataRole.UserRole, layer_id)
@@ -86,15 +96,18 @@ class LayerTreeDock(QDockWidget):
 
     def _refresh_item(self, layer_id: str, _field: str) -> None:
         layer = self._layer_store.get(layer_id)
-        if _is_hidden_layer(layer):
+        if not self._should_show_layer(layer):
             self._remove_item(layer_id)
             return
         item = self._items.get(layer_id)
         if item is None:
+            self._add_item(layer_id)
+            self._sync_selection(list(self._layer_store.selection))
             return
         self._set_item_values(item, layer)
 
     def _set_item_values(self, item: QTreeWidgetItem, layer: Layer) -> None:
+        was_updating = self._updating
         self._updating = True
         try:
             item.setText(0, layer.name)
@@ -102,7 +115,42 @@ class LayerTreeDock(QDockWidget):
             item.setText(2, _layer_details(layer))
             item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
         finally:
-            self._updating = False
+            self._updating = was_updating
+
+    def _should_show_layer(self, layer: Layer) -> bool:
+        return (
+            not _is_hidden_layer(layer)
+            and layer.kind in _LAYER_TREE_PRIMARY_KINDS
+            and (layer.visible or layer.id in self._layer_store.selection)
+        )
+
+    def _refresh_visible_items(self, layer_ids: Iterable[str]) -> None:
+        selected_ids = set(layer_ids)
+        shown_ids: set[str] = set()
+        for layer in self._layer_store.iter_layers():
+            if (
+                not _is_hidden_layer(layer)
+                and layer.kind in _LAYER_TREE_PRIMARY_KINDS
+                and (layer.visible or layer.id in selected_ids)
+            ):
+                shown_ids.add(layer.id)
+
+        was_updating = self._updating
+        self._updating = True
+        try:
+            for layer_id in list(self._items):
+                if layer_id not in shown_ids:
+                    self._remove_item(layer_id)
+            for layer_id in shown_ids:
+                if layer_id not in self._items:
+                    self._add_item(layer_id)
+            for layer_id, item in self._items.items():
+                self._set_item_values(item, self._layer_store.get(layer_id))
+                item.setSelected(layer_id in selected_ids)
+            if shown_ids:
+                self.tree.resizeColumnToContents(0)
+        finally:
+            self._updating = was_updating
 
     # ------------------------------------------------------------------ user edits
 
@@ -147,13 +195,7 @@ class LayerTreeDock(QDockWidget):
         self._layer_store.select(layer_ids)
 
     def _sync_selection(self, layer_ids: list[str]) -> None:
-        self._updating = True
-        try:
-            selection = set(layer_ids)
-            for layer_id, item in self._items.items():
-                item.setSelected(layer_id in selection)
-        finally:
-            self._updating = False
+        self._refresh_visible_items(layer_ids)
 
     def _selected_layer_ids(self) -> list[str]:
         return [
@@ -168,10 +210,8 @@ class LayerTreeDock(QDockWidget):
         item = self.tree.itemAt(point)
         if item is None:
             return
-        selected = self._selected_layer_ids()
-        if not selected:
-            return
         primary_id = str(item.data(0, Qt.ItemDataRole.UserRole))
+        selected = self._selected_layer_ids()
         if primary_id not in selected:
             selected = [primary_id]
         try:
@@ -332,6 +372,16 @@ def _layer_details(layer: Layer) -> str:
         traces = layer.metadata.get("trace_count", "")
         z_range = layer.metadata.get("z_range", "")
         return f"道数：{traces}, Z范围：{z_range}"
+    if layer.kind == "reservoir_grid":
+        shape = getattr(layer, "shape", None)
+        mode = "总览" if getattr(layer, "use_downsampled", True) else "精细"
+        return f"网格：{shape}, 模式：{mode}"
+    if layer.kind == "reservoir_property":
+        return f"属性：{getattr(layer, 'property_name', '')}"
+    if layer.kind == "reservoir_selection":
+        n = getattr(layer, "n_cells", 0)
+        axis = getattr(layer, "source_axis", None) or "-"
+        return f"{n:,} 个单元 · 沿 {axis}"
     return ""
 
 

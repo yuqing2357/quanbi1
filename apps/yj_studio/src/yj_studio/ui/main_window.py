@@ -30,6 +30,8 @@ from yj_studio.scene.layers import (
     FaultSurfaceLayer,
     HorizonLayer,
     LithBodyLayer,
+    ReservoirGridLayer,
+    ReservoirPropertyLayer,
     VolumeLayer,
     WellLayer,
     WellLogLayer,
@@ -49,6 +51,7 @@ from yj_studio.ui.docks.fault_dock import FaultDock
 from yj_studio.ui.docks.horizon_dock import HorizonDock
 from yj_studio.ui.docks.layer_tree_dock import LayerTreeDock
 from yj_studio.ai import AIService, SAM3Config
+from yj_studio.reservoir import ReservoirRegistry
 from yj_studio.algorithms import AlgorithmRunner, registry as algorithm_registry
 from yj_studio.algorithms import builtin as _algorithm_builtin  # noqa: F401 — registers algorithms
 from yj_studio.ui.docks.ai_dock import AIDock
@@ -87,6 +90,12 @@ class MainWindow(QMainWindow):
         self.algorithm_runner.register_service("volume_store", self.volume_store)
         # Interactive AI prompt tools talk to the same service.
         self.tool_manager.register_service("ai_service", self.ai_service)
+        # Petrel reservoir grids live here. ReservoirGridLayer holds
+        # only a string grid_id; renderers and algorithms look the
+        # real ReservoirGrid up in this registry.
+        self.reservoir_registry = ReservoirRegistry()
+        self.algorithm_runner.register_service("reservoir_registry", self.reservoir_registry)
+        self.tool_manager.register_service("reservoir_registry", self.reservoir_registry)
         self.volume_specs: dict[str, VolumeSpec] = {}
         self._active_volume_layer_id: str | None = None
         self._loaded_horizon_paths: set[str] = set()
@@ -168,7 +177,12 @@ class MainWindow(QMainWindow):
             self._view_3d.volume_store = self.volume_store
             self._view_3d.view_sync = self.view_sync
             self._views_area.add_primary_view(self._view_3d, self.tr("三维"))
-            self._scene_controller = SceneController(self.layer_store, self.volume_store, self._view_3d)
+            self._scene_controller = SceneController(
+                self.layer_store,
+                self.volume_store,
+                self._view_3d,
+                reservoir_registry=self.reservoir_registry,
+            )
             return
 
         label = QLabel(self.tr("YJ Studio"))
@@ -180,6 +194,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu(self.tr("文件"))
         open_volume_action = file_menu.addAction(self.tr("打开体数据..."))
         open_volume_action.triggered.connect(self._open_volume_dialog)
+        open_reservoir_action = file_menu.addAction(self.tr("打开储层模型 (GRDECL)..."))
+        open_reservoir_action.triggered.connect(self._open_reservoir_dialog)
         file_menu.addSeparator()
         file_menu.addAction(self.tr("退出"), self.close)
 
@@ -200,6 +216,9 @@ class MainWindow(QMainWindow):
         z_action.triggered.connect(lambda: self._open_section("z"))
         arbitrary_action = view_menu.addAction(self.tr("新建任意剖面..."))
         arbitrary_action.triggered.connect(self._open_arbitrary_section_dialog)
+        view_menu.addSeparator()
+        reservoir_section_action = view_menu.addAction(self.tr("新建储层剖面"))
+        reservoir_section_action.triggered.connect(self._open_reservoir_section)
 
         help_menu = self.menuBar().addMenu(self.tr("帮助"))
         help_menu.addAction(self.tr("关于"), self._show_about)
@@ -890,6 +909,231 @@ class MainWindow(QMainWindow):
         if self._slice_controls is not None:
             self._slice_controls.set_volume_specs(self.volume_specs)
         self.load_volume(volume_id)
+
+    def _open_reservoir_dialog(self) -> None:
+        """Pick a master GRDECL, load it on a worker, add layers on success."""
+
+        from yj_studio.ui.dialogs.reservoir_load_dialog import run_reservoir_load_dialog
+
+        path_text, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr("打开储层模型"),
+            "",
+            self.tr("GRDECL 主文件 (*.GRDECL *.grdecl)"),
+        )
+        if not path_text:
+            return
+        master_path = Path(path_text)
+        # Filter out the include companions — the user should pick the
+        # master, not COORD/ZCORN/ACTNUM. We catch the common case here
+        # and warn; the loader itself will fail with a clearer error
+        # if it really is an include companion.
+        upper = master_path.name.upper()
+        if any(tag in upper for tag in ("_COORD", "_ZCORN", "_ACTNUM")):
+            QMessageBox.warning(
+                self,
+                self.tr("打开储层模型"),
+                self.tr(
+                    "选择的是 INCLUDE 子文件 ({name})。\n"
+                    "请选择 Petrel 导出的主 GRDECL 文件 (不带 _COORD/_ZCORN/_ACTNUM 后缀)。"
+                ).format(name=master_path.name),
+            )
+            return
+
+        grid = run_reservoir_load_dialog(self, master_path)
+        if grid is None:
+            return
+
+        grid_id = self.reservoir_registry.register(grid)
+        bounds = self._reservoir_bounds(grid)
+
+        # ROI seeded to the active-cell bbox: gives users a sensible
+        # initial window without having to drag a box, and lets every
+        # downstream consumer (2D section, 3D render, SAM3) speak in
+        # terms of a stable IJK frame from day one.
+        from yj_studio.reservoir import default_roi
+        initial_roi = default_roi(grid)
+
+        grid_layer = ReservoirGridLayer(
+            name=master_path.stem,
+            grid_id=grid_id,
+            master_path=str(master_path),
+            shape=grid.shape,
+            bounds=bounds,
+            color=(0.7, 0.7, 0.8, 1.0),
+            # Slightly translucent so SAM3 selection layers drawn
+            # inside the grid stay visible. Users can crank it back
+            # to 1.0 via the property dock if they want a solid look.
+            opacity=0.45,
+            roi=initial_roi,
+        )
+        self.layer_store.add(grid_layer)
+
+        # Default property layer: prefer LITHOLOGIES, otherwise the
+        # first available property. Skip silently if the grid has no
+        # properties at all (still useful as wireframe-only).
+        default_prop = None
+        for name in ("LITHOLOGIES", "PORO"):
+            if grid.has_property(name):
+                default_prop = name
+                break
+        if default_prop is None and grid.property_names():
+            default_prop = grid.property_names()[0]
+        if default_prop is not None:
+            arr = grid.property(default_prop)
+            is_int = bool(np.issubdtype(arr.dtype, np.integer))
+            prop_layer = ReservoirPropertyLayer(
+                name=f"{master_path.stem} · {default_prop}",
+                grid_layer_id=grid_layer.id,
+                grid_id=grid_id,
+                property_name=default_prop,
+                is_integer=is_int,
+                cmap=("tab10" if is_int else "viridis"),
+                clim=None if is_int else (float(arr.min()), float(arr.max())),
+            )
+            self.layer_store.add(prop_layer)
+
+        self.statusBar().showMessage(
+            self.tr("已加载储层模型：{name} ({nx}×{ny}×{nz}, {active:,} 活动单元)").format(
+                name=master_path.name,
+                nx=grid.shape[0], ny=grid.shape[1], nz=grid.shape[2],
+                active=int(grid.active.sum()),
+            )
+        )
+
+    def _open_reservoir_section(self) -> None:
+        """Open a 2D cell-section view for the first loaded reservoir grid."""
+
+        if self._views_area is None:
+            self.statusBar().showMessage(self.tr("视图尚未就绪"))
+            return
+        # Pick the first ReservoirGridLayer in the scene. Multi-grid
+        # selection UI is a future concern.
+        grid_layer = None
+        for layer in self.layer_store.iter_layers():
+            if isinstance(layer, ReservoirGridLayer):
+                grid_layer = layer
+                break
+        if grid_layer is None:
+            self.statusBar().showMessage(self.tr("请先加载储层模型 (GRDECL)"))
+            return
+        grid = self.reservoir_registry.get(grid_layer.grid_id)
+        if grid is None:
+            self.statusBar().showMessage(self.tr("储层模型未注册"))
+            return
+
+        from yj_studio.view.view_reservoir_section import ViewReservoirSection
+
+        view = ViewReservoirSection(
+            grid,
+            axis="i",
+            roi=grid_layer.roi,
+            parent=self._views_area,
+        )
+        # Forward this view's ROI changes to the layer + every other
+        # open reservoir section so the UI stays in lockstep.
+        view.roi_changed.connect(
+            lambda new_roi, gid=grid_layer.id: self._on_reservoir_roi_changed(gid, new_roi)
+        )
+        # When the user draws a box on this section, spin up a SAM3
+        # workbench bound to that ROI + propagation axis.
+        view.roi_drawn.connect(
+            lambda new_roi, axis, gid=grid_layer.id:
+                self._open_sam3_workbench(gid, new_roi, axis)
+        )
+        self._views_area.add_internal_section(
+            view,
+            title=view.title,
+            axis=view.axis,
+            index=view.index,
+        )
+
+    def _open_sam3_workbench(
+        self, grid_layer_id: str, roi: tuple, axis: str
+    ) -> None:
+        """Spin up a SAM3 workbench bound to ``roi`` on ``axis``.
+
+        The workbench renders ROI-scoped frames through the offscreen
+        ``render_roi_section`` pipeline, giving SAM3 a stable pixel
+        grid for prompts and (later) video propagation. Each draw on
+        a reservoir section opens its own workbench tab — users can
+        keep several experiments alive simultaneously.
+        """
+
+        if self._views_area is None:
+            return
+        layer = self.layer_store.get(grid_layer_id)
+        if not isinstance(layer, ReservoirGridLayer):
+            return
+        grid = self.reservoir_registry.get(layer.grid_id)
+        if grid is None:
+            return
+
+        from yj_studio.view.view_sam3_workbench import SAM3Workbench
+
+        wb = SAM3Workbench(
+            grid=grid,
+            roi=roi,
+            axis=axis,
+            ai_service=self.ai_service,
+            grid_layer_id=layer.id,
+            grid_id=layer.grid_id,
+            parent=self._views_area,
+        )
+        wb.selection_committed.connect(self._on_selection_committed)
+        self._views_area.add_internal_section(
+            wb,
+            title=wb.title,
+            axis=wb.axis,
+            index=wb.index,
+        )
+
+    def _on_selection_committed(self, layer) -> None:
+        """Add a SAM3-produced selection layer to the scene."""
+        self.layer_store.add(layer)
+        self.statusBar().showMessage(
+            self.tr("已添加储层选择图层：{name}").format(name=layer.name)
+        )
+
+    def _on_reservoir_roi_changed(self, grid_layer_id: str, new_roi: tuple) -> None:
+        """Push a new ROI onto the grid layer and broadcast to all open
+        reservoir section views referencing the same grid."""
+
+        try:
+            layer = self.layer_store.get(grid_layer_id)
+        except (KeyError, LookupError):
+            return
+        if not isinstance(layer, ReservoirGridLayer):
+            return
+        layer.roi = tuple(int(v) for v in new_roi)
+        # Iterate all open tabs and reframe any section view that
+        # belongs to this grid.
+        if self._views_area is not None:
+            from yj_studio.view.view_reservoir_section import ViewReservoirSection
+            for i in range(self._views_area.count()):
+                w = self._views_area.widget(i)
+                if isinstance(w, ViewReservoirSection) and w._grid.master_path == Path(layer.master_path):
+                    w.set_roi(layer.roi)
+
+    @staticmethod
+    def _reservoir_bounds(grid) -> tuple[float, float, float, float, float, float]:
+        """Derive a (xmin,xmax,ymin,ymax,zmin,zmax) bbox from the grid's COORD.
+
+        Uses pillar endpoints — these are exact bounds of the pillar
+        envelope, which is a superset of the actual cell envelope, so
+        the scene's bbox slightly overestimates. Good enough for camera
+        framing on first load.
+        """
+
+        coord = grid.coord
+        xs = np.concatenate([coord[..., 0].ravel(), coord[..., 3].ravel()])
+        ys = np.concatenate([coord[..., 1].ravel(), coord[..., 4].ravel()])
+        zs = np.concatenate([coord[..., 2].ravel(), coord[..., 5].ravel()])
+        return (
+            float(xs.min()), float(xs.max()),
+            float(ys.min()), float(ys.max()),
+            float(zs.min()), float(zs.max()),
+        )
 
     def _open_horizon_structure_map(self, layer_id: str) -> None:
         if self._views_area is None:

@@ -10,6 +10,9 @@ from .lith_body_layer import LithBodyLayer
 from .mask_layer import MaskLayer
 from .measurement_layer import MeasurementLayer
 from .polygon_layer import PolygonLayer
+from .reservoir_grid_layer import ReservoirGridLayer
+from .reservoir_property_layer import ReservoirPropertyLayer
+from .reservoir_selection_layer import ReservoirSelectionLayer
 from .trap_layer import TrapLayer
 from .volume_layer import VolumeLayer
 from .well_layer import WellLayer
@@ -26,6 +29,9 @@ __all__ = [
     "MaskLayer",
     "MeasurementLayer",
     "PolygonLayer",
+    "ReservoirGridLayer",
+    "ReservoirPropertyLayer",
+    "ReservoirSelectionLayer",
     "TrapLayer",
     "VolumeLayer",
     "WellLayer",

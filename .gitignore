@@ -8,6 +8,7 @@ pytest-tmp/
 build/
 apps/yj_studio/tests/_artifacts/
 apps/yj_studio/tests/_scratch/
+tools/_sam3_smoke_out/
 .venv/
 dist/
 *.egg-info/

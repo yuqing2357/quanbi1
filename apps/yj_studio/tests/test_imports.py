@@ -142,8 +142,10 @@ def test_well_layers_have_single_visible_entry() -> None:
     store = LayerStore()
     wells_dock = WellsDock(store)
     layer_tree = LayerTreeDock(store)
-    store.add(WellLayer(name="W1", well_name="W1", head_position=(1.0, 2.0, 3.0)))
-    store.add(
+    well_id = store.add(
+        WellLayer(name="W1", well_name="W1", head_position=(1.0, 2.0, 3.0), visible=False)
+    )
+    log_id = store.add(
         WellLogLayer(
             name="W1 POR",
             well_name="W1",
@@ -154,9 +156,88 @@ def test_well_layers_have_single_visible_entry() -> None:
 
     assert wells_dock.tree.topLevelItemCount() == 1
     assert wells_dock.tree.topLevelItem(0).text(0) == "W1"
+    assert layer_tree.tree.topLevelItemCount() == 0
+
+    store.select([well_id])
     assert layer_tree.tree.topLevelItemCount() == 1
-    assert layer_tree.tree.topLevelItem(0).text(1) == "well"
+    assert layer_tree.tree.topLevelItem(0).text(1) == "井"
+
+    store.select([log_id])
+    assert layer_tree.tree.topLevelItemCount() == 0
     wells_dock.close()
+    layer_tree.close()
+    app.quit()
+
+
+def test_layer_tree_shows_only_selected_managed_layers() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from yj_studio.app import create_application
+    from yj_studio.scene import LayerStore
+    from yj_studio.scene.layers import FaultSurfaceLayer, HorizonLayer, VolumeLayer, WellLayer
+    from yj_studio.ui.docks.layer_tree_dock import LayerTreeDock
+
+    app = create_application([])
+    store = LayerStore()
+    layer_tree = LayerTreeDock(store)
+    volume_id = store.add(VolumeLayer(name="cube", volume_id="cube", shape=(4, 5, 6)))
+    horizon_id = store.add(HorizonLayer(name="H1", visible=False))
+    fault_id = store.add(FaultSurfaceLayer(name="F1", visible=False))
+    well_id = store.add(
+        WellLayer(name="W1", well_name="W1", head_position=(1.0, 2.0, 3.0), visible=False)
+    )
+
+    store.select([volume_id, horizon_id, fault_id, well_id])
+
+    names = {
+        layer_tree.tree.topLevelItem(index).text(0)
+        for index in range(layer_tree.tree.topLevelItemCount())
+    }
+    labels = {
+        layer_tree.tree.topLevelItem(index).text(1)
+        for index in range(layer_tree.tree.topLevelItemCount())
+    }
+    assert names == {"H1", "F1", "W1"}
+    assert labels == {"层位", "断层面", "井"}
+    layer_tree.close()
+    app.quit()
+
+
+def test_layer_tree_shows_checked_managed_layers() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from yj_studio.app import create_application
+    from yj_studio.scene import LayerStore
+    from yj_studio.scene.layers import FaultSurfaceLayer, HorizonLayer, VolumeLayer, WellLayer
+    from yj_studio.ui.docks.layer_tree_dock import LayerTreeDock
+
+    app = create_application([])
+    store = LayerStore()
+    layer_tree = LayerTreeDock(store)
+    volume_id = store.add(
+        VolumeLayer(name="cube", volume_id="cube", shape=(4, 5, 6), visible=True)
+    )
+    horizon_id = store.add(HorizonLayer(name="H1", visible=False))
+    fault_id = store.add(FaultSurfaceLayer(name="F1", visible=False))
+    well_id = store.add(
+        WellLayer(name="W1", well_name="W1", head_position=(1.0, 2.0, 3.0), visible=False)
+    )
+
+    store.update(horizon_id, visible=True)
+    store.update(fault_id, visible=True)
+    store.update(well_id, visible=True)
+    store.select([volume_id])
+
+    names = {
+        layer_tree.tree.topLevelItem(index).text(0)
+        for index in range(layer_tree.tree.topLevelItemCount())
+    }
+    assert names == {"H1", "F1", "W1"}
+
+    store.update(fault_id, visible=False)
+    names = {
+        layer_tree.tree.topLevelItem(index).text(0)
+        for index in range(layer_tree.tree.topLevelItemCount())
+    }
+    assert names == {"H1", "W1"}
     layer_tree.close()
     app.quit()
 
