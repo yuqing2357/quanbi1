@@ -10,7 +10,7 @@ from yj_studio.tools.tool import InteractionTool
 
 class MeasureTool(InteractionTool):
     def __init__(self) -> None:
-        super().__init__(id="measure", label="Measure", icon="ruler", cursor="crosshair")
+        super().__init__(id="measure", label="测量", icon="ruler", cursor="crosshair")
         self._points: list[tuple[float, float, float]] = []
 
     def activate(self, view) -> None:
@@ -26,7 +26,7 @@ class MeasureTool(InteractionTool):
         if point is None:
             return False
         self._points.append(point)
-        tool_notify(view, f"Measure points: {len(self._points)}")
+        tool_notify(view, f"测量点数：{len(self._points)}")
         return True
 
     def on_mouse_double_click(self, view, event) -> bool:
@@ -37,7 +37,7 @@ class MeasureTool(InteractionTool):
         geometry = np.asarray(self._points, dtype=np.float32)
         values, units = self._measure_values(view, geometry)
         layer = MeasurementLayer(
-            name=next_layer_name(layer_store, "Measurement"),
+            name=next_layer_name(layer_store, "测量"),
             geometry=geometry,
             values=values,
             units=units,
@@ -57,7 +57,7 @@ class MeasureTool(InteractionTool):
         key = getattr(event, "key", "")
         if key in {"escape", "esc"}:
             self._points = []
-            tool_notify(view, "Measurement cleared")
+            tool_notify(view, "测量已清除")
             return True
         return False
 
@@ -81,7 +81,7 @@ class MeasureTool(InteractionTool):
 
     def _measure_message(self, values: dict[str, float]) -> str:
         if "area" in values:
-            return f"Area: {values['area']:.3f}"
+            return f"面积：{values['area']:.3f}"
         if "distance" in values:
-            return f"Distance: {values['distance']:.3f}"
-        return "Measurement completed"
+            return f"距离：{values['distance']:.3f}"
+        return "测量已完成"

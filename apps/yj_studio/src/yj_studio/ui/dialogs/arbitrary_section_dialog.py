@@ -41,7 +41,7 @@ class ArbitrarySectionDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("New Arbitrary Section")
+        self.setWindowTitle("新建任意剖面")
         self._shape = shape
         self._topdown_image = _valid_topdown_image(topdown_image, shape)
         self._topdown_cmap = topdown_cmap
@@ -50,7 +50,7 @@ class ArbitrarySectionDialog(QDialog):
         self._hover_point: tuple[float, float] | None = None
 
         layout = QVBoxLayout(self)
-        self.status_label = QLabel("Left click to add points. Right click or Undo removes the last point.")
+        self.status_label = QLabel("左键添加点，右键或撤销删除最后一个点。")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
@@ -74,15 +74,15 @@ class ArbitrarySectionDialog(QDialog):
         self.snap_radius = QSpinBox(self)
         self.snap_radius.setRange(0, 100)
         self.snap_radius.setValue(8)
-        form.addRow("Z start", self.z_start)
-        form.addRow("Z end", self.z_end)
-        form.addRow("Max traces", self.max_traces)
-        form.addRow("Snap radius", self.snap_radius)
+        form.addRow("起始 Z", self.z_start)
+        form.addRow("结束 Z", self.z_end)
+        form.addRow("最大道数", self.max_traces)
+        form.addRow("吸附半径", self.snap_radius)
         layout.addLayout(form)
 
-        undo_button = QPushButton("Undo", self)
+        undo_button = QPushButton("撤销", self)
         undo_button.clicked.connect(self._undo_point)
-        clear_button = QPushButton("Clear", self)
+        clear_button = QPushButton("清空", self)
         clear_button.clicked.connect(self._clear_points)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -104,13 +104,13 @@ class ArbitrarySectionDialog(QDialog):
 
     def accept(self) -> None:
         if len(self._points) < 2:
-            QMessageBox.warning(self, "New Arbitrary Section", "Draw at least two points on the map.")
+            QMessageBox.warning(self, "新建任意剖面", "请至少在地图上绘制两个点。")
             return
         super().accept()
 
     def polyline(self) -> np.ndarray:
         if len(self._points) < 2:
-            raise ValueError("Draw at least two points on the map.")
+            raise ValueError("请至少在地图上绘制两个点。")
         return np.asarray(self._points, dtype=np.float32)
 
     def _on_button_press(self, event) -> None:
@@ -170,9 +170,9 @@ class ArbitrarySectionDialog(QDialog):
             self._axes.set_facecolor("#202124")
         self._axes.set_xlim(0.0, float(max(0, nx - 1)))
         self._axes.set_ylim(0.0, float(max(0, ny - 1)))
-        self._axes.set_xlabel("Inline")
-        self._axes.set_ylabel("Xline")
-        self._axes.set_title("Top View Section Path")
+        self._axes.set_xlabel("纵向线号")
+        self._axes.set_ylabel("横向线号")
+        self._axes.set_title("顶视图剖面路径")
         self._draw_wells()
         (self._line_artist,) = self._axes.plot([], [], color="#ffb000", linewidth=2.2, zorder=5)
         self._point_artist = self._axes.scatter([], [], c="#ffb000", s=36, edgecolors="black", zorder=6)
@@ -221,11 +221,11 @@ class ArbitrarySectionDialog(QDialog):
             self._canvas.draw()
 
     def _set_status(self, well: WellMapPoint | None) -> None:
-        prefix = f"{len(self._points)} point(s)"
+        prefix = f"{len(self._points)} 个点"
         if well is None:
-            self.status_label.setText(f"{prefix}. Left click to add points. Right click or Undo removes the last point.")
+            self.status_label.setText(f"{prefix}。左键添加点，右键或撤销删除最后一个点。")
             return
-        self.status_label.setText(f"{prefix}. Snapped to well {well.name}.")
+        self.status_label.setText(f"{prefix}。已吸附到井 {well.name}。")
 
 
 def snap_point_to_well(
@@ -254,10 +254,10 @@ def parse_polyline_text(text: str) -> np.ndarray:
         line = line.replace(";", ",").replace("\t", ",")
         parts = [part.strip() for part in line.split(",") if part.strip()]
         if len(parts) < 2:
-            raise ValueError(f"Expected inline,xline: {raw_line!r}")
+            raise ValueError(f"应为 纵向线号,横向线号：{raw_line!r}")
         points.append((float(parts[0]), float(parts[1])))
     if len(points) < 2:
-        raise ValueError("Enter at least two inline,xline points.")
+        raise ValueError("请至少输入两个 纵向线号,横向线号 点。")
     return np.asarray(points, dtype=np.float32)
 
 

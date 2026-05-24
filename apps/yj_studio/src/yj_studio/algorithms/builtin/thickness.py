@@ -18,12 +18,12 @@ from yj_studio.scene.layers import HorizonLayer, MeasurementLayer
 class ThicknessParams(BaseModel):
     depth_step_m: float = Field(
         default=DEPTH_STEP_TO_SAMPLE,
-        description="Metres per sample. Used to convert sample-distance to thickness in metres.",
+        description="每个采样点对应的米数，用于把采样差换算为米。",
         gt=0.0,
     )
     name: str = Field(
-        default="Thickness",
-        description="Display name for the resulting measurement layer.",
+        default="层间厚度",
+        description="结果测量图层的显示名称。",
     )
 
 
@@ -40,12 +40,11 @@ class ThicknessOutput(BaseModel):
 class ThicknessAlgorithm(Algorithm):
     id: ClassVar[str] = "horizon.thickness"
     category: ClassVar[str] = "horizon"
-    label: ClassVar[str] = "Interval Thickness"
+    label: ClassVar[str] = "层间厚度"
     description: ClassVar[str] = (
-        "Compute pointwise thickness between a top and bottom horizon, both"
-        " expressed in sample indices. Outputs a MeasurementLayer with the"
-        " thickness grid (geometry: (N, 4) = inline, xline, z_top, z_bottom)"
-        " and aggregate statistics in metres."
+        "计算上下两层位之间的点厚度。层位坐标均以采样索引表示，输出一"
+        "个 MeasurementLayer，包含厚度网格（geometry: (N, 4) = 纵向、"
+        "横向、顶层 Z、底层 Z）以及以米为单位的统计值。"
     )
     input_schema: ClassVar[type[BaseModel]] = ThicknessParams
     output_schema: ClassVar[type[BaseModel]] = ThicknessOutput
@@ -55,16 +54,16 @@ class ThicknessAlgorithm(Algorithm):
         top_layer = ctx.input_layers.get("top")
         bottom_layer = ctx.input_layers.get("bottom")
         if not isinstance(top_layer, HorizonLayer) or top_layer.sample is None:
-            return AlgorithmResult.failure("Top horizon is missing sample data")
+            return AlgorithmResult.failure("上层位缺少样点数据")
         if not isinstance(bottom_layer, HorizonLayer) or bottom_layer.sample is None:
-            return AlgorithmResult.failure("Bottom horizon is missing sample data")
+            return AlgorithmResult.failure("下层位缺少样点数据")
         if top_layer.sample.shape != bottom_layer.sample.shape:
             return AlgorithmResult.failure(
-                f"Horizon shapes differ: top {top_layer.sample.shape} vs"
-                f" bottom {bottom_layer.sample.shape}"
+                f"层位形状不一致：上层 {top_layer.sample.shape}，"
+                f"下层 {bottom_layer.sample.shape}"
             )
 
-        ctx.report_progress(0.1, "Reading horizons")
+        ctx.report_progress(0.1, "读取层位")
         top = np.asarray(top_layer.sample, dtype=np.float32)
         bot = np.asarray(bottom_layer.sample, dtype=np.float32)
 
@@ -78,11 +77,11 @@ class ThicknessAlgorithm(Algorithm):
         thickness_samples = np.where(valid, bot - top, np.nan)
         thickness_m = thickness_samples * float(ctx.params.depth_step_m)
 
-        ctx.report_progress(0.5, "Aggregating statistics")
+        ctx.report_progress(0.5, "汇总统计")
         valid_cells = int(np.sum(valid))
         coverage = float(valid_cells) / float(valid.size) if valid.size else 0.0
         if valid_cells == 0:
-            return AlgorithmResult.failure("No overlapping valid points between the two horizons")
+            return AlgorithmResult.failure("两层位之间没有重叠的有效点")
 
         finite_values = thickness_m[valid]
         stats = ThicknessOutput(
@@ -94,7 +93,7 @@ class ThicknessAlgorithm(Algorithm):
             valid_cells=valid_cells,
         )
 
-        ctx.report_progress(0.8, "Building geometry")
+        ctx.report_progress(0.8, "构建几何")
         rows, cols = np.where(valid)
         geometry = np.column_stack(
             [
@@ -107,7 +106,7 @@ class ThicknessAlgorithm(Algorithm):
         )
 
         measurement = MeasurementLayer(
-            name=ctx.params.name or "Thickness",
+            name=ctx.params.name or "层间厚度",
             geometry=geometry,
             values={
                 "mean_m": stats.mean_m,
@@ -141,10 +140,10 @@ class ThicknessAlgorithm(Algorithm):
             },
         )
 
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         summary = (
-            f"Thickness {ctx.params.name}: mean={stats.mean_m:.1f} m, "
-            f"range=[{stats.min_m:.1f}, {stats.max_m:.1f}] m, "
-            f"coverage={stats.coverage * 100:.1f}%"
+            f"厚度 {ctx.params.name}: 平均={stats.mean_m:.1f} m，"
+            f"范围=[{stats.min_m:.1f}, {stats.max_m:.1f}] m，"
+            f"覆盖率={stats.coverage * 100:.1f}%"
         )
         return AlgorithmResult.success(output_layers=[measurement], summary=summary)

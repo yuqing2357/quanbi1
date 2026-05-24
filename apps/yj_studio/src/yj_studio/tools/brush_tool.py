@@ -52,7 +52,7 @@ class _MaskEditTool(InteractionTool):
         key = getattr(event, "key", "")
         if key in {"escape", "esc"}:
             self._painting = False
-            tool_notify(view, "Painting cancelled")
+            tool_notify(view, "绘制已取消")
             return True
         return False
 
@@ -62,7 +62,7 @@ class _MaskEditTool(InteractionTool):
             return False
         context = slice_context_from_event(view, event, prefer_mouse=prefer_mouse)
         if context is None:
-            tool_notify(view, "Load a volume before painting")
+            tool_notify(view, "请先加载体数据再绘制")
             return False
         mask_layer = ensure_mask_layer(
             layer_store,
@@ -82,4 +82,4 @@ class _MaskEditTool(InteractionTool):
 
 class BrushTool(_MaskEditTool):
     def __init__(self) -> None:
-        super().__init__(tool_id="brush", label="Brush", icon="brush")
+        super().__init__(tool_id="brush", label="画笔", icon="brush")

@@ -41,6 +41,7 @@ from yj_studio.algorithms.runner import AlgorithmRunner, AlgorithmTask
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.undo_commands import AddLayerCommand
 from yj_studio.ui.widgets.schema_form import SchemaForm
+from yj_studio.ui.text import algorithm_category_label, parameter_role_label
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class AlgorithmDock(QDockWidget):
         *,
         undo_stack: QUndoStack | None = None,
     ) -> None:
-        super().__init__("Algorithms", parent)
+        super().__init__("算法", parent)
         self._layer_store = layer_store
         self._registry = registry
         self._runner = runner
@@ -70,7 +71,7 @@ class AlgorithmDock(QDockWidget):
         splitter = QSplitter(Qt.Orientation.Vertical, body)
 
         self._tree = QTreeWidget(splitter)
-        self._tree.setHeaderLabels(["Algorithm"])
+        self._tree.setHeaderLabels(["算法"])
         self._tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         splitter.addWidget(self._tree)
 
@@ -86,9 +87,9 @@ class AlgorithmDock(QDockWidget):
         details_layout.addWidget(self._form, 1)
 
         controls = QHBoxLayout()
-        self._run_button = QPushButton("Run", details)
+        self._run_button = QPushButton("运行", details)
         self._run_button.clicked.connect(self._on_run_clicked)
-        self._cancel_button = QPushButton("Cancel", details)
+        self._cancel_button = QPushButton("取消", details)
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self._on_cancel_clicked)
         controls.addWidget(self._run_button)
@@ -125,7 +126,7 @@ class AlgorithmDock(QDockWidget):
         for cls in sorted(self._registry.iter_algorithms(), key=lambda c: (c.category, c.label)):
             parent = groups.get(cls.category)
             if parent is None:
-                parent = QTreeWidgetItem([cls.category.title()])
+                parent = QTreeWidgetItem([algorithm_category_label(cls.category)])
                 self._tree.addTopLevelItem(parent)
                 groups[cls.category] = parent
             item = QTreeWidgetItem([cls.label])
@@ -163,7 +164,7 @@ class AlgorithmDock(QDockWidget):
             return
         error = self._form.validate()
         if error:
-            QMessageBox.warning(self, "Algorithm parameters", error)
+            QMessageBox.warning(self, "算法参数", error)
             return
         collected = self._form.collect()
         layers = {}
@@ -171,7 +172,11 @@ class AlgorithmDock(QDockWidget):
             try:
                 layers[role] = self._layer_store.get(layer_id)
             except KeyError:
-                QMessageBox.warning(self, "Algorithm parameters", f"Layer for role '{role}' missing")
+                QMessageBox.warning(
+                    self,
+                    "算法参数",
+                    f"缺少角色“{parameter_role_label(role)}”对应的图层",
+                )
                 return
 
         self._summary_label.setText("")
@@ -200,7 +205,7 @@ class AlgorithmDock(QDockWidget):
         self._progress.setValue(100)
         if output_layers:
             if self._undo_stack is not None:
-                self._undo_stack.beginMacro(f"Run {self._algorithm_label_for_undo()}")
+                self._undo_stack.beginMacro(f"运行 {self._algorithm_label_for_undo()}")
                 try:
                     for layer in output_layers:
                         self._undo_stack.push(AddLayerCommand(self._layer_store, layer))
@@ -209,19 +214,19 @@ class AlgorithmDock(QDockWidget):
             else:
                 for layer in output_layers:
                     self._layer_store.add(layer)
-        self._summary_label.setText(summary or f"Produced {len(output_layers)} layer(s).")
+        self._summary_label.setText(summary or f"已生成 {len(output_layers)} 个图层。")
 
     def _algorithm_label_for_undo(self) -> str:
-        return self._current_algorithm.label if self._current_algorithm else "algorithm"
+        return self._current_algorithm.label if self._current_algorithm else "算法"
 
     def _on_errored(self, message: str, traceback_text: str) -> None:
         self._reset_buttons()
-        self._summary_label.setText(f"Error: {message}")
+        self._summary_label.setText(f"错误：{message}")
         logger.error("Algorithm error: %s\n%s", message, traceback_text)
 
     def _on_cancelled(self) -> None:
         self._reset_buttons()
-        self._summary_label.setText("Cancelled")
+        self._summary_label.setText("已取消")
 
     def _reset_buttons(self) -> None:
         self._run_button.setEnabled(self._current_algorithm is not None)

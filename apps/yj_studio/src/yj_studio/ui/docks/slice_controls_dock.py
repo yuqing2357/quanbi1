@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from yj_studio.io.readers.volume_npy import VolumeSpec
+from yj_studio.ui.text import section_axis_label
 
 
 class SliceControlsDock(QDockWidget):
@@ -30,7 +31,7 @@ class SliceControlsDock(QDockWidget):
     roi_changed = pyqtSignal(object)  # tuple[int]*6 or None
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Slice Controls", parent)
+        super().__init__("剖面控制", parent)
         self._sliders: dict[str, QSlider] = {}
         self._labels: dict[str, QLabel] = {}
         self._volume_specs: dict[str, VolumeSpec] = {}
@@ -132,22 +133,22 @@ class SliceControlsDock(QDockWidget):
         form = QFormLayout()
         self.volume_combo = QComboBox(root)
         self.volume_combo.currentIndexChanged.connect(self._emit_volume_changed)
-        form.addRow("Volume", self.volume_combo)
+        form.addRow("体数据", self.volume_combo)
 
         self.cmap_combo = QComboBox(root)
         self.cmap_combo.addItems(["Petrel", "gray", "seismic", "viridis", "turbo", "hsv", "RdBu", "tab10"])
         self.cmap_combo.currentTextChanged.connect(self.cmap_changed.emit)
-        form.addRow("CMap", self.cmap_combo)
+        form.addRow("色图", self.cmap_combo)
 
         self.clim_min = _clim_spinbox(root)
         self.clim_max = _clim_spinbox(root)
         self.clim_min.valueChanged.connect(self._emit_clim_changed)
         self.clim_max.valueChanged.connect(self._emit_clim_changed)
-        form.addRow("Min", self.clim_min)
-        form.addRow("Max", self.clim_max)
+        form.addRow("最小", self.clim_min)
+        form.addRow("最大", self.clim_max)
         layout.addLayout(form)
 
-        group = QGroupBox("Slices", root)
+        group = QGroupBox("剖面位置", root)
         group_layout = QFormLayout(group)
         for axis in ("inline", "xline", "z"):
             slider = QSlider(Qt.Orientation.Horizontal, group)
@@ -160,19 +161,19 @@ class SliceControlsDock(QDockWidget):
             row_layout.addWidget(value_label)
             self._sliders[axis] = slider
             self._labels[axis] = value_label
-            group_layout.addRow(axis.title(), row)
+            group_layout.addRow(section_axis_label(axis), row)
         layout.addWidget(group)
 
-        roi_group = QGroupBox("ROI Clipping", root)
+        roi_group = QGroupBox("ROI 裁剪", root)
         roi_layout = QGridLayout(roi_group)
-        self._roi_enable = QCheckBox("Enable", roi_group)
+        self._roi_enable = QCheckBox("启用", roi_group)
         self._roi_enable.toggled.connect(self._on_roi_toggled)
         roi_layout.addWidget(self._roi_enable, 0, 0, 1, 3)
         self._roi_spins: dict[str, QSpinBox] = {}
         labels_grid = [
-            ("Inline", "i0", "i1", 1),
-            ("Xline", "j0", "j1", 2),
-            ("Z", "k0", "k1", 3),
+            ("纵向", "i0", "i1", 1),
+            ("横向", "j0", "j1", 2),
+            ("Z向", "k0", "k1", 3),
         ]
         for label_text, lo_key, hi_key, row in labels_grid:
             roi_layout.addWidget(QLabel(label_text, roi_group), row, 0)
@@ -185,7 +186,7 @@ class SliceControlsDock(QDockWidget):
                 self._roi_spins[key] = spin
             roi_layout.addWidget(lo, row, 1)
             roi_layout.addWidget(hi, row, 2)
-        reset_btn = QPushButton("Reset ROI", roi_group)
+        reset_btn = QPushButton("重置 ROI", roi_group)
         reset_btn.clicked.connect(self._reset_roi)
         roi_layout.addWidget(reset_btn, 4, 0, 1, 3)
         layout.addWidget(roi_group)

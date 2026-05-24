@@ -11,7 +11,7 @@ class _BaseStickTool(InteractionTool):
     layer_cls = HorizonStickLayer
     points_field = "points"
     layer_key = "stick"
-    layer_title = "Stick"
+    layer_title = "层位杆"
     layer_color = (0.95, 0.7, 0.1, 0.95)
 
     def __init__(self, *, tool_id: str, label: str, icon: str) -> None:
@@ -36,7 +36,7 @@ class _BaseStickTool(InteractionTool):
     def on_mouse_double_click(self, view, event) -> bool:
         if self._layer_id is None:
             return False
-        tool_notify(view, f"{self.label} completed")
+        tool_notify(view, f"{self.label} 已完成")
         self._layer_id = None
         return True
 
@@ -44,7 +44,7 @@ class _BaseStickTool(InteractionTool):
         key = getattr(event, "key", "")
         if key in {"escape", "esc"}:
             self._layer_id = None
-            tool_notify(view, f"{self.label} cleared")
+            tool_notify(view, f"{self.label} 已清除")
             return True
         return False
 
@@ -60,7 +60,7 @@ class _BaseStickTool(InteractionTool):
             new_points = np.vstack([np.asarray(points, dtype=np.float32), np.asarray(point, dtype=np.float32)])
         layer_store.update(layer.id, **{self.points_field: new_points})
         layer_store.select([layer.id])
-        tool_notify(view, f"{self.label} points: {len(new_points)}")
+        tool_notify(view, f"{self.label} 点数：{len(new_points)}")
 
     def _layer(self, layer_store):
         if self._layer_id is not None:
@@ -83,4 +83,4 @@ class _BaseStickTool(InteractionTool):
 
 class HorizonStickTool(_BaseStickTool):
     def __init__(self) -> None:
-        super().__init__(tool_id="horizon_stick", label="Horizon Stick", icon="pin")
+        super().__init__(tool_id="horizon_stick", label="层位杆", icon="pin")

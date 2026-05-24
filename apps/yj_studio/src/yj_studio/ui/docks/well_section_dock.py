@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import WellLayer
+from yj_studio.ui.text import well_display_mode_label
 
 
 class WellSectionDock(QDockWidget):
@@ -23,24 +24,24 @@ class WellSectionDock(QDockWidget):
     build_requested = pyqtSignal(list, str)
 
     def __init__(self, layer_store: LayerStore, parent: QWidget | None = None) -> None:
-        super().__init__("Well Section", parent)
+        super().__init__("井剖面", parent)
         self._layer_store = layer_store
         self._items: dict[str, QListWidgetItem] = {}
 
         content = QWidget(self)
         layout = QVBoxLayout(content)
-        layout.addWidget(QLabel("Select wells", content))
+        layout.addWidget(QLabel("选择井", content))
 
         self.list_widget = QListWidget(content)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         layout.addWidget(self.list_widget)
 
         self.mode_box = QComboBox(content)
-        self.mode_box.addItem("Lithology", "lith")
-        self.mode_box.addItem("Porosity", "por")
+        self.mode_box.addItem(well_display_mode_label("lith"), "lith")
+        self.mode_box.addItem(well_display_mode_label("por"), "por")
         layout.addWidget(self.mode_box)
 
-        build_button = QPushButton("Open Section", content)
+        build_button = QPushButton("打开剖面", content)
         build_button.clicked.connect(self._emit_build_requested)
         layout.addWidget(build_button)
         self.setWidget(content)

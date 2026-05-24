@@ -29,6 +29,7 @@ from yj_studio.scene.undo_commands import (
     SetVisibleCommand,
     SplitLayerCommand,
 )
+from yj_studio.ui.text import layer_kind_label
 
 
 class LayerTreeDock(QDockWidget):
@@ -41,14 +42,14 @@ class LayerTreeDock(QDockWidget):
         *,
         undo_stack: QUndoStack | None = None,
     ) -> None:
-        super().__init__("Layers", parent)
+        super().__init__("图层", parent)
         self._layer_store = layer_store
         self._undo_stack = undo_stack
         self._items: dict[str, QTreeWidgetItem] = {}
         self._updating = False
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Type", "Details"])
+        self.tree.setHeaderLabels(["名称", "类型", "详情"])
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
@@ -97,7 +98,7 @@ class LayerTreeDock(QDockWidget):
         self._updating = True
         try:
             item.setText(0, layer.name)
-            item.setText(1, layer.kind)
+            item.setText(1, layer_kind_label(layer.kind))
             item.setText(2, _layer_details(layer))
             item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
         finally:
@@ -129,7 +130,7 @@ class LayerTreeDock(QDockWidget):
             return
         macro = self._undo_stack is not None and changes_visible and changes_name
         if macro:
-            self._undo_stack.beginMacro(self.tr("Edit layer"))
+            self._undo_stack.beginMacro(self.tr("编辑图层"))
         try:
             if changes_visible:
                 self._push(SetVisibleCommand(self._layer_store, layer_id, new_visible))
@@ -179,16 +180,16 @@ class LayerTreeDock(QDockWidget):
             return
 
         menu = QMenu(self)
-        rename_action = menu.addAction(self.tr("Rename..."))
-        color_action = menu.addAction(self.tr("Color..."))
-        opacity_action = menu.addAction(self.tr("Opacity..."))
+        rename_action = menu.addAction(self.tr("重命名..."))
+        color_action = menu.addAction(self.tr("颜色..."))
+        opacity_action = menu.addAction(self.tr("透明度..."))
         menu.addSeparator()
-        merge_action = menu.addAction(self.tr("Merge selected"))
+        merge_action = menu.addAction(self.tr("合并所选"))
         merge_action.setEnabled(self._can_merge(selected))
-        split_action = menu.addAction(self.tr("Split"))
+        split_action = menu.addAction(self.tr("拆分"))
         split_action.setEnabled(self._can_split(primary))
         menu.addSeparator()
-        delete_action = menu.addAction(self.tr("Delete"))
+        delete_action = menu.addAction(self.tr("删除"))
 
         chosen = menu.exec(self.tree.viewport().mapToGlobal(point))
         if chosen is None:
@@ -208,7 +209,7 @@ class LayerTreeDock(QDockWidget):
 
     def _action_rename(self, layer: Layer) -> None:
         new_name, ok = QInputDialog.getText(
-            self, self.tr("Rename layer"), self.tr("New name:"), text=layer.name
+            self, self.tr("重命名图层"), self.tr("新名称："), text=layer.name
         )
         if not ok:
             return
@@ -223,7 +224,7 @@ class LayerTreeDock(QDockWidget):
         result = QColorDialog.getColor(
             initial,
             self,
-            self.tr("Pick Color"),
+            self.tr("选择颜色"),
             QColorDialog.ColorDialogOption.ShowAlphaChannel,
         )
         if not result.isValid():
@@ -241,8 +242,8 @@ class LayerTreeDock(QDockWidget):
     def _action_opacity(self, layer: Layer) -> None:
         pct, ok = QInputDialog.getInt(
             self,
-            self.tr("Opacity"),
-            self.tr("Opacity (0-100):"),
+            self.tr("透明度"),
+            self.tr("透明度（0-100）："),
             value=int(round(float(layer.opacity) * 100)),
             min=0,
             max=100,
@@ -260,14 +261,14 @@ class LayerTreeDock(QDockWidget):
             return
         confirm = QMessageBox.question(
             self,
-            self.tr("Delete layers"),
-            self.tr("Remove {count} layer(s)? This can be undone.").format(count=len(ids)),
+            self.tr("删除图层"),
+            self.tr("确定要移除 {count} 个图层吗？此操作可撤销。").format(count=len(ids)),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
         if self._undo_stack is not None:
-            self._undo_stack.beginMacro(self.tr("Delete layers"))
+            self._undo_stack.beginMacro(self.tr("删除图层"))
         try:
             for layer_id in ids:
                 self._push(RemoveLayerCommand(self._layer_store, layer_id))
@@ -297,7 +298,7 @@ class LayerTreeDock(QDockWidget):
         try:
             self._push(MergeLayersCommand(self._layer_store, ids, merger))
         except ValueError as exc:
-            QMessageBox.warning(self, self.tr("Merge"), str(exc))
+            QMessageBox.warning(self, self.tr("合并"), str(exc))
 
     def _can_split(self, layer: Layer) -> bool:
         return layer.kind in {"horizon_stick", "fault_stick", "polygon"}
@@ -308,7 +309,7 @@ class LayerTreeDock(QDockWidget):
         try:
             self._push(SplitLayerCommand(self._layer_store, layer.id, _split_layer))
         except ValueError as exc:
-            QMessageBox.information(self, self.tr("Split"), str(exc))
+            QMessageBox.information(self, self.tr("拆分"), str(exc))
 
 
 # ---------------------------------------------------------------------- helpers
@@ -318,19 +319,19 @@ def _layer_details(layer: Layer) -> str:
     if layer.kind == "volume":
         shape = getattr(layer, "shape", None)
         cmap = getattr(layer, "cmap", "")
-        return f"shape={shape}, cmap={cmap}"
+        return f"尺寸：{shape}, 色图：{cmap}"
     if layer.kind in {"horizon", "fault_surface", "lith_body"}:
-        return str(layer.metadata.get("path", ""))
+        return f"路径：{layer.metadata.get('path', '')}"
     if layer.kind == "well":
         head = getattr(layer, "head_position", None)
-        return f"head={head}"
+        return f"井头：{head}"
     if layer.kind == "well_log":
         count = layer.metadata.get("sample_count", "")
-        return f"{getattr(layer, 'well_name', '')}, samples={count}"
+        return f"{getattr(layer, 'well_name', '')}, 样本数：{count}"
     if layer.kind == "arbitrary_section":
         traces = layer.metadata.get("trace_count", "")
         z_range = layer.metadata.get("z_range", "")
-        return f"traces={traces}, z={z_range}"
+        return f"道数：{traces}, Z范围：{z_range}"
     return ""
 
 
@@ -358,7 +359,7 @@ def _merge_layers_factory(store: LayerStore):
         first = sources[0]
         merged = replace(first)
         merged.id = str(uuid4())
-        merged.name = f"{first.name} (merged)"
+        merged.name = f"{first.name}（合并）"
 
         if first.kind == "annotation":
             merged_items: list = []
@@ -385,27 +386,27 @@ def _split_layer(layer: Layer) -> list[Layer]:
     if layer.kind == "annotation":
         items = list(getattr(layer, "items", []))
         if len(items) < 2:
-            raise ValueError("Layer has fewer than 2 annotations to split")
+            raise ValueError("图层注释少于 2 个，无法拆分。")
         parts: list[Layer] = []
         for index, item in enumerate(items, start=1):
             clone = replace(layer)
             clone.id = str(uuid4())
-            clone.name = f"{layer.name} #{index}"
+            clone.name = f"{layer.name} 第{index}个"
             clone.items = [deepcopy(item)]
             parts.append(clone)
         return parts
 
     attr = _POINT_ATTR_BY_KIND.get(layer.kind)
     if attr is None:
-        raise ValueError(f"Layer kind '{layer.kind}' cannot be split")
+        raise ValueError(f"图层类型“{layer.kind}”不能拆分。")
     array = getattr(layer, attr)
     if array is None or len(array) < 2:
-        raise ValueError("Layer has fewer than 2 points to split")
+        raise ValueError("图层点数少于 2 个，无法拆分。")
     parts = []
     for index, row in enumerate(array, start=1):
         clone = replace(layer)
         clone.id = str(uuid4())
-        clone.name = f"{layer.name} #{index}"
+        clone.name = f"{layer.name} 第{index}个"
         setattr(clone, attr, row[None, ...].copy())
         parts.append(clone)
     return parts

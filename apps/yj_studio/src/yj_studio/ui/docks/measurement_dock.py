@@ -5,13 +5,14 @@ from PyQt6.QtWidgets import QDockWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayo
 
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import MeasurementLayer
+from yj_studio.ui.text import measurement_value_label
 
 
 class MeasurementDock(QDockWidget):
     """List measurement layers produced by the measurement tool."""
 
     def __init__(self, layer_store: LayerStore, parent: QWidget | None = None) -> None:
-        super().__init__("Measurements", parent)
+        super().__init__("测量", parent)
         self._layer_store = layer_store
         self._items: dict[str, QTreeWidgetItem] = {}
         self._updating = False
@@ -21,7 +22,7 @@ class MeasurementDock(QDockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         self.tree = QTreeWidget(content)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Values", "Units"])
+        self.tree.setHeaderLabels(["名称", "数值", "单位"])
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.tree)
         self.setWidget(content)
@@ -96,10 +97,16 @@ class MeasurementDock(QDockWidget):
 def _format_values(values: dict[str, float]) -> str:
     if not values:
         return ""
-    return ", ".join(f"{key}={value:.3f}" for key, value in values.items())
+    return ", ".join(f"{measurement_value_label(key)}={value:.3f}" for key, value in values.items())
 
 
 def _format_units(units: dict[str, str]) -> str:
     if not units:
         return ""
-    return ", ".join(f"{key}:{value}" for key, value in units.items())
+    unit_labels = {
+        "m": "米",
+        "ratio": "比例",
+        "cells": "单元",
+        "cells^2": "单元²",
+    }
+    return ", ".join(f"{measurement_value_label(key)}:{unit_labels.get(value, value)}" for key, value in units.items())

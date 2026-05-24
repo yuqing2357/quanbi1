@@ -18,10 +18,9 @@ class FaultAutopickParams(BaseModel):
 class FaultAutopickAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "fault.autopick"
     category: ClassVar[str] = "fault"
-    label: ClassVar[str] = "Fault Auto-Pick"
+    label: ClassVar[str] = "断层自动拾取"
     description: ClassVar[str] = (
-        "Detect fault surfaces from a fault-emphasising attribute volume"
-        " (e.g. coherence, ant-tracking). Phase 2."
+        "基于断层增强属性体识别断层面（如相干体、ant-tracking）。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = FaultAutopickParams
     layer_inputs: ClassVar[dict[str, str]] = {"volume": "volume"}

@@ -18,11 +18,10 @@ class SandbodyExtractParams(BaseModel):
 class SandbodyExtractAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "reservoir.sandbody_extract"
     category: ClassVar[str] = "reservoir"
-    label: ClassVar[str] = "Sandbody Extraction"
+    label: ClassVar[str] = "砂体提取"
     description: ClassVar[str] = (
-        "Identify sandbodies between top/bottom horizons using a"
-        " seismic-attribute threshold. Outputs a MaskLayer plus thickness"
-        " statistics. Phase 2."
+        "基于地震属性阈值识别上下层位之间的砂体，输出 MaskLayer 及"
+        "厚度统计。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = SandbodyExtractParams
     layer_inputs: ClassVar[dict[str, str]] = {

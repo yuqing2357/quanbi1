@@ -38,6 +38,7 @@ from yj_studio.services.section_service import (
     well_intersection,
 )
 from yj_studio.services.view_sync_service import ViewSyncService
+from yj_studio.ui.text import measurement_value_label, section_axis_label
 from yj_studio.view.highlight import highlight_color, is_layer_highlighted, selected_well_names
 
 
@@ -92,7 +93,7 @@ class View2DSection(QWidget):
 
     @property
     def title(self) -> str:
-        return f"{self.axis.title()} {self.index}"
+        return f"{section_axis_label(self.axis)} {self.index}"
 
     def set_index(self, index: int, *, publish: bool = False) -> None:
         if int(index) == self.index:
@@ -107,7 +108,7 @@ class View2DSection(QWidget):
         self._axes.clear()
         volume_layer = self._volume_layer()
         if volume_layer is None:
-            self._draw_message("No active volume")
+            self._draw_message("未加载体数据")
             return
         try:
             section = extract_orthogonal_section(
@@ -504,13 +505,13 @@ def _mask_rgba(mask: np.ndarray, color: tuple[float, float, float, float], opaci
 def _measurement_label(layer: MeasurementLayer) -> str:
     if "area" in layer.values:
         unit = layer.units.get("area", "")
-        return f"Area {layer.values['area']:.2f}{_unit_suffix(unit)}"
+        return f"{measurement_value_label('area')} {layer.values['area']:.2f}{_unit_suffix(unit)}"
     if "distance" in layer.values:
         unit = layer.units.get("distance", "")
-        return f"Dist {layer.values['distance']:.2f}{_unit_suffix(unit)}"
+        return f"{measurement_value_label('distance')} {layer.values['distance']:.2f}{_unit_suffix(unit)}"
     if "thickness" in layer.values:
         unit = layer.units.get("thickness", "")
-        return f"Thk {layer.values['thickness']:.2f}{_unit_suffix(unit)}"
+        return f"{measurement_value_label('thickness')} {layer.values['thickness']:.2f}{_unit_suffix(unit)}"
     return ""
 
 

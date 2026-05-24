@@ -59,7 +59,7 @@ class _LoaderWorker(QObject):
 
     def run(self) -> None:
         try:
-            self.progress.emit("Importing SAM3 module")
+            self.progress.emit("正在导入 SAM3 模块")
             if self._config.sam3_source_root is not None:
                 root = str(self._config.sam3_source_root)
                 if root not in sys.path:
@@ -74,11 +74,11 @@ class _LoaderWorker(QObject):
 
             if not self._config.checkpoint_exists():
                 self.failed.emit(
-                    f"SAM3 checkpoint not found: {self._config.checkpoint_path}"
+                    f"未找到 SAM3 检查点：{self._config.checkpoint_path}"
                 )
                 return
 
-            self.progress.emit("Loading SAM3 image model (~30s)")
+            self.progress.emit("正在加载 SAM3 图像模型（约 30 秒）")
             t0 = time.time()
             image_model = build_sam3_image_model(
                 device=self._config.device,
@@ -94,7 +94,7 @@ class _LoaderWorker(QObject):
 
             video_predictor = None
             if self._config.load_video_model:
-                self.progress.emit("Loading SAM3 video model (~30s)")
+                self.progress.emit("正在加载 SAM3 视频模型（约 30 秒）")
                 t0 = time.time()
                 try:
                     video_predictor = build_sam3_video_model(
@@ -116,7 +116,7 @@ class _LoaderWorker(QObject):
                         exc,
                     )
                     self.progress.emit(
-                        "SAM3 video model unavailable (image still works)"
+                        "SAM3 视频模型不可用（图像模式仍可使用）"
                     )
 
             self.succeeded.emit(
@@ -195,7 +195,7 @@ class AIService(QObject):
 
         if self._state in {AIServiceState.LOADING, AIServiceState.READY}:
             return
-        self._set_state(AIServiceState.LOADING, "Starting SAM3 loader")
+        self._set_state(AIServiceState.LOADING, "正在启动 SAM3 加载器")
         self._thread = QThread(self)
         self._worker = _LoaderWorker(self._config)
         self._worker.moveToThread(self._thread)
@@ -209,7 +209,7 @@ class AIService(QObject):
         """Drop references to the model so torch can free GPU memory."""
 
         self._models = None
-        self._set_state(AIServiceState.IDLE, "SAM3 unloaded")
+        self._set_state(AIServiceState.IDLE, "SAM3 已卸载")
 
     # ------------------------------------------------------------------ slots
 
@@ -219,7 +219,7 @@ class AIService(QObject):
     def _on_succeeded(self, models: _LoadedModels) -> None:
         self._models = models
         self._cleanup_thread()
-        self._set_state(AIServiceState.READY, "SAM3 ready")
+        self._set_state(AIServiceState.READY, "SAM3 已就绪")
 
     def _on_failed(self, message: str) -> None:
         self._cleanup_thread()
@@ -240,11 +240,11 @@ class AIService(QObject):
 
     # ------------------------------------------------------------------ busy helpers
 
-    def mark_busy(self, message: str = "Running") -> None:
+    def mark_busy(self, message: str = "运行中") -> None:
         if self._state == AIServiceState.READY:
             self._set_state(AIServiceState.BUSY, message)
 
-    def mark_ready(self, message: str = "SAM3 ready") -> None:
+    def mark_ready(self, message: str = "SAM3 已就绪") -> None:
         if self._state == AIServiceState.BUSY:
             self._set_state(AIServiceState.READY, message)
 

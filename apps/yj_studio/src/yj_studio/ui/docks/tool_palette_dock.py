@@ -17,7 +17,7 @@ class ToolPaletteDock(QDockWidget):
     """Vertical list of interaction tools."""
 
     def __init__(self, tool_manager: ToolManager, parent: QWidget | None = None) -> None:
-        super().__init__("Tools", parent)
+        super().__init__("工具", parent)
         self._tool_manager = tool_manager
         self._buttons: dict[str, QToolButton] = {}
 
@@ -35,7 +35,7 @@ class ToolPaletteDock(QDockWidget):
             button.setAutoRaise(False)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
             button.setText(tool.label)
-            button.setToolTip(tool.label if tool.enabled else f"{tool.label} (Phase 2)")
+            button.setToolTip(tool.label if tool.enabled else f"{tool.label}（第二阶段）")
             button.setIcon(_tool_icon(self, tool.icon))
             button.setEnabled(tool.enabled)
             button.clicked.connect(lambda checked=False, tool_id=tool.id: self._tool_manager.set_active(tool_id))

@@ -22,7 +22,7 @@ from yj_studio.tools.tool import InteractionTool
 
 class BoxPickTool(InteractionTool):
     def __init__(self) -> None:
-        super().__init__(id="box_pick", label="Box Pick", icon="square", cursor="crosshair")
+        super().__init__(id="box_pick", label="框选", icon="square", cursor="crosshair")
         self._start: tuple[float, float] | None = None
 
     def deactivate(self, view: Any) -> None:
@@ -55,10 +55,10 @@ class BoxPickTool(InteractionTool):
         selected = _select_layers(view, layer_store, rect)
         if selected:
             layer_store.select(selected)
-            tool_notify(view, f"Selected {len(selected)} layers")
+            tool_notify(view, f"已选中 {len(selected)} 个图层")
         else:
             layer_store.select([])
-            tool_notify(view, "Selection cleared")
+            tool_notify(view, "已清除选择")
         self._start = None
         return True
 

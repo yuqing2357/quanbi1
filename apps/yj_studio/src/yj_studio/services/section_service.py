@@ -48,16 +48,16 @@ def extract_orthogonal_section(
     """Extract one orthogonal 2D section using the same orientation as the 3D slices."""
 
     if layer.shape is None:
-        raise ValueError("VolumeLayer.shape is required")
+        raise ValueError("体数据图层需要有效尺寸。")
     clipped_index = _clip_index(axis, index, layer.shape)
     raw = volume_store.get_slice(layer.volume_id, axis, clipped_index)
     values = np.asarray(raw, dtype=np.float32).T
     nx, ny, nz = layer.shape
     if axis == "inline":
-        return OrthogonalSection(axis, clipped_index, values, "Xline", "Sample", (0, ny - 1, nz - 1, 0))
+        return OrthogonalSection(axis, clipped_index, values, "横向线号", "采样", (0, ny - 1, nz - 1, 0))
     if axis == "xline":
-        return OrthogonalSection(axis, clipped_index, values, "Inline", "Sample", (0, nx - 1, nz - 1, 0))
-    return OrthogonalSection(axis, clipped_index, values, "Inline", "Xline", (0, nx - 1, ny - 1, 0))
+        return OrthogonalSection(axis, clipped_index, values, "纵向线号", "采样", (0, nx - 1, nz - 1, 0))
+    return OrthogonalSection(axis, clipped_index, values, "纵向线号", "横向线号", (0, nx - 1, ny - 1, 0))
 
 
 def horizon_intersection(layer: HorizonLayer, axis: SectionAxis, index: int) -> SectionLine | None:

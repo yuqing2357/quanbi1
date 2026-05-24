@@ -9,7 +9,7 @@ from yj_studio.tools.tool import InteractionTool
 
 class PolygonTool(InteractionTool):
     def __init__(self) -> None:
-        super().__init__(id="polygon", label="Polygon", icon="polygon", cursor="crosshair")
+        super().__init__(id="polygon", label="多边形", icon="polygon", cursor="crosshair")
         self._points: list[tuple[float, float, float]] = []
 
     def activate(self, view) -> None:
@@ -25,7 +25,7 @@ class PolygonTool(InteractionTool):
         if point is None:
             return False
         self._points.append(point)
-        tool_notify(view, f"Polygon points: {len(self._points)}")
+        tool_notify(view, f"多边形点数：{len(self._points)}")
         return True
 
     def on_mouse_double_click(self, view, event) -> bool:
@@ -34,12 +34,12 @@ class PolygonTool(InteractionTool):
             self._points = []
             return False
         if len(self._points) < 3:
-            tool_notify(view, "Polygon needs at least 3 points")
+            tool_notify(view, "多边形至少需要 3 个点")
             self._points = []
             return True
         vertices = np.asarray(self._points, dtype=np.float32)
         layer = PolygonLayer(
-            name=next_layer_name(layer_store, "Polygon"),
+            name=next_layer_name(layer_store, "多边形"),
             vertices=vertices,
             closed=True,
             color=(1.0, 0.75, 0.15, 0.85),
@@ -50,7 +50,7 @@ class PolygonTool(InteractionTool):
         )
         layer_store.add(layer)
         layer_store.select([layer.id])
-        tool_notify(view, f"Created {layer.name}")
+        tool_notify(view, f"已创建 {layer.name}")
         self._points = []
         return True
 
@@ -58,6 +58,6 @@ class PolygonTool(InteractionTool):
         key = getattr(event, "key", "")
         if key in {"escape", "esc"}:
             self._points = []
-            tool_notify(view, "Polygon cleared")
+            tool_notify(view, "多边形已清除")
             return True
         return False

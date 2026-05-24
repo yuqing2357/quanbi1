@@ -18,10 +18,9 @@ class ClosureContourParams(BaseModel):
 class ClosureContourAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "trap.closure_contour"
     category: ClassVar[str] = "trap"
-    label: ClassVar[str] = "Closure Contour Extraction"
+    label: ClassVar[str] = "闭合等值线提取"
     description: ClassVar[str] = (
-        "Extract closed contour rings from a horizon depth grid; closed rings"
-        " are candidate structural closures. Phase 2."
+        "从层位深度网格中提取闭合等值线环；闭合环是候选构造闭合。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = ClosureContourParams
     layer_inputs: ClassVar[dict[str, str]] = {"horizon": "horizon"}

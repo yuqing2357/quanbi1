@@ -18,10 +18,9 @@ class ConnectivityParams(BaseModel):
 class ConnectivityAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "reservoir.connectivity"
     category: ClassVar[str] = "reservoir"
-    label: ClassVar[str] = "Connectivity Analysis"
+    label: ClassVar[str] = "连通性分析"
     description: ClassVar[str] = (
-        "Group a 3D mask into connected components and report which wells"
-        " each component reaches. Phase 2."
+        "将三维掩膜分解为连通分量，并报告每个分量接触到哪些井。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = ConnectivityParams
     layer_inputs: ClassVar[dict[str, str]] = {"mask": "mask"}

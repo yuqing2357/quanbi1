@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 pytest-cache-files-*/
 pytest-tmp/
+.tmp/
+.pytest-tmp/
 build/
 apps/yj_studio/tests/_artifacts/
 apps/yj_studio/tests/_scratch/

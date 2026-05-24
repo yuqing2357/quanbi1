@@ -241,7 +241,7 @@ def ensure_mask_layer(
                 layer.mask = np.zeros(shape, dtype=np.uint8)
             return layer
     layer = MaskLayer(
-        name=f"{tool_name.title()} {axis} {slice_index}",
+        name=f"{_tool_display_name(tool_name)} {axis} {slice_index}",
         color=color,
         opacity=opacity,
         visible=True,
@@ -299,3 +299,24 @@ def next_layer_name(layer_store: LayerStore, prefix: str) -> str:
         if layer.name.startswith(prefix):
             count += 1
     return f"{prefix} {count + 1}"
+
+
+def _tool_display_name(tool_name: str) -> str:
+    return {
+        "paint_mask": "掩膜",
+        "fill": "填充",
+        "connected_component": "连通域",
+        "threshold": "阈值",
+        "region_grow": "区域生长",
+        "snap": "吸附",
+        "contour": "等值线",
+        "horizon_autotrack": "层位自动追踪",
+        "ai_point_prompt": "AI 点提示",
+        "ai_box_prompt": "AI 框提示",
+        "measure": "测量",
+        "polygon": "多边形",
+        "brush": "画笔",
+        "eraser": "橡皮",
+        "horizon_stick": "层位杆",
+        "fault_stick": "断层杆",
+    }.get(tool_name, tool_name.replace("_", " "))

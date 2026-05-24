@@ -8,4 +8,4 @@ class EraserTool(_MaskEditTool):
     mask_color = (0.2, 0.6, 1.0, 0.25)
 
     def __init__(self) -> None:
-        super().__init__(tool_id="eraser", label="Eraser", icon="eraser")
+        super().__init__(tool_id="eraser", label="橡皮", icon="eraser")

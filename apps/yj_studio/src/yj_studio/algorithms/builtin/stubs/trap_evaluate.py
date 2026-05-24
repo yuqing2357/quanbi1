@@ -18,11 +18,10 @@ class TrapEvaluateParams(BaseModel):
 class TrapEvaluateAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "trap.evaluate"
     category: ClassVar[str] = "trap"
-    label: ClassVar[str] = "Trap Evaluation"
+    label: ClassVar[str] = "圈闭评估"
     description: ClassVar[str] = (
-        "Evaluate a candidate TrapLayer against horizon/fault/well evidence"
-        " to produce a tabulated risk/quality report (AnnotationLayer)."
-        " Phase 2."
+        "结合层位、断层和井证据评估候选 TrapLayer，并生成风险/质量表"
+        "（AnnotationLayer）。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = TrapEvaluateParams
     layer_inputs: ClassVar[dict[str, str]] = {"trap": "trap"}

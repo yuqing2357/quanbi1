@@ -46,16 +46,16 @@ class ViewWellSection(QWidget):
 
     @property
     def title(self) -> str:
-        return f"Well {'-'.join(self.data.names[:3])}"
+        return f"井剖面 {'-'.join(self.data.names[:3])}"
 
     def refresh(self) -> None:
         self._axes.clear()
         self._draw_seismic()
         self._draw_wells()
         self._apply_section_limits()
-        self._axes.set_title(" -> ".join(self.data.names))
-        self._axes.set_xlabel("Distance")
-        self._axes.set_ylabel("Depth (m)")
+        self._axes.set_title(" → ".join(self.data.names))
+        self._axes.set_xlabel("距离")
+        self._axes.set_ylabel("深度（m）")
         self._canvas.draw_idle()
 
     def _draw_seismic(self) -> None:

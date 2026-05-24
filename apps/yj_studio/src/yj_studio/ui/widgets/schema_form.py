@@ -27,6 +27,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic.fields import FieldInfo
 
 from yj_studio.scene.layer_store import LayerStore
+from yj_studio.ui.text import layer_kind_label, parameter_name_label, parameter_role_label
 
 
 class SchemaForm(QWidget):
@@ -69,7 +70,7 @@ class SchemaForm(QWidget):
         for role, kind_filter in self._current_layer_spec.items():
             combo = self._build_layer_combo(role, kind_filter)
             self._layer_widgets[role] = combo
-            self._form_layout.addRow(role, combo)
+            self._form_layout.addRow(parameter_role_label(role), combo)
 
         if model is not None:
             for name, field in model.model_fields.items():
@@ -77,7 +78,7 @@ class SchemaForm(QWidget):
                 if widget is None:
                     continue
                 self._param_widgets[name] = widget
-                self._form_layout.addRow(name, widget)
+                self._form_layout.addRow(parameter_name_label(name), widget)
         self.changed.emit()
 
     def collect(self) -> dict[str, Any]:
@@ -102,7 +103,7 @@ class SchemaForm(QWidget):
             return str(exc)
         for role in self._current_layer_spec:
             if role not in collected["layers"]:
-                return f"Missing layer input: {role}"
+                return f"缺少图层输入：{parameter_role_label(role)}"
         return None
 
     def refresh_layer_choices(self) -> None:
@@ -131,8 +132,9 @@ class SchemaForm(QWidget):
 
     def _build_layer_combo(self, role: str, kind_filter: str) -> QComboBox:
         combo = QComboBox(self)
-        combo.setToolTip(f"{role}: any of {kind_filter}")
-        combo.addItem("— Select —", "")
+        human_filter = "、".join(layer_kind_label(token.strip()) for token in kind_filter.split("|") if token.strip())
+        combo.setToolTip(f"{parameter_role_label(role)}：可选 {human_filter or '全部类型'}")
+        combo.addItem("— 请选择 —", "")
         for label, layer_id in self._iter_matching_layers(kind_filter):
             combo.addItem(label, layer_id)
         combo.currentIndexChanged.connect(lambda _i: self.changed.emit())
@@ -143,7 +145,7 @@ class SchemaForm(QWidget):
         for layer in self._layer_store.iter_layers():
             if wanted and layer.kind not in wanted:
                 continue
-            yield f"{layer.name} [{layer.kind}]", layer.id
+            yield f"{layer.name} [{layer_kind_label(layer.kind)}]", layer.id
 
     def _build_param_widget(self, name: str, field: FieldInfo) -> QWidget | None:
         annotation = field.annotation

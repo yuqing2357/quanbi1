@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import WellLayer, WellLogLayer
+from yj_studio.ui.text import layer_kind_label, well_display_mode_label
 
 
 class WellsDock(QDockWidget):
@@ -24,7 +25,7 @@ class WellsDock(QDockWidget):
     display_mode_changed = pyqtSignal(str)
 
     def __init__(self, layer_store: LayerStore, parent: QWidget | None = None) -> None:
-        super().__init__("Wells", parent)
+        super().__init__("井", parent)
         self._layer_store = layer_store
         self._items: dict[str, QTreeWidgetItem] = {}
         self._updating = False
@@ -36,19 +37,19 @@ class WellsDock(QDockWidget):
 
         mode_row = QHBoxLayout()
         mode_row.setContentsMargins(0, 0, 0, 0)
-        mode_row.addWidget(QLabel("Display", panel))
+        mode_row.addWidget(QLabel("显示模式", panel))
         self.display_mode_box = QComboBox(panel)
-        self.display_mode_box.addItem("Well only", "none")
-        self.display_mode_box.addItem("Lithology", "lith")
-        self.display_mode_box.addItem("Porosity", "por")
-        self.display_mode_box.addItem("Permeability", "perm")
+        self.display_mode_box.addItem(well_display_mode_label("none"), "none")
+        self.display_mode_box.addItem(well_display_mode_label("lith"), "lith")
+        self.display_mode_box.addItem(well_display_mode_label("por"), "por")
+        self.display_mode_box.addItem(well_display_mode_label("perm"), "perm")
         self.display_mode_box.currentIndexChanged.connect(self._on_display_mode_changed)
         mode_row.addWidget(self.display_mode_box, 1)
         layout.addLayout(mode_row)
 
         self.tree = QTreeWidget(panel)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Type", "Details"])
+        self.tree.setHeaderLabels(["名称", "类型", "详情"])
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_activated)
@@ -114,7 +115,7 @@ class WellsDock(QDockWidget):
         self._updating = True
         try:
             item.setText(0, layer.name)
-            item.setText(1, layer.kind)
+            item.setText(1, layer_kind_label(layer.kind))
             item.setText(2, _well_details(layer))
             item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
         finally:
@@ -172,5 +173,5 @@ class WellsDock(QDockWidget):
 def _well_details(layer: WellLayer) -> str:
     if layer.head_position is not None:
         x, y, z = layer.head_position
-        return f"head=({x:.1f}, {y:.1f}, {z:.1f})"
-    return f"depth={layer.metadata.get('z_top', '?')}..{layer.metadata.get('z_bottom', '?')}"
+        return f"井头=({x:.1f}, {y:.1f}, {z:.1f})"
+    return f"深度={layer.metadata.get('z_top', '?')}..{layer.metadata.get('z_bottom', '?')}"

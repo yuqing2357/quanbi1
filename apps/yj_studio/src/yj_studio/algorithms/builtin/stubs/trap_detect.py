@@ -18,10 +18,10 @@ class TrapDetectParams(BaseModel):
 class TrapDetectAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "trap.detect_structural"
     category: ClassVar[str] = "trap"
-    label: ClassVar[str] = "Trap Detection"
+    label: ClassVar[str] = "圈闭检测"
     description: ClassVar[str] = (
-        "Combine horizon closures with fault polygons to find candidate"
-        " structural traps; emit TrapLayer with confidence score. Phase 2."
+        "结合层位闭合与断层多边形寻找候选构造圈闭，并输出带置信度的"
+        " TrapLayer。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = TrapDetectParams
     layer_inputs: ClassVar[dict[str, str]] = {"horizon": "horizon"}

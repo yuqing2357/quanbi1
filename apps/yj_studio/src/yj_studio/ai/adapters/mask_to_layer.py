@@ -74,7 +74,8 @@ def build_mask_layer(
     meta.setdefault("axis", axis)
     meta.setdefault("slice_index", int(slice_index))
     if score is not None:
-        meta.setdefault("score", float(score))
+        score_value = round(float(score), 6)
+        meta.setdefault("score", score_value)
     prov = dict(provenance or {})
     prov.setdefault("source", "ai.sam3")
     return MaskLayer(
@@ -82,7 +83,7 @@ def build_mask_layer(
         mask=mask_arr,
         axis=axis,
         slice_index=int(slice_index),
-        confidence=float(score) if score is not None else None,
+        confidence=score_value if score is not None else None,
         color=color,
         opacity=color[3],
         metadata=meta,

@@ -60,6 +60,7 @@ from yj_studio.ui.docks.slice_controls_dock import SliceControlsDock
 from yj_studio.ui.docks.tool_palette_dock import ToolPaletteDock
 from yj_studio.ui.docks.well_section_dock import WellSectionDock
 from yj_studio.ui.docks.wells_dock import WellsDock
+from yj_studio.ui.text import well_display_mode_label
 from yj_studio.view.views_area import ViewsArea
 from yj_studio.view.view_horizon_map import ViewHorizonMap
 from yj_studio.view.view_well_section import ViewWellSection
@@ -147,7 +148,7 @@ class MainWindow(QMainWindow):
                 self.load_default_faults()
                 self.load_default_lith_bodies()
                 self.load_default_wells()
-        self.statusBar().showMessage(self.tr("Ready"))
+        self.statusBar().showMessage(self.tr("就绪"))
 
     def _build_central_area(self, *, enable_3d: bool) -> None:
         self._views_area = ViewsArea(
@@ -166,42 +167,42 @@ class MainWindow(QMainWindow):
             self._view_3d.layer_store = self.layer_store
             self._view_3d.volume_store = self.volume_store
             self._view_3d.view_sync = self.view_sync
-            self._views_area.add_primary_view(self._view_3d, self.tr("3D"))
+            self._views_area.add_primary_view(self._view_3d, self.tr("三维"))
             self._scene_controller = SceneController(self.layer_store, self.volume_store, self._view_3d)
             return
 
         label = QLabel(self.tr("YJ Studio"))
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setObjectName("emptyWorkspaceLabel")
-        self._views_area.add_primary_view(label, self.tr("Workspace"))
+        self._views_area.add_primary_view(label, self.tr("工作区"))
 
     def _build_menus(self) -> None:
-        file_menu = self.menuBar().addMenu(self.tr("File"))
-        open_volume_action = file_menu.addAction(self.tr("Open Volume..."))
+        file_menu = self.menuBar().addMenu(self.tr("文件"))
+        open_volume_action = file_menu.addAction(self.tr("打开体数据..."))
         open_volume_action.triggered.connect(self._open_volume_dialog)
         file_menu.addSeparator()
-        file_menu.addAction(self.tr("Exit"), self.close)
+        file_menu.addAction(self.tr("退出"), self.close)
 
-        edit_menu = self.menuBar().addMenu(self.tr("Edit"))
-        undo_action = self.undo_stack.createUndoAction(self, self.tr("Undo"))
+        edit_menu = self.menuBar().addMenu(self.tr("编辑"))
+        undo_action = self.undo_stack.createUndoAction(self, self.tr("撤销"))
         undo_action.setShortcut(QKeySequence.StandardKey.Undo)
-        redo_action = self.undo_stack.createRedoAction(self, self.tr("Redo"))
+        redo_action = self.undo_stack.createRedoAction(self, self.tr("重做"))
         redo_action.setShortcut(QKeySequence.StandardKey.Redo)
         edit_menu.addAction(undo_action)
         edit_menu.addAction(redo_action)
 
-        view_menu = self.menuBar().addMenu(self.tr("View"))
-        inline_action = view_menu.addAction(self.tr("New Inline Section"))
+        view_menu = self.menuBar().addMenu(self.tr("视图"))
+        inline_action = view_menu.addAction(self.tr("新建纵向剖面"))
         inline_action.triggered.connect(lambda: self._open_section("inline"))
-        xline_action = view_menu.addAction(self.tr("New Xline Section"))
+        xline_action = view_menu.addAction(self.tr("新建横向剖面"))
         xline_action.triggered.connect(lambda: self._open_section("xline"))
-        z_action = view_menu.addAction(self.tr("New Z Section"))
+        z_action = view_menu.addAction(self.tr("新建 Z向剖面"))
         z_action.triggered.connect(lambda: self._open_section("z"))
-        arbitrary_action = view_menu.addAction(self.tr("New Arbitrary Section..."))
+        arbitrary_action = view_menu.addAction(self.tr("新建任意剖面..."))
         arbitrary_action.triggered.connect(self._open_arbitrary_section_dialog)
 
-        help_menu = self.menuBar().addMenu(self.tr("Help"))
-        help_menu.addAction(self.tr("About"), self._show_about)
+        help_menu = self.menuBar().addMenu(self.tr("帮助"))
+        help_menu.addAction(self.tr("关于"), self._show_about)
 
     def _build_layer_tree(self) -> None:
         dock = LayerTreeDock(self.layer_store, self, undo_stack=self.undo_stack)
@@ -392,13 +393,13 @@ class MainWindow(QMainWindow):
 
     def _on_active_tool_changed(self, tool_id: str) -> None:
         tool = self.tool_manager.get(tool_id)
-        self.statusBar().showMessage(self.tr("Tool: {label}").format(label=tool.label))
+        self.statusBar().showMessage(self.tr("工具：{label}").format(label=tool.label))
 
     def _show_about(self) -> None:
         QMessageBox.about(
             self,
-            self.tr("About YJ Studio"),
-            self.tr("YJ Studio v{version}\nSeismic interpretation desktop system.").format(
+            self.tr("关于 YJ Studio"),
+            self.tr("YJ Studio v{version}\n地震解释桌面系统。").format(
                 version=__version__
             ),
         )
@@ -455,7 +456,7 @@ class MainWindow(QMainWindow):
             self._loaded_horizon_paths.add(path_text)
         if summaries:
             self.statusBar().showMessage(
-                self.tr("Loaded {count} horizon entries").format(count=len(summaries))
+                self.tr("已加载 {count} 条层位记录").format(count=len(summaries))
             )
 
     def load_default_faults(self) -> None:
@@ -485,7 +486,7 @@ class MainWindow(QMainWindow):
             self._loaded_fault_paths.add(path_text)
         if summaries:
             self.statusBar().showMessage(
-                self.tr("Loaded {count} fault entries").format(count=len(summaries))
+                self.tr("已加载 {count} 条断层记录").format(count=len(summaries))
             )
 
     def load_default_lith_bodies(self) -> None:
@@ -516,7 +517,7 @@ class MainWindow(QMainWindow):
             self._loaded_lith_body_paths.add(path_text)
         if summaries:
             self.statusBar().showMessage(
-                self.tr("Loaded {count} lithology body entries").format(count=len(summaries))
+                self.tr("已加载 {count} 条岩性体记录").format(count=len(summaries))
             )
 
     def load_default_wells(self) -> None:
@@ -562,7 +563,7 @@ class MainWindow(QMainWindow):
             self._add_well_log_layers(record, z_count=z_count, log_specs=log_specs)
         if len(repository):
             self.statusBar().showMessage(
-                self.tr("Loaded {count} well entries").format(count=len(repository))
+                self.tr("已加载 {count} 条井记录").format(count=len(repository))
             )
 
     def _add_well_log_layers(
@@ -618,7 +619,7 @@ class MainWindow(QMainWindow):
 
     def load_default_volume(self) -> None:
         if not self.volume_specs:
-            self.statusBar().showMessage(self.tr("No default volume found"))
+            self.statusBar().showMessage(self.tr("未找到默认体数据"))
             return
         volume_id = "seismic" if "seismic" in self.volume_specs else next(iter(self.volume_specs))
         self.load_volume(volume_id)
@@ -629,7 +630,7 @@ class MainWindow(QMainWindow):
             shape = tuple(int(value) for value in volume.shape)
         except Exception as exc:
             logger.exception("Failed to load volume %s", volume_id)
-            QMessageBox.warning(self, self.tr("Open Volume"), str(exc))
+            QMessageBox.warning(self, self.tr("打开体数据"), str(exc))
             return
 
         spec = self.volume_store.spec(volume_id)
@@ -665,7 +666,7 @@ class MainWindow(QMainWindow):
         if self._view_3d is not None:
             self._view_3d.reset_to_volume(shape)
         self.statusBar().showMessage(
-            self.tr("Loaded {label}: {shape}").format(label=spec.label, shape=shape)
+            self.tr("已加载 {label}：{shape}").format(label=spec.label, shape=shape)
         )
 
     def _set_slice_index(self, axis: str, index: int) -> None:
@@ -716,14 +717,18 @@ class MainWindow(QMainWindow):
             return
         self.undo_stack.push(
             SetLayerFieldCommand(
-                self.layer_store, layer.id, "roi", new_value, text="Change ROI"
+                self.layer_store,
+                layer.id,
+                "roi",
+                new_value,
+                text="修改 ROI",
             )
         )
 
     def _open_section(self, axis: SectionAxis) -> None:
         layer = self._active_volume_layer()
         if layer is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before opening a section"))
+            self.statusBar().showMessage(self.tr("打开剖面前请先加载体数据"))
             return
         if layer.shape is None:
             return
@@ -734,7 +739,7 @@ class MainWindow(QMainWindow):
     def _open_section_at(self, axis: SectionAxis, index: int) -> None:
         layer = self._active_volume_layer()
         if layer is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before opening a section"))
+            self.statusBar().showMessage(self.tr("打开剖面前请先加载体数据"))
             return
         self._views_area.add_orthogonal_section(
             volume_layer_id=layer.id,
@@ -745,7 +750,7 @@ class MainWindow(QMainWindow):
     def _open_arbitrary_section_dialog(self) -> None:
         layer = self._active_volume_layer()
         if layer is None or layer.shape is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before opening an arbitrary section"))
+            self.statusBar().showMessage(self.tr("打开任意剖面前请先加载体数据"))
             return
         dialog = ArbitrarySectionDialog(
             shape=layer.shape,
@@ -774,7 +779,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         volume_layer = self._active_volume_layer()
         if volume_layer is None or volume_layer.shape is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before opening an arbitrary section"))
+            self.statusBar().showMessage(self.tr("打开任意剖面前请先加载体数据"))
             return
         try:
             volume = self.volume_store.get_volume(volume_layer.volume_id)
@@ -787,19 +792,19 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             logger.exception("Failed to create arbitrary section")
-            QMessageBox.warning(self, self.tr("Arbitrary Section"), str(exc))
+            QMessageBox.warning(self, self.tr("任意剖面"), str(exc))
             return
         z_mid = float(section.depths[0] + section.depths[-1]) / 2.0
         polyline_xyz = np.column_stack(
             [section.polyline_xy, np.full(section.polyline_xy.shape[0], z_mid, dtype=np.float32)]
         ).astype(np.float32)
         section_layer = ArbitrarySectionLayer(
-            name=_next_layer_name(self.layer_store, "Arbitrary Section"),
+            name=_next_layer_name(self.layer_store, "任意剖面"),
             polyline=polyline_xyz,
             image=section.values,
             distances=section.distances,
             depths=section.depths,
-            axis_label="Distance",
+            axis_label="距离",
             color=(1.0, 0.55, 0.1, 0.9),
             opacity=0.9,
             visible=True,
@@ -817,13 +822,11 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.layer_store.remove(layer_id)
             logger.exception("Failed to open arbitrary section view")
-            QMessageBox.warning(self, self.tr("Arbitrary Section"), str(exc))
+            QMessageBox.warning(self, self.tr("任意剖面"), str(exc))
             return
         self.layer_store.select([layer_id])
         self.statusBar().showMessage(
-            self.tr("Opened arbitrary section: {traces} traces").format(
-                traces=section.values.shape[1]
-            )
+            self.tr("已打开任意剖面：{traces} 条道").format(traces=section.values.shape[1])
         )
 
     def _selected_polyline_xy(self) -> np.ndarray | None:
@@ -867,9 +870,9 @@ class MainWindow(QMainWindow):
     def _open_volume_dialog(self) -> None:
         path_text, _ = QFileDialog.getOpenFileName(
             self,
-            self.tr("Open Volume"),
+            self.tr("打开体数据"),
             str(DEFAULT_SEISMIC_NPY.parent),
-            self.tr("NumPy volume (*.npy)"),
+            self.tr("NumPy 体数据 (*.npy)"),
         )
         if not path_text:
             return
@@ -898,7 +901,7 @@ class MainWindow(QMainWindow):
             data = build_structure_map(layer)
         except Exception as exc:
             logger.exception("Failed to open horizon structure map")
-            QMessageBox.warning(self, self.tr("Horizon"), str(exc))
+            QMessageBox.warning(self, self.tr("层位"), str(exc))
             return
         view = ViewHorizonMap(data, axis="horizon", parent=self._views_area)
         self._views_area.add_internal_section(
@@ -907,14 +910,12 @@ class MainWindow(QMainWindow):
             axis="horizon",
             index=0,
         )
-        self.statusBar().showMessage(
-            self.tr("Opened structure map: {name}").format(name=layer.name)
-        )
+        self.statusBar().showMessage(self.tr("已打开构造图：{name}").format(name=layer.name))
 
     def _open_along_horizon_map(self, layer_id: str) -> None:
         volume_layer = self._active_volume_layer()
         if volume_layer is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before sampling along a horizon"))
+            self.statusBar().showMessage(self.tr("沿层采样前请先加载体数据"))
             return
         layer = self.layer_store.get(layer_id)
         if not isinstance(layer, HorizonLayer):
@@ -923,7 +924,7 @@ class MainWindow(QMainWindow):
             data = sample_volume_along_horizon(self.volume_store, volume_layer, layer)
         except Exception as exc:
             logger.exception("Failed to sample along horizon")
-            QMessageBox.warning(self, self.tr("Horizon"), str(exc))
+            QMessageBox.warning(self, self.tr("层位"), str(exc))
             return
         view = ViewHorizonMap(data, axis="horizon", parent=self._views_area)
         self._views_area.add_internal_section(
@@ -932,9 +933,7 @@ class MainWindow(QMainWindow):
             axis="horizon",
             index=0,
         )
-        self.statusBar().showMessage(
-            self.tr("Opened along-horizon map: {name}").format(name=layer.name)
-        )
+        self.statusBar().showMessage(self.tr("已打开沿层图：{name}").format(name=layer.name))
 
     def _jump_to_horizon_high_point(self, layer_id: str) -> None:
         layer = self.layer_store.get(layer_id)
@@ -944,7 +943,7 @@ class MainWindow(QMainWindow):
             point = find_horizon_high_point(layer)
         except Exception as exc:
             logger.exception("Failed to find horizon high point")
-            QMessageBox.warning(self, self.tr("Horizon"), str(exc))
+            QMessageBox.warning(self, self.tr("层位"), str(exc))
             return
         self.layer_store.select([layer.id])
         if not layer.visible:
@@ -956,7 +955,7 @@ class MainWindow(QMainWindow):
         self._open_section_at("inline", point.inline)
         self._open_section_at("xline", point.xline)
         self.statusBar().showMessage(
-            self.tr("Jumped to high point: {name} inline={inline}, xline={xline}, sample={sample:.1f}").format(
+            self.tr("已跳转到高点：{name} inline={inline}, xline={xline}, sample={sample:.1f}").format(
                 name=layer.name,
                 inline=point.inline,
                 xline=point.xline,
@@ -978,7 +977,7 @@ class MainWindow(QMainWindow):
         head_position = getattr(layer, "head_position", None)
         if head_position is not None:
             self._focus_3d_on_point(head_position)
-        self.statusBar().showMessage(self.tr("Selected {name}").format(name=layer.name))
+        self.statusBar().showMessage(self.tr("已选中 {name}").format(name=layer.name))
 
     def _open_well_adjacent_section(self, layer: WellLayer) -> None:
         if layer.head_position is None:
@@ -992,7 +991,7 @@ class MainWindow(QMainWindow):
         self._open_section_at("inline", opened_inline if opened_inline is not None else inline_index)
         self._open_section_at("xline", opened_xline if opened_xline is not None else xline_index)
         self.statusBar().showMessage(
-            self.tr("Opened inline and xline sections for {name}").format(
+            self.tr("已为 {name} 打开 inline 和 xline 剖面").format(
                 name=layer.well_name or layer.name
             )
         )
@@ -1006,7 +1005,7 @@ class MainWindow(QMainWindow):
         for well_name in self._visible_or_selected_well_names():
             self._show_well_layers(well_name, mode=mode)
         self.statusBar().showMessage(
-            self.tr("Well display mode: {mode}").format(mode=_well_display_label(mode))
+            self.tr("测井显示模式：{mode}").format(mode=well_display_mode_label(mode))
         )
 
     def _visible_or_selected_well_names(self) -> list[str]:
@@ -1043,13 +1042,13 @@ class MainWindow(QMainWindow):
         if len(selected_wells) < 2:
             QMessageBox.information(
                 self,
-                self.tr("Well Section"),
-                self.tr("Select at least two wells."),
+                self.tr("井剖面"),
+                self.tr("请至少选择两口井。"),
             )
             return
         volume_layer = self._active_volume_layer()
         if volume_layer is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("Load a volume before opening a well section"))
+            self.statusBar().showMessage(self.tr("打开井剖面前请先加载体数据"))
             return
         try:
             self._set_well_display_mode(mode)
@@ -1064,7 +1063,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             logger.exception("Failed to open well section")
-            QMessageBox.warning(self, self.tr("Well Section"), str(exc))
+            QMessageBox.warning(self, self.tr("井剖面"), str(exc))
             return
         view = ViewWellSection(data, self.layer_store, self._views_area)
         view.layer_store = self.layer_store
@@ -1077,7 +1076,7 @@ class MainWindow(QMainWindow):
             index=0,
         )
         self.statusBar().showMessage(
-            self.tr("Opened well section: {names}").format(names=" -> ".join(data.names))
+            self.tr("已打开井剖面：{names}").format(names=" -> ".join(data.names))
         )
 
     def _focus_3d_on_point(self, point: tuple[float, float, float]) -> None:
@@ -1125,7 +1124,7 @@ def _default_well_log_specs() -> list[dict[str, object]]:
     return [
         {
             "key": "por",
-            "label": "POR",
+            "label": "孔隙度",
             "mode": "por",
             "root": processed_root / "por",
             "value_column": "por",
@@ -1134,7 +1133,7 @@ def _default_well_log_specs() -> list[dict[str, object]]:
         },
         {
             "key": "perm",
-            "label": "PERM",
+            "label": "渗透率",
             "mode": "perm",
             "root": processed_root / "perm",
             "value_column": "perm",
@@ -1143,7 +1142,7 @@ def _default_well_log_specs() -> list[dict[str, object]]:
         },
         {
             "key": "lith_coarse",
-            "label": "LITH",
+            "label": "岩性",
             "mode": "lith",
             "root": processed_root / "lith" / "coarse",
             "value_column": "lith",
@@ -1155,11 +1154,11 @@ def _default_well_log_specs() -> list[dict[str, object]]:
 
 def _well_display_label(mode: str) -> str:
     return {
-        "none": "Well only",
-        "lith": "Lithology",
-        "por": "Porosity",
-        "perm": "Permeability",
-    }.get(mode, "Well only")
+        "none": "仅井轨迹",
+        "lith": "岩性",
+        "por": "孔隙度",
+        "perm": "渗透率",
+    }.get(mode, "仅井轨迹")
 
 
 def _lith_body_rgba(class_value: int, metadata: dict[str, object]) -> tuple[float, float, float, float]:

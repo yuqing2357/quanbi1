@@ -59,7 +59,7 @@ class ToolManager(QObject):
     def activate(self, tool_id: str, view: Any = None) -> None:
         tool = self._tools[tool_id]
         if not tool.enabled:
-            raise RuntimeError(f"Tool is disabled: {tool_id}")
+            raise RuntimeError(f"工具不可用：{tool_id}")
         active = self.active_tool
         if view is not None and view not in self._views:
             self.attach_view(view)
@@ -75,7 +75,7 @@ class ToolManager(QObject):
             self._apply_cursor(target, tool.cursor)
         self.active_tool_changed.emit(tool_id)
         if not targets:
-            self.message_requested.emit(f"Tool activated: {tool.label}")
+            self.message_requested.emit(f"工具已激活：{tool.label}")
 
     def set_active(self, tool_id: str, view: Any = None) -> None:
         self.activate(tool_id, view=view)

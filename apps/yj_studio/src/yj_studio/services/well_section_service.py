@@ -41,10 +41,10 @@ def build_well_section_data(
     """Build an in-application connected-well section from scene layers."""
 
     if volume_layer.shape is None:
-        raise ValueError("Load a volume before opening a well section.")
+        raise ValueError("请先加载体数据，再打开井剖面。")
     well_layers = _selected_well_layers(layer_store, selected_wells)
     if len(well_layers) < 2:
-        raise ValueError("Select at least two wells.")
+        raise ValueError("请至少选择两口井。")
 
     section_wells = _section_wells(layer_store, well_layers, mode)
     distances = np.asarray([well.distance for well in section_wells], dtype=np.float32)

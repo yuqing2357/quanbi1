@@ -38,49 +38,46 @@ BoxSpec = tuple[float, float, float, float]
 
 class SAM3SegmentParams(BaseModel):
     axis: Literal["inline", "xline", "z"] = Field(
-        default="inline", description="Which axis to slice the volume along."
+        default="inline", description="沿哪个轴切取体数据。"
     )
     slice_index: int = Field(
-        default=0, ge=0, description="Index of the slice on the chosen axis."
+        default=0, ge=0, description="所选轴上的剖面索引。"
     )
     text_prompt: str = Field(
         default="",
         description=(
-            "Free-form text prompt (e.g. 'salt body', 'channel sand'). When"
-            " empty SAM3 still runs but only relies on geometric prompts."
+            "可选文本提示（如“盐丘”“河道砂体”）。留空时仅使用几何提示。"
         ),
     )
     boxes: list[BoxSpec] = Field(
         default_factory=list,
         description=(
-            "Optional positive bounding boxes in pixel coords"
-            " (x_min, y_min, x_max, y_max) of the slice image."
+            "可选正样本框，像素坐标为 (x_min, y_min, x_max, y_max)。"
         ),
     )
     points: list[PointSpec] = Field(
         default_factory=list,
         description=(
-            "Optional positive point hints. Each point is converted into a"
-            " small box (point ± point_box_radius_px) before being fed to"
-            " SAM3, which has no native point prompt API."
+            "可选正样本点提示。每个点会先转换成一个小框再送入 SAM3，"
+            "因为 SAM3 没有原生点提示接口。"
         ),
     )
     point_box_radius_px: float = Field(
         default=8.0,
         gt=0.0,
-        description="Half-width of the pseudo-box wrapped around each point.",
+        description="包裹每个点的伪框半宽。",
     )
     confidence_threshold: float = Field(
         default=0.4, ge=0.0, le=1.0,
-        description="Drop masks whose SAM3 score is below this value.",
+        description="丢弃低于此阈值的掩膜。",
     )
     keep_top_k: int = Field(
         default=3, ge=1, le=50,
-        description="Maximum number of candidate masks to surface.",
+        description="最多保留的候选掩膜数。",
     )
     name_prefix: str = Field(
-        default="SAM3",
-        description="Prefix used to name the resulting MaskLayer(s).",
+        default="SAM3 掩膜",
+        description="结果 MaskLayer 的名称前缀。",
     )
 
 
@@ -92,12 +89,11 @@ class SAM3SegmentOutput(BaseModel):
 class SAM3SegmentAlgorithm(Algorithm):
     id: ClassVar[str] = "ai.sam3.segment"
     category: ClassVar[str] = "ai"
-    label: ClassVar[str] = "SAM3 Slice Segment"
+    label: ClassVar[str] = "SAM3 单剖面分割"
     description: ClassVar[str] = (
-        "Run SAM3 image segmentation on a single 2D slice of the active"
-        " seismic volume. Supports free-form text + bounding boxes + points"
-        " (points are wrapped into tiny boxes since SAM3 has no native"
-        " point-prompt API). Outputs one MaskLayer per surviving candidate."
+        "在单张二维剖面上运行 SAM3 图像分割。支持自由文本、框提示和点提示"
+        "（点会先转换成小框，因为 SAM3 没有原生点提示接口）。输出为每个"
+        "保留候选对应的一个 MaskLayer。"
     )
     input_schema: ClassVar[type[BaseModel]] = SAM3SegmentParams
     output_schema: ClassVar[type[BaseModel]] = SAM3SegmentOutput
@@ -108,21 +104,21 @@ class SAM3SegmentAlgorithm(Algorithm):
     def run(self, ctx: AlgorithmContext) -> AlgorithmResult:
         volume_layer = ctx.input_layers.get("volume")
         if not isinstance(volume_layer, VolumeLayer):
-            return AlgorithmResult.failure("Need a VolumeLayer as 'volume' input")
+            return AlgorithmResult.failure("需要一个作为 'volume' 输入的 VolumeLayer")
 
         ai_service = ctx.services.get("ai_service")
         volume_store = ctx.services.get("volume_store")
         if ai_service is None or volume_store is None:
             return AlgorithmResult.failure(
-                "Required services missing: 'ai_service' and 'volume_store'."
-                " Click 'Start AI' in the AI Dock first."
+                "所需服务缺失：'ai_service' 和 'volume_store'。"
+                " 请先在 AI 面板中启动 AI。"
             )
         if not ai_service.is_ready():
             return AlgorithmResult.failure(
-                f"AI service not ready (state={ai_service.state.value})."
+                f"AI 服务未就绪（状态={ai_service.state.value}）。"
             )
 
-        ctx.report_progress(0.05, "Reading slice")
+        ctx.report_progress(0.05, "读取剖面")
         slice_arr = volume_store.get_slice(
             volume_layer.volume_id, ctx.params.axis, ctx.params.slice_index
         )
@@ -135,8 +131,8 @@ class SAM3SegmentAlgorithm(Algorithm):
         rgb = slice_to_rgb_image(slice2d, clim=volume_layer.clim)
         height, width = rgb.shape[:2]
 
-        ctx.report_progress(0.2, "Pushing image to SAM3")
-        ai_service.mark_busy("SAM3 segmenting")
+        ctx.report_progress(0.2, "发送图像到 SAM3")
+        ai_service.mark_busy("SAM3 分割中")
         try:
             processor = ai_service.image_processor
             processor.set_confidence_threshold(float(ctx.params.confidence_threshold))
@@ -147,7 +143,7 @@ class SAM3SegmentAlgorithm(Algorithm):
             state = processor.set_image(pil)
 
             if ctx.params.text_prompt.strip():
-                ctx.report_progress(0.4, "Applying text prompt")
+                ctx.report_progress(0.4, "应用文本提示")
                 state = processor.set_text_prompt(
                     prompt=ctx.params.text_prompt.strip(), state=state
                 )
@@ -168,7 +164,7 @@ class SAM3SegmentAlgorithm(Algorithm):
                 state = _apply_box_prompt(processor, state, x0, y0, x1, y1, width, height)
                 ctx.check_cancel()
 
-            ctx.report_progress(0.85, "Decoding masks")
+            ctx.report_progress(0.85, "解码掩膜")
             detections = decode_sam3_masks(state)
         finally:
             ai_service.mark_ready()
@@ -177,6 +173,7 @@ class SAM3SegmentAlgorithm(Algorithm):
         detections = detections[: int(ctx.params.keep_top_k)]
 
         output_layers: list[MaskLayer] = []
+        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(ctx.params.axis, ctx.params.axis)
         for i, det in enumerate(detections, start=1):
             # SAM3 returns a mask in image-pixel shape (rows=H, cols=W) where
             # H matches the slice's "z / sample" axis and W matches the
@@ -190,7 +187,7 @@ class SAM3SegmentAlgorithm(Algorithm):
             output_layers.append(
                 build_mask_layer(
                     sam3_mask,
-                    name=f"{ctx.params.name_prefix} #{i} ({det['score']:.2f})",
+                    name=f"{ctx.params.name_prefix} 第{i}个（{det['score']:.2f}）",
                     axis=ctx.params.axis,
                     slice_index=int(ctx.params.slice_index),
                     score=det["score"],
@@ -202,10 +199,10 @@ class SAM3SegmentAlgorithm(Algorithm):
                 )
             )
 
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         summary = (
-            f"SAM3: {len(output_layers)} candidate mask(s) on"
-            f" {ctx.params.axis}={ctx.params.slice_index}"
+            f"SAM3：在 {axis_name}={ctx.params.slice_index} 上生成"
+            f" {len(output_layers)} 个候选掩膜"
         )
         return AlgorithmResult.success(output_layers=output_layers, summary=summary)
 

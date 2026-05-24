@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 from yj_studio.scene.layer import Layer
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import HorizonLayer
+from yj_studio.ui.text import layer_kind_label
 
 
 class HorizonDock(QDockWidget):
@@ -25,7 +26,7 @@ class HorizonDock(QDockWidget):
     along_horizon_requested = pyqtSignal(str)
 
     def __init__(self, layer_store: LayerStore, parent: QWidget | None = None) -> None:
-        super().__init__("Horizons", parent)
+        super().__init__("层位", parent)
         self._layer_store = layer_store
         self._items: dict[str, QTreeWidgetItem] = {}
         self._updating = False
@@ -37,22 +38,22 @@ class HorizonDock(QDockWidget):
 
         self.tree = QTreeWidget(panel)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Type", "Details"])
+        self.tree.setHeaderLabels(["名称", "类型", "详情"])
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_activated)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.tree, 1)
 
-        structure_button = QPushButton("Structure Map", panel)
+        structure_button = QPushButton("构造图", panel)
         structure_button.clicked.connect(self._emit_structure_map_requested)
         layout.addWidget(structure_button)
 
-        high_button = QPushButton("Jump High Point", panel)
+        high_button = QPushButton("跳转高点", panel)
         high_button.clicked.connect(self._emit_high_point_requested)
         layout.addWidget(high_button)
 
-        along_button = QPushButton("Along Horizon", panel)
+        along_button = QPushButton("沿层图", panel)
         along_button.clicked.connect(self._emit_along_horizon_requested)
         layout.addWidget(along_button)
         self.setWidget(panel)
@@ -101,7 +102,7 @@ class HorizonDock(QDockWidget):
         self._updating = True
         try:
             item.setText(0, layer.name)
-            item.setText(1, layer.kind)
+            item.setText(1, layer_kind_label(layer.kind))
             item.setText(2, _layer_details(layer))
             item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
         finally:

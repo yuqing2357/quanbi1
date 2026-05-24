@@ -79,7 +79,7 @@ class AIPointPromptTool(InteractionTool):
     def __init__(self) -> None:
         super().__init__(
             id="ai_point_prompt",
-            label="AI Point Prompt",
+            label="AI 点提示",
             icon="target",
             cursor="crosshair",
         )
@@ -92,7 +92,7 @@ class AIPointPromptTool(InteractionTool):
     def on_mouse_press(self, view: Any, event: Any) -> bool:
         axis = _slice_axis(view)
         if axis is None:
-            tool_notify(view, "Open a 2D section before collecting AI point prompts")
+            tool_notify(view, "请先打开二维剖面，再采集 AI 点提示")
             return False
         if not event_left_button(event):
             return False
@@ -101,11 +101,11 @@ class AIPointPromptTool(InteractionTool):
             return False
         service = _ai_service(view)
         if service is None:
-            tool_notify(view, "AI service not available")
+            tool_notify(view, "AI 服务不可用")
             return False
         service.emit_point_prompt(axis, _slice_index(view), xy[0], xy[1])
         self._paint_marker(view, xy)
-        tool_notify(view, f"Point prompt @ ({xy[0]:.0f}, {xy[1]:.0f})")
+        tool_notify(view, f"点提示 @ ({xy[0]:.0f}, {xy[1]:.0f})")
         return True
 
     def _paint_marker(self, view: Any, xy: tuple[float, float]) -> None:
@@ -163,7 +163,7 @@ class AIBoxPromptTool(InteractionTool):
     def __init__(self) -> None:
         super().__init__(
             id="ai_box_prompt",
-            label="AI Box Prompt",
+            label="AI 框提示",
             icon="square",
             cursor="crosshair",
         )
@@ -206,17 +206,17 @@ class AIBoxPromptTool(InteractionTool):
             return False
         service = _ai_service(view)
         if service is None:
-            tool_notify(view, "AI service not available")
+            tool_notify(view, "AI 服务不可用")
             return False
         x_min, y_min, x_max, y_max = view_rect_from_events(start, end)
         if x_max - x_min < 1.0 or y_max - y_min < 1.0:
-            tool_notify(view, "AI box prompt ignored (too small)")
+            tool_notify(view, "AI 框提示已忽略（太小）")
             return False
         service.emit_box_prompt(axis, _slice_index(view), x_min, y_min, x_max, y_max)
         self._paint_final(view, x_min, y_min, x_max, y_max)
         tool_notify(
             view,
-            f"Box prompt [{x_min:.0f},{y_min:.0f} → {x_max:.0f},{y_max:.0f}]",
+            f"框提示 [{x_min:.0f},{y_min:.0f} → {x_max:.0f},{y_max:.0f}]",
         )
         return True
 

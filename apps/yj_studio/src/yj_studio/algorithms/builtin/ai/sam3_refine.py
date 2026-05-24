@@ -30,8 +30,8 @@ class SAM3RefineParams(BaseModel):
     text_prompt_override: str = Field(
         default="",
         description=(
-            "If non-empty, overrides the text prompt stored on the edited"
-            " mask's provenance. Empty re-uses the original prompt."
+            "如果不为空，则覆盖编辑后掩膜来源中存储的文本提示；留空则"
+            "复用原始提示。"
         ),
     )
     confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
@@ -39,7 +39,7 @@ class SAM3RefineParams(BaseModel):
     pad_box_px: float = Field(
         default=4.0,
         ge=0.0,
-        description="Inflate the mask bbox by this many pixels on each side.",
+        description="将掩膜边界框向四周外扩的像素数。",
     )
 
 
@@ -51,12 +51,11 @@ class SAM3RefineOutput(BaseModel):
 class SAM3RefineAlgorithm(Algorithm):
     id: ClassVar[str] = "ai.sam3.refine"
     category: ClassVar[str] = "ai"
-    label: ClassVar[str] = "SAM3 Refine From Mask"
+    label: ClassVar[str] = "SAM3 掩膜精修"
     description: ClassVar[str] = (
-        "Take an edited MaskLayer, derive its bounding box, and re-segment"
-        " the same slice with SAM3 using that box as a positive prompt. The"
-        " original text prompt (if any) is recovered from the mask's"
-        " provenance and reused unless overridden."
+        "基于已编辑的 MaskLayer 重新分割同一剖面。算法会从编辑后的掩膜"
+        " 中提取边界框，并将其作为正样本框与原始文本提示一起送入 SAM3。"
+        " 原始文本提示（如果有）会从掩膜来源中恢复，除非被覆盖。"
     )
     input_schema: ClassVar[type[BaseModel]] = SAM3RefineParams
     output_schema: ClassVar[type[BaseModel]] = SAM3RefineOutput
@@ -68,36 +67,36 @@ class SAM3RefineAlgorithm(Algorithm):
         volume_layer = ctx.input_layers.get("volume")
         edited = ctx.input_layers.get("edited_mask")
         if not isinstance(volume_layer, VolumeLayer):
-            return AlgorithmResult.failure("Need a VolumeLayer as 'volume' input")
+            return AlgorithmResult.failure("需要一个作为 'volume' 输入的 VolumeLayer")
         if not isinstance(edited, MaskLayer) or edited.mask is None:
-            return AlgorithmResult.failure("Need an edited 2D MaskLayer as 'edited_mask'")
+            return AlgorithmResult.failure("需要一个已编辑的二维 MaskLayer 作为 'edited_mask'")
         if edited.axis not in {"inline", "xline", "z"}:
             return AlgorithmResult.failure(
-                f"Edited mask axis must be inline/xline/z, got {edited.axis!r}"
+                f"编辑后的掩膜轴必须是纵向、横向或 Z 向，当前为 {edited.axis!r}"
             )
         if edited.slice_index is None:
-            return AlgorithmResult.failure("Edited mask has no slice_index")
+            return AlgorithmResult.failure("编辑后的掩膜没有 slice_index")
         if edited.mask.ndim != 2:
             return AlgorithmResult.failure(
-                "Refine only supports 2D masks (use the propagate algorithm for 3D)"
+                "精修仅支持二维掩膜（3D 请使用传播算法）"
             )
 
         ai_service = ctx.services.get("ai_service")
         volume_store = ctx.services.get("volume_store")
         if ai_service is None or volume_store is None:
             return AlgorithmResult.failure(
-                "Required services missing. Start AI in the AI Dock first."
+                "所需服务缺失，请先在 AI 面板中启动 AI。"
             )
         if not ai_service.is_ready():
             return AlgorithmResult.failure(
-                f"AI service not ready (state={ai_service.state.value})."
+                f"AI 服务未就绪（状态={ai_service.state.value}）。"
             )
 
         mask_arr = np.asarray(edited.mask, dtype=bool)
         if not mask_arr.any():
-            return AlgorithmResult.failure("Edited mask is empty")
+            return AlgorithmResult.failure("编辑后的掩膜为空")
 
-        ctx.report_progress(0.05, "Reading slice")
+        ctx.report_progress(0.05, "读取剖面")
         raw = volume_store.get_slice(volume_layer.volume_id, edited.axis, int(edited.slice_index))
         if edited.axis in {"inline", "xline"}:
             slice2d = np.asarray(raw, dtype=np.float32).T
@@ -128,7 +127,7 @@ class SAM3RefineAlgorithm(Algorithm):
             edited.metadata.get("text_prompt") or ""
         ).strip()
 
-        ai_service.mark_busy("SAM3 refining")
+        ai_service.mark_busy("SAM3 精修中")
         try:
             from PIL import Image
 
@@ -137,14 +136,14 @@ class SAM3RefineAlgorithm(Algorithm):
             pil = Image.fromarray(rgb)
             state = processor.set_image(pil)
 
-            ctx.report_progress(0.4, "Applying prompts")
+            ctx.report_progress(0.4, "应用提示")
             if text_prompt:
                 state = processor.set_text_prompt(prompt=text_prompt, state=state)
             ctx.check_cancel()
             state = _apply_box_prompt(processor, state, x0, y0, x1, y1, width, height)
             ctx.check_cancel()
 
-            ctx.report_progress(0.8, "Decoding masks")
+            ctx.report_progress(0.8, "解码掩膜")
             detections = decode_sam3_masks(state)
         finally:
             ai_service.mark_ready()
@@ -152,6 +151,7 @@ class SAM3RefineAlgorithm(Algorithm):
         detections.sort(key=lambda d: d["score"], reverse=True)
         detections = detections[: int(ctx.params.keep_top_k)]
         output_layers: list[MaskLayer] = []
+        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(edited.axis, edited.axis)
         for i, det in enumerate(detections, start=1):
             # See sam3_segment.py for why the SAM3 mask is transposed at the
             # AI → scene seam: brush + MaskLayer renderer + view_2d_section
@@ -161,7 +161,7 @@ class SAM3RefineAlgorithm(Algorithm):
             output_layers.append(
                 build_mask_layer(
                     sam3_mask,
-                    name=f"{edited.name} (refined #{i}, {det['score']:.2f})",
+                    name=f"{edited.name}（精修第{i}个，{det['score']:.2f}）",
                     axis=edited.axis,
                     slice_index=int(edited.slice_index),
                     score=det["score"],
@@ -178,8 +178,11 @@ class SAM3RefineAlgorithm(Algorithm):
                 )
             )
 
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         return AlgorithmResult.success(
             output_layers=output_layers,
-            summary=f"Refined → {len(output_layers)} candidate(s) on {edited.axis}={edited.slice_index}",
+            summary=(
+                f"精修完成：在 {axis_name}={edited.slice_index} 上生成"
+                f" {len(output_layers)} 个候选"
+            ),
         )

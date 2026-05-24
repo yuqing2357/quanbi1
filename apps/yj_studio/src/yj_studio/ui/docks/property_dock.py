@@ -31,6 +31,7 @@ from yj_studio.scene.undo_commands import (
     SetOpacityCommand,
     SetVisibleCommand,
 )
+from yj_studio.ui.text import layer_kind_label
 
 
 _VOLUME_CMAPS = ["Petrel", "gray", "seismic", "viridis", "plasma", "magma", "jet", "RdBu_r"]
@@ -63,7 +64,7 @@ class _ColorSwatch(QPushButton):
         result = QColorDialog.getColor(
             initial,
             self,
-            self.tr("Pick Color"),
+            self.tr("选择颜色"),
             QColorDialog.ColorDialogOption.ShowAlphaChannel,
         )
         if not result.isValid():
@@ -91,7 +92,7 @@ class PropertyDock(QDockWidget):
         undo_stack: QUndoStack,
         parent: QWidget | None = None,
     ) -> None:
-        super().__init__("Properties", parent)
+        super().__init__("属性", parent)
         self._layer_store = layer_store
         self._volume_store = volume_store
         self._undo_stack = undo_stack
@@ -102,7 +103,7 @@ class PropertyDock(QDockWidget):
         outer = QVBoxLayout(body)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        self._header_label = QLabel(self.tr("No layer selected"), body)
+        self._header_label = QLabel(self.tr("未选择图层"), body)
         outer.addWidget(self._header_label)
 
         self._form = QFormLayout()
@@ -112,15 +113,15 @@ class PropertyDock(QDockWidget):
         # Common fields
         self._name_edit = QLineEdit(body)
         self._name_edit.editingFinished.connect(self._commit_name)
-        self._form.addRow(self.tr("Name"), self._name_edit)
+        self._form.addRow(self.tr("名称"), self._name_edit)
 
         self._visible_check = QCheckBox(body)
         self._visible_check.toggled.connect(self._commit_visible)
-        self._form.addRow(self.tr("Visible"), self._visible_check)
+        self._form.addRow(self.tr("可见"), self._visible_check)
 
         self._color_swatch = _ColorSwatch(body)
         self._color_swatch.color_changed.connect(self._commit_color)
-        self._form.addRow(self.tr("Color"), self._color_swatch)
+        self._form.addRow(self.tr("颜色"), self._color_swatch)
 
         opacity_row = QWidget(body)
         opacity_layout = QHBoxLayout(opacity_row)
@@ -132,10 +133,10 @@ class PropertyDock(QDockWidget):
         opacity_layout.addWidget(self._opacity_slider, 1)
         opacity_layout.addWidget(self._opacity_value)
         self._opacity_slider.valueChanged.connect(self._on_opacity_slider)
-        self._form.addRow(self.tr("Opacity"), opacity_row)
+        self._form.addRow(self.tr("不透明度"), opacity_row)
 
         # Volume-specific
-        self._cmap_label = QLabel(self.tr("Colormap"), body)
+        self._cmap_label = QLabel(self.tr("色图"), body)
         self._cmap_combo = QComboBox(body)
         self._cmap_combo.setEditable(True)
         self._cmap_combo.addItems(_VOLUME_CMAPS)
@@ -157,10 +158,10 @@ class PropertyDock(QDockWidget):
         clim_layout.addWidget(self._clim_min)
         clim_layout.addWidget(QLabel("–", clim_row))
         clim_layout.addWidget(self._clim_max)
-        reset_clim = QPushButton(self.tr("Reset"), clim_row)
+        reset_clim = QPushButton(self.tr("重置"), clim_row)
         reset_clim.clicked.connect(self._reset_clim_from_volume)
         clim_layout.addWidget(reset_clim)
-        self._clim_label = QLabel(self.tr("Range"), body)
+        self._clim_label = QLabel(self.tr("范围"), body)
         self._form.addRow(self._clim_label, clim_row)
 
         outer.addStretch(1)
@@ -226,7 +227,7 @@ class PropertyDock(QDockWidget):
     def _refresh(self) -> None:
         layer = self._current_layer()
         if layer is None:
-            self._header_label.setText(self.tr("No layer selected"))
+            self._header_label.setText(self.tr("未选择图层"))
             self._set_form_enabled(False)
             self._show_volume_fields(False)
             self._updating = True
@@ -241,7 +242,7 @@ class PropertyDock(QDockWidget):
             return
 
         self._header_label.setText(
-            self.tr("{kind}: {name}").format(kind=layer.kind, name=layer.name)
+            self.tr("{kind}：{name}").format(kind=layer_kind_label(layer.kind), name=layer.name)
         )
         self._set_form_enabled(not layer.locked)
         self._updating = True
@@ -333,7 +334,7 @@ class PropertyDock(QDockWidget):
             return
         self._push(
             SetLayerFieldCommand(
-                self._layer_store, layer.id, "cmap", new_cmap, text="Change colormap"
+                self._layer_store, layer.id, "cmap", new_cmap, text="修改色图"
             )
         )
 
@@ -350,7 +351,7 @@ class PropertyDock(QDockWidget):
             return
         self._push(
             SetLayerFieldCommand(
-                self._layer_store, layer.id, "clim", new_clim, text="Change clim"
+                self._layer_store, layer.id, "clim", new_clim, text="修改显示范围"
             )
         )
 
@@ -375,6 +376,6 @@ class PropertyDock(QDockWidget):
             return
         self._push(
             SetLayerFieldCommand(
-                self._layer_store, layer.id, "clim", new_clim, text="Reset clim"
+                self._layer_store, layer.id, "clim", new_clim, text="重置显示范围"
             )
         )

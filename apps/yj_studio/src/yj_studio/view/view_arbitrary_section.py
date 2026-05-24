@@ -48,16 +48,16 @@ class ViewArbitrarySection(QWidget):
     @property
     def title(self) -> str:
         layer = self._layer()
-        return layer.name if layer is not None else "Arbitrary Section"
+        return layer.name if layer is not None else "任意剖面"
 
     def refresh(self) -> None:
         self._axes.clear()
         layer = self._layer()
         if layer is None:
-            self._draw_message("Section layer removed")
+            self._draw_message("剖面图层已移除")
             return
         if layer.image is None or layer.image.size == 0:
-            self._draw_message("No section image")
+            self._draw_message("没有剖面图像")
             return
         values = np.asarray(layer.image, dtype=np.float32)
         finite = values[np.isfinite(values)]
@@ -81,7 +81,7 @@ class ViewArbitrarySection(QWidget):
         )
         self._axes.set_title(layer.name)
         self._axes.set_xlabel(layer.axis_label)
-        self._axes.set_ylabel("Sample")
+        self._axes.set_ylabel("采样")
         self._canvas.draw()
 
     def _draw_message(self, message: str) -> None:

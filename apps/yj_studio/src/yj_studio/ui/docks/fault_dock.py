@@ -13,7 +13,7 @@ class FaultDock(LayerFilterDock):
 
     def __init__(self, layer_store: LayerStore, parent: QWidget | None = None) -> None:
         super().__init__(
-            "Faults",
+            "断层",
             layer_store,
             lambda layer: isinstance(layer, FaultSurfaceLayer),
             parent,

@@ -38,26 +38,26 @@ logger = logging.getLogger(__name__)
 class SAM3PropagateParams(BaseModel):
     forward_steps: int = Field(
         default=10, ge=0, le=500,
-        description="Number of slices to propagate forward (toward higher indices).",
+        description="向前传播的剖面数（朝更大的索引方向）。",
     )
     backward_steps: int = Field(
         default=10, ge=0, le=500,
-        description="Number of slices to propagate backward (toward lower indices).",
+        description="向后传播的剖面数（朝更小的索引方向）。",
     )
     text_prompt: str = Field(
         default="",
         description=(
-            "Optional text prompt that supplements the seed mask. Empty"
-            " falls back to 'visual' (geometric prompt only)."
+            "可选文本提示，用来补充种子掩膜；留空时回退到 visual"
+            "（仅几何提示）。"
         ),
     )
     confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
-    name_prefix: str = Field(default="SAM3 Volume Mask")
+    name_prefix: str = Field(default="SAM3 体掩膜")
     drop_low_confidence_frames: bool = Field(
         default=True,
         description=(
-            "When True, stops propagation as soon as a frame's confidence"
-            " falls below ``confidence_threshold``."
+            "为 True 时，一旦某一帧的置信度低于 ``confidence_threshold`` 就"
+            "停止传播。"
         ),
     )
 
@@ -70,11 +70,11 @@ class SAM3PropagateOutput(BaseModel):
 class SAM3PropagateAlgorithm(Algorithm):
     id: ClassVar[str] = "ai.sam3.propagate"
     category: ClassVar[str] = "ai"
-    label: ClassVar[str] = "SAM3 Cross-Slice Propagate"
+    label: ClassVar[str] = "SAM3 跨剖面传播"
     description: ClassVar[str] = (
-        "Take a 2D MaskLayer seed and propagate it through neighbouring"
-        " slices using the SAM3 video tracker. Output is a 3D MaskLayer"
-        " covering ``forward_steps + backward_steps + 1`` slices."
+        "使用 SAM3 视频跟踪器，将单张二维 MaskLayer 种子传播到相邻剖面。"
+        " 输出为覆盖 ``forward_steps + backward_steps + 1`` 个剖面的三维"
+        " MaskLayer。"
     )
     input_schema: ClassVar[type[BaseModel]] = SAM3PropagateParams
     output_schema: ClassVar[type[BaseModel]] = SAM3PropagateOutput
@@ -86,31 +86,31 @@ class SAM3PropagateAlgorithm(Algorithm):
         volume_layer = ctx.input_layers.get("volume")
         seed_layer = ctx.input_layers.get("seed_mask")
         if not isinstance(volume_layer, VolumeLayer) or volume_layer.shape is None:
-            return AlgorithmResult.failure("Need a VolumeLayer as 'volume' input")
+            return AlgorithmResult.failure("需要一个作为 'volume' 输入的 VolumeLayer")
         if not isinstance(seed_layer, MaskLayer) or seed_layer.mask is None:
-            return AlgorithmResult.failure("Need a 2D MaskLayer as 'seed_mask' input")
+            return AlgorithmResult.failure("需要一个二维 MaskLayer 作为 'seed_mask' 输入")
         if seed_layer.axis not in {"inline", "xline", "z"}:
             return AlgorithmResult.failure(
-                f"Seed mask has unknown axis {seed_layer.axis!r}"
+                f"种子掩膜的轴未知：{seed_layer.axis!r}"
             )
         if seed_layer.slice_index is None:
-            return AlgorithmResult.failure("Seed mask has no slice_index")
+            return AlgorithmResult.failure("种子掩膜没有 slice_index")
 
         ai_service = ctx.services.get("ai_service")
         volume_store = ctx.services.get("volume_store")
         if ai_service is None or volume_store is None:
             return AlgorithmResult.failure(
-                "Required services missing. Open the AI Dock and start AI."
+                "所需服务缺失，请先打开 AI 面板并启动 AI。"
             )
         if not ai_service.is_ready():
             return AlgorithmResult.failure(
-                f"AI service not ready (state={ai_service.state.value})."
+                f"AI 服务未就绪（状态={ai_service.state.value}）。"
             )
         predictor = ai_service.video_predictor
         if predictor is None:
             return AlgorithmResult.failure(
-                "SAM3 video predictor is not loaded. Enable load_video_model"
-                " in SAM3Config and restart the AI service."
+                "SAM3 视频预测器未加载。请在 SAM3Config 中启用 load_video_model"
+                " 并重启 AI 服务。"
             )
 
         axis = str(seed_layer.axis)
@@ -121,11 +121,11 @@ class SAM3PropagateAlgorithm(Algorithm):
         first = max(0, seed_index - int(ctx.params.backward_steps))
         last = min(axis_size - 1, seed_index + int(ctx.params.forward_steps))
         if last < first:
-            return AlgorithmResult.failure("Propagation range is empty")
+            return AlgorithmResult.failure("传播范围为空")
         indices = list(range(first, last + 1))
         seed_frame_idx = indices.index(seed_index)
 
-        ctx.report_progress(0.05, f"Exporting {len(indices)} frames")
+        ctx.report_progress(0.05, f"导出 {len(indices)} 帧")
         export = export_axis_range_to_jpegs(
             volume_store,
             volume_layer.volume_id,
@@ -134,17 +134,17 @@ class SAM3PropagateAlgorithm(Algorithm):
             clim=volume_layer.clim,
         )
 
-        ai_service.mark_busy("SAM3 propagating")
+        ai_service.mark_busy("SAM3 传播中")
         session_state = None
         try:
             ctx.check_cancel()
             box_norm = _seed_box_normalised(seed_layer.mask, export.width, export.height)
             if box_norm is None:
                 return AlgorithmResult.failure(
-                    "Seed mask is empty — cannot derive a bounding box."
+                    "种子掩膜为空，无法推导边界框。"
                 )
 
-            ctx.report_progress(0.1, "Initialising SAM3 video session")
+            ctx.report_progress(0.1, "初始化 SAM3 视频会话")
             session_state = predictor.init_state(
                 resource_path=str(export.directory),
                 async_loading_frames=False,
@@ -152,7 +152,7 @@ class SAM3PropagateAlgorithm(Algorithm):
             )
             text = ctx.params.text_prompt.strip() or "visual"
 
-            ctx.report_progress(0.2, "Adding seed prompt")
+            ctx.report_progress(0.2, "添加种子提示")
             predictor.add_prompt(
                 inference_state=session_state,
                 frame_idx=seed_frame_idx,
@@ -164,7 +164,7 @@ class SAM3PropagateAlgorithm(Algorithm):
                 obj_id=1,
             )
 
-            ctx.report_progress(0.25, "Propagating")
+            ctx.report_progress(0.25, "传播中")
             collected: dict[int, np.ndarray] = {}
             scores: dict[int, float] = {}
             total_frames = len(indices)
@@ -180,7 +180,7 @@ class SAM3PropagateAlgorithm(Algorithm):
                     done = len(collected)
                     ctx.report_progress(
                         0.25 + 0.7 * (done / max(total_frames, 1)),
-                        f"Frame {int(frame_idx) - seed_frame_idx + seed_index}",
+                        f"第 {int(frame_idx) - seed_frame_idx + seed_index} 帧",
                     )
                     if (
                         ctx.params.drop_low_confidence_frames
@@ -215,9 +215,9 @@ class SAM3PropagateAlgorithm(Algorithm):
                 logger.exception("Failed to clean up SAM3 frames")
 
         if not collected:
-            return AlgorithmResult.failure("Propagation produced no frames")
+            return AlgorithmResult.failure("传播没有产生任何帧")
 
-        ctx.report_progress(0.95, "Stacking 3D mask")
+        ctx.report_progress(0.95, "叠加三维掩膜")
         ordered_frames = sorted(collected.items(), key=lambda kv: kv[0])
         height, width = ordered_frames[0][1].shape
         volume_mask = np.zeros((len(indices), height, width), dtype=bool)
@@ -226,8 +226,9 @@ class SAM3PropagateAlgorithm(Algorithm):
             volume_mask[frame_idx] = mask
             confidence_arr[frame_idx] = scores.get(frame_idx, 0.0)
 
+        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(axis, axis)
         layer = MaskLayer(
-            name=f"{ctx.params.name_prefix} ({axis} {first}-{last})",
+            name=f"{ctx.params.name_prefix}（{axis_name} {first}-{last}）",
             mask=volume_mask,
             confidence=confidence_arr,
             axis=axis,
@@ -248,12 +249,12 @@ class SAM3PropagateAlgorithm(Algorithm):
             },
         )
 
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         return AlgorithmResult.success(
             output_layers=[layer],
             summary=(
-                f"SAM3 propagation: covered {len(collected)} of {len(indices)}"
-                f" frames around {axis}={seed_index}"
+                f"SAM3 传播：在 {axis_name}={seed_index} 周围覆盖"
+                f" {len(collected)}/{len(indices)} 帧"
             ),
         )
 

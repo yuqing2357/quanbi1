@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+def _configure_matplotlib_fonts() -> None:
+    try:
+        import matplotlib as mpl
+    except Exception:  # pragma: no cover - optional runtime dependency
+        return
+    mpl.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "DejaVu Sans",
+    ]
+    mpl.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_fonts()
+
 PALETTE = [
     (0.894, 0.102, 0.110, 0.88),
     (0.216, 0.494, 0.722, 0.88),

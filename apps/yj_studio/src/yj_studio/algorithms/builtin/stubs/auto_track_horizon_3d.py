@@ -19,10 +19,9 @@ class AutoTrackHorizon3DParams(BaseModel):
 class AutoTrackHorizon3DAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "horizon.autotrack_3d"
     category: ClassVar[str] = "horizon"
-    label: ClassVar[str] = "Horizon Autotrack (3D)"
+    label: ClassVar[str] = "层位自动追踪（3D）"
     description: ClassVar[str] = (
-        "3D region-grow style horizon propagation from a HorizonStick seed."
-        " Phase 2."
+        "从 HorizonStick 种子出发，以 3D 区域生长式方式传播层位。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = AutoTrackHorizon3DParams
     layer_inputs: ClassVar[dict[str, str]] = {"volume": "volume", "seed": "horizon_stick"}

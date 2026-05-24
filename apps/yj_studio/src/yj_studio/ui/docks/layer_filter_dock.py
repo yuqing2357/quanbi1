@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QAbstractItemView, QDockWidget, QTreeWidget, QTreeWi
 
 from yj_studio.scene.layer import Layer
 from yj_studio.scene.layer_store import LayerStore
+from yj_studio.ui.text import layer_kind_label
 
 
 class LayerFilterDock(QDockWidget):
@@ -29,7 +30,7 @@ class LayerFilterDock(QDockWidget):
 
         self.tree = QTreeWidget(self)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Type", "Details"])
+        self.tree.setHeaderLabels(["名称", "类型", "详情"])
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_activated)
@@ -80,7 +81,7 @@ class LayerFilterDock(QDockWidget):
         self._updating = True
         try:
             item.setText(0, layer.name)
-            item.setText(1, layer.kind)
+            item.setText(1, layer_kind_label(layer.kind))
             item.setText(2, _layer_details(layer))
             item.setCheckState(0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
         finally:
@@ -128,9 +129,9 @@ class LayerFilterDock(QDockWidget):
 def _layer_details(layer: Layer) -> str:
     path = layer.metadata.get("path")
     if path:
-        return str(path)
+        return f"路径：{path}"
     if layer.kind == "well":
-        return f"depth={layer.metadata.get('z_top', '?')}..{layer.metadata.get('z_bottom', '?')}"
+        return f"深度：{layer.metadata.get('z_top', '?')}..{layer.metadata.get('z_bottom', '?')}"
     if layer.kind == "well_log":
-        return str(layer.metadata.get("source_path", ""))
+        return f"来源：{layer.metadata.get('source_path', '')}"
     return ""

@@ -13,7 +13,7 @@ from yj_studio.view.picker import Picker
 
 class PointPickTool(InteractionTool):
     def __init__(self) -> None:
-        super().__init__(id="point_pick", label="Point Pick", icon="crosshair", cursor="crosshair")
+        super().__init__(id="point_pick", label="点选", icon="crosshair", cursor="crosshair")
         self._picker = Picker()
 
     def on_mouse_press(self, view, event) -> bool:
@@ -29,7 +29,7 @@ class PointPickTool(InteractionTool):
 
         layer_store.select([selected_id])
         layer = layer_store.get(selected_id)
-        tool_notify(view, f"Selected {layer.name}")
+        tool_notify(view, f"已选中 {layer.name}")
         return True
 
     def _pick_layer_id(self, view, event) -> str | None:

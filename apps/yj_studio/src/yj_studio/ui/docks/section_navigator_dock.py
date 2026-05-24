@@ -3,6 +3,8 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QDockWidget
 
+from yj_studio.ui.text import section_axis_label
+
 
 class SectionNavigatorDock(QDockWidget):
     """List opened 2D section views."""
@@ -11,24 +13,24 @@ class SectionNavigatorDock(QDockWidget):
     section_close_requested = pyqtSignal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Sections", parent)
+        super().__init__("剖面", parent)
         self._items: dict[str, QTreeWidgetItem] = {}
 
         content = QWidget(self)
         layout = QVBoxLayout(content)
         self.tree = QTreeWidget(content)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Name", "Axis", "Index"])
+        self.tree.setHeaderLabels(["名称", "轴", "索引"])
         self.tree.itemDoubleClicked.connect(self._activate_item)
         layout.addWidget(self.tree)
 
-        close_button = QPushButton("Close", content)
+        close_button = QPushButton("关闭", content)
         close_button.clicked.connect(self._close_current)
         layout.addWidget(close_button)
         self.setWidget(content)
 
     def add_section(self, section_id: str, title: str, axis: str, index: int) -> None:
-        item = QTreeWidgetItem([title, axis, str(index)])
+        item = QTreeWidgetItem([title, section_axis_label(axis), str(index)])
         item.setData(0, Qt.ItemDataRole.UserRole, section_id)
         self._items[section_id] = item
         self.tree.addTopLevelItem(item)

@@ -18,10 +18,9 @@ class RegionGrowParams(BaseModel):
 class RegionGrowAlgorithm(PhaseTwoStub):
     id: ClassVar[str] = "mask.region_grow"
     category: ClassVar[str] = "reservoir"
-    label: ClassVar[str] = "Region Grow"
+    label: ClassVar[str] = "区域生长"
     description: ClassVar[str] = (
-        "Grow a seed mask outward while neighbours stay within tolerance of"
-        " the seed mean amplitude. Phase 2."
+        "在邻域满足与种子平均振幅相近的条件下向外扩张种子掩膜。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = RegionGrowParams
     layer_inputs: ClassVar[dict[str, str]] = {"volume": "volume", "seed": "mask"}

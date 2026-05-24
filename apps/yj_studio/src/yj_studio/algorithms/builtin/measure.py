@@ -28,7 +28,7 @@ from yj_studio.scene.layers import (
 
 class DistanceParams(BaseModel):
     depth_step_m: float = Field(default=DEPTH_STEP_TO_SAMPLE, gt=0.0)
-    name: str = Field(default="Polyline length")
+    name: str = Field(default="折线长度")
 
 
 class DistanceOutput(BaseModel):
@@ -41,11 +41,10 @@ class DistanceOutput(BaseModel):
 class MeasureDistanceAlgorithm(Algorithm):
     id: ClassVar[str] = "measure.distance"
     category: ClassVar[str] = "measure"
-    label: ClassVar[str] = "Polyline Distance"
+    label: ClassVar[str] = "折线长度"
     description: ClassVar[str] = (
-        "Measure the total length of a polyline / horizon-stick. Reports both"
-        " the planar (inline/xline) distance and the 3D distance with z"
-        " expressed in metres via depth_step_m."
+        "测量折线或层位杆的总长度，同时报告平面（纵向/横向）长度和按"
+        " depth_step_m 换算后的三维长度。"
     )
     input_schema: ClassVar[type[BaseModel]] = DistanceParams
     output_schema: ClassVar[type[BaseModel]] = DistanceOutput
@@ -55,9 +54,9 @@ class MeasureDistanceAlgorithm(Algorithm):
         layer = ctx.input_layers.get("path")
         points = _points_for(layer)
         if points is None or points.shape[0] < 2:
-            return AlgorithmResult.failure("Path layer needs at least 2 points")
+            return AlgorithmResult.failure("路径至少需要 2 个点")
 
-        ctx.report_progress(0.3, "Computing segments")
+        ctx.report_progress(0.3, "计算线段")
         deltas = np.diff(points, axis=0)
         xy_lengths = np.hypot(deltas[:, 0], deltas[:, 1])
         z_lengths_m = np.abs(deltas[:, 2]) * float(ctx.params.depth_step_m)
@@ -70,7 +69,7 @@ class MeasureDistanceAlgorithm(Algorithm):
         )
 
         measurement = MeasurementLayer(
-            name=ctx.params.name or "Polyline length",
+            name=ctx.params.name or "折线长度",
             geometry=points.astype(np.float32),
             values={"total_xy": stats.total_xy, "total_3d_m": stats.total_3d_m},
             units={"total_xy": "cells", "total_3d_m": "m"},
@@ -79,16 +78,16 @@ class MeasureDistanceAlgorithm(Algorithm):
             metadata={"algorithm": MeasureDistanceAlgorithm.id, "source_layer": layer.name},
             provenance={"source": "algorithm.measure.distance", "input_layer_id": layer.id},
         )
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         return AlgorithmResult.success(
             output_layers=[measurement],
-            summary=f"Distance: {stats.total_3d_m:.1f} m over {stats.segment_count} segments",
+            summary=f"长度：{stats.total_3d_m:.1f} m，共 {stats.segment_count} 段",
         )
 
 
 class AreaParams(BaseModel):
     depth_step_m: float = Field(default=DEPTH_STEP_TO_SAMPLE, gt=0.0)
-    name: str = Field(default="Polygon area")
+    name: str = Field(default="多边形面积")
 
 
 class AreaOutput(BaseModel):
@@ -101,10 +100,10 @@ class AreaOutput(BaseModel):
 class MeasureAreaAlgorithm(Algorithm):
     id: ClassVar[str] = "measure.area"
     category: ClassVar[str] = "measure"
-    label: ClassVar[str] = "Polygon Area"
+    label: ClassVar[str] = "多边形面积"
     description: ClassVar[str] = (
-        "Compute the planar (inline/xline) area and perimeter of a closed"
-        " polygon using the shoelace formula. Z is ignored."
+        "使用鞋带公式计算闭合多边形在平面（纵向/横向）上的面积与周长，"
+        "不考虑 Z 轴。"
     )
     input_schema: ClassVar[type[BaseModel]] = AreaParams
     output_schema: ClassVar[type[BaseModel]] = AreaOutput
@@ -113,12 +112,12 @@ class MeasureAreaAlgorithm(Algorithm):
     def run(self, ctx: AlgorithmContext) -> AlgorithmResult:
         layer = ctx.input_layers.get("polygon")
         if not isinstance(layer, PolygonLayer) or layer.vertices is None:
-            return AlgorithmResult.failure("Need a PolygonLayer with vertices")
+            return AlgorithmResult.failure("需要一个带顶点的 PolygonLayer")
         verts = np.asarray(layer.vertices, dtype=np.float32)
         if verts.shape[0] < 3:
-            return AlgorithmResult.failure("Polygon needs at least 3 vertices")
+            return AlgorithmResult.failure("多边形至少需要 3 个顶点")
 
-        ctx.report_progress(0.4, "Computing area")
+        ctx.report_progress(0.4, "计算面积")
         x = verts[:, 0]
         y = verts[:, 1]
         area = 0.5 * float(np.abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
@@ -129,7 +128,7 @@ class MeasureAreaAlgorithm(Algorithm):
         stats = AreaOutput(area_xy=area, perimeter_xy=perimeter, vertex_count=int(verts.shape[0]))
 
         measurement = MeasurementLayer(
-            name=ctx.params.name or "Polygon area",
+            name=ctx.params.name or "多边形面积",
             geometry=verts,
             values={"area_xy": stats.area_xy, "perimeter_xy": stats.perimeter_xy},
             units={"area_xy": "cells^2", "perimeter_xy": "cells"},
@@ -138,10 +137,10 @@ class MeasureAreaAlgorithm(Algorithm):
             metadata={"algorithm": MeasureAreaAlgorithm.id, "source_layer": layer.name},
             provenance={"source": "algorithm.measure.area", "input_layer_id": layer.id},
         )
-        ctx.report_progress(1.0, "Done")
+        ctx.report_progress(1.0, "完成")
         return AlgorithmResult.success(
             output_layers=[measurement],
-            summary=f"Area: {stats.area_xy:.1f} cells² (perimeter {stats.perimeter_xy:.1f})",
+            summary=f"面积：{stats.area_xy:.1f} 单元²（周长 {stats.perimeter_xy:.1f}）",
         )
 
 
