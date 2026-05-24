@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+pytest-tmp/
+build/
+apps/yj_studio/tests/_artifacts/
+apps/yj_studio/tests/_scratch/
+.venv/
+dist/
+*.egg-info/
+weights/
