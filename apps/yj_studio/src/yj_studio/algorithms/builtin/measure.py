@@ -43,7 +43,7 @@ class MeasureDistanceAlgorithm(Algorithm):
     category: ClassVar[str] = "measure"
     label: ClassVar[str] = "折线长度"
     description: ClassVar[str] = (
-        "测量折线或层位杆的总长度，同时报告平面（纵向/横向）长度和按"
+        "测量折线或层位杆的总长度，同时报告平面（Inline/Xline）长度和按"
         " depth_step_m 换算后的三维长度。"
     )
     input_schema: ClassVar[type[BaseModel]] = DistanceParams
@@ -102,7 +102,7 @@ class MeasureAreaAlgorithm(Algorithm):
     category: ClassVar[str] = "measure"
     label: ClassVar[str] = "多边形面积"
     description: ClassVar[str] = (
-        "使用鞋带公式计算闭合多边形在平面（纵向/横向）上的面积与周长，"
+        "使用鞋带公式计算闭合多边形在平面（Inline/Xline）上的面积与周长，"
         "不考虑 Z 轴。"
     )
     input_schema: ClassVar[type[BaseModel]] = AreaParams

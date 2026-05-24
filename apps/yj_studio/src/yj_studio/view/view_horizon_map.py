@@ -85,8 +85,8 @@ class ViewHorizonMap(QWidget):
                 zorder=6,
             )
         axes.set_title(self.data.title)
-        axes.set_xlabel("纵向线号")
-        axes.set_ylabel("横向线号")
+        axes.set_xlabel("Inline")
+        axes.set_ylabel("Xline")
         self._figure.colorbar(image, ax=axes, label=self.data.colorbar_label)
         self._canvas.draw_idle()
 

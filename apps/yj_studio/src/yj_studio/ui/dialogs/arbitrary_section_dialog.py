@@ -170,8 +170,8 @@ class ArbitrarySectionDialog(QDialog):
             self._axes.set_facecolor("#202124")
         self._axes.set_xlim(0.0, float(max(0, nx - 1)))
         self._axes.set_ylim(0.0, float(max(0, ny - 1)))
-        self._axes.set_xlabel("纵向线号")
-        self._axes.set_ylabel("横向线号")
+        self._axes.set_xlabel("Inline")
+        self._axes.set_ylabel("Xline")
         self._axes.set_title("顶视图剖面路径")
         self._draw_wells()
         (self._line_artist,) = self._axes.plot([], [], color="#ffb000", linewidth=2.2, zorder=5)
@@ -254,10 +254,10 @@ def parse_polyline_text(text: str) -> np.ndarray:
         line = line.replace(";", ",").replace("\t", ",")
         parts = [part.strip() for part in line.split(",") if part.strip()]
         if len(parts) < 2:
-            raise ValueError(f"应为 纵向线号,横向线号：{raw_line!r}")
+            raise ValueError(f"应为 Inline,Xline：{raw_line!r}")
         points.append((float(parts[0]), float(parts[1])))
     if len(points) < 2:
-        raise ValueError("请至少输入两个 纵向线号,横向线号 点。")
+        raise ValueError("请至少输入两个 Inline,Xline 点。")
     return np.asarray(points, dtype=np.float32)
 
 

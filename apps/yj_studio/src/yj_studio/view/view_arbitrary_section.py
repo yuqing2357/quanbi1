@@ -81,7 +81,7 @@ class ViewArbitrarySection(QWidget):
         )
         self._axes.set_title(layer.name)
         self._axes.set_xlabel(layer.axis_label)
-        self._axes.set_ylabel("采样")
+        self._axes.set_ylabel("Sample")
         self._canvas.draw()
 
     def _draw_message(self, message: str) -> None:

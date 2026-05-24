@@ -18,9 +18,9 @@ LAYER_KIND_LABELS = {
 }
 
 SECTION_AXIS_LABELS = {
-    "inline": "纵向剖面",
-    "xline": "横向剖面",
-    "z": "Z向剖面",
+    "inline": "Inline 剖面",
+    "xline": "Xline 剖面",
+    "z": "Z 剖面",
     "arbitrary": "任意剖面",
     "well": "井剖面",
 }

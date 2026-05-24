@@ -21,7 +21,7 @@ class HorizonAutotrackAlgorithm(PhaseTwoStub):
     category: ClassVar[str] = "horizon"
     label: ClassVar[str] = "层位自动追踪（2D）"
     description: ClassVar[str] = (
-        "沿纵向/横向相似性在体内传播手工拾取的层位杆。第二阶段提供。"
+        "沿 Inline/Xline 相似性在体内传播手工拾取的层位杆。第二阶段提供。"
     )
     input_schema: ClassVar[type[BaseModel]] = HorizonAutotrackParams
     layer_inputs: ClassVar[dict[str, str]] = {"volume": "volume", "seed": "horizon_stick"}

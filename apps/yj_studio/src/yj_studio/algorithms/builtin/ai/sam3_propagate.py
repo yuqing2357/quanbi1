@@ -226,7 +226,7 @@ class SAM3PropagateAlgorithm(Algorithm):
             volume_mask[frame_idx] = mask
             confidence_arr[frame_idx] = scores.get(frame_idx, 0.0)
 
-        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(axis, axis)
+        axis_name = {"inline": "Inline", "xline": "Xline", "z": "Z"}.get(axis, axis)
         layer = MaskLayer(
             name=f"{ctx.params.name_prefix}（{axis_name} {first}-{last}）",
             mask=volume_mask,

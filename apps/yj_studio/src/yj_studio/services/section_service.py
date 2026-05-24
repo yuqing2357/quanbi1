@@ -54,10 +54,10 @@ def extract_orthogonal_section(
     values = np.asarray(raw, dtype=np.float32).T
     nx, ny, nz = layer.shape
     if axis == "inline":
-        return OrthogonalSection(axis, clipped_index, values, "横向线号", "采样", (0, ny - 1, nz - 1, 0))
+        return OrthogonalSection(axis, clipped_index, values, "Xline", "Sample", (0, ny - 1, nz - 1, 0))
     if axis == "xline":
-        return OrthogonalSection(axis, clipped_index, values, "纵向线号", "采样", (0, nx - 1, nz - 1, 0))
-    return OrthogonalSection(axis, clipped_index, values, "纵向线号", "横向线号", (0, nx - 1, ny - 1, 0))
+        return OrthogonalSection(axis, clipped_index, values, "Inline", "Sample", (0, nx - 1, nz - 1, 0))
+    return OrthogonalSection(axis, clipped_index, values, "Inline", "Xline", (0, nx - 1, ny - 1, 0))
 
 
 def horizon_intersection(layer: HorizonLayer, axis: SectionAxis, index: int) -> SectionLine | None:

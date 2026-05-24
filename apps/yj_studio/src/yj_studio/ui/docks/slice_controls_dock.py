@@ -171,9 +171,9 @@ class SliceControlsDock(QDockWidget):
         roi_layout.addWidget(self._roi_enable, 0, 0, 1, 3)
         self._roi_spins: dict[str, QSpinBox] = {}
         labels_grid = [
-            ("纵向", "i0", "i1", 1),
-            ("横向", "j0", "j1", 2),
-            ("Z向", "k0", "k1", 3),
+            ("Inline", "i0", "i1", 1),
+            ("Xline", "j0", "j1", 2),
+            ("Z", "k0", "k1", 3),
         ]
         for label_text, lo_key, hi_key, row in labels_grid:
             roi_layout.addWidget(QLabel(label_text, roi_group), row, 0)

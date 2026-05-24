@@ -173,7 +173,7 @@ class SAM3SegmentAlgorithm(Algorithm):
         detections = detections[: int(ctx.params.keep_top_k)]
 
         output_layers: list[MaskLayer] = []
-        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(ctx.params.axis, ctx.params.axis)
+        axis_name = {"inline": "Inline", "xline": "Xline", "z": "Z"}.get(ctx.params.axis, ctx.params.axis)
         for i, det in enumerate(detections, start=1):
             # SAM3 returns a mask in image-pixel shape (rows=H, cols=W) where
             # H matches the slice's "z / sample" axis and W matches the

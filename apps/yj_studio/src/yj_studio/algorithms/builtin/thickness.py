@@ -43,8 +43,8 @@ class ThicknessAlgorithm(Algorithm):
     label: ClassVar[str] = "层间厚度"
     description: ClassVar[str] = (
         "计算上下两层位之间的点厚度。层位坐标均以采样索引表示，输出一"
-        "个 MeasurementLayer，包含厚度网格（geometry: (N, 4) = 纵向、"
-        "横向、顶层 Z、底层 Z）以及以米为单位的统计值。"
+        "个 MeasurementLayer，包含厚度网格（geometry: (N, 4) = Inline、"
+        "Xline、顶层 Z、底层 Z）以及以米为单位的统计值。"
     )
     input_schema: ClassVar[type[BaseModel]] = ThicknessParams
     output_schema: ClassVar[type[BaseModel]] = ThicknessOutput

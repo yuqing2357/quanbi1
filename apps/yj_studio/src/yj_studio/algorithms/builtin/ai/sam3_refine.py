@@ -72,7 +72,7 @@ class SAM3RefineAlgorithm(Algorithm):
             return AlgorithmResult.failure("需要一个已编辑的二维 MaskLayer 作为 'edited_mask'")
         if edited.axis not in {"inline", "xline", "z"}:
             return AlgorithmResult.failure(
-                f"编辑后的掩膜轴必须是纵向、横向或 Z 向，当前为 {edited.axis!r}"
+                f"编辑后的掩膜轴必须是 Inline、Xline 或 Z，当前为 {edited.axis!r}"
             )
         if edited.slice_index is None:
             return AlgorithmResult.failure("编辑后的掩膜没有 slice_index")
@@ -151,7 +151,7 @@ class SAM3RefineAlgorithm(Algorithm):
         detections.sort(key=lambda d: d["score"], reverse=True)
         detections = detections[: int(ctx.params.keep_top_k)]
         output_layers: list[MaskLayer] = []
-        axis_name = {"inline": "纵向", "xline": "横向", "z": "Z向"}.get(edited.axis, edited.axis)
+        axis_name = {"inline": "Inline", "xline": "Xline", "z": "Z"}.get(edited.axis, edited.axis)
         for i, det in enumerate(detections, start=1):
             # See sam3_segment.py for why the SAM3 mask is transposed at the
             # AI → scene seam: brush + MaskLayer renderer + view_2d_section
