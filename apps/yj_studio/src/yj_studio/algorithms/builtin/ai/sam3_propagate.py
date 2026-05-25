@@ -152,61 +152,71 @@ class SAM3PropagateAlgorithm(Algorithm):
             )
             text = ctx.params.text_prompt.strip() or "visual"
 
-            ctx.report_progress(0.2, "添加种子提示")
-            predictor.add_prompt(
-                inference_state=session_state,
-                frame_idx=seed_frame_idx,
-                text_str=text,
-                points=None,
-                point_labels=None,
-                boxes_xywh=[list(box_norm)],
-                box_labels=[1],
-                obj_id=1,
-            )
+            # SAM3 video predictor's weights are bfloat16; add_prompt
+            # and propagate_in_video are NOT decorated with autocast
+            # internally, so callers must provide the bf16 context.
+            # Verified via tools/smoke_sam3_video.py.
+            import torch
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-            ctx.report_progress(0.25, "传播中")
-            collected: dict[int, np.ndarray] = {}
-            scores: dict[int, float] = {}
-            total_frames = len(indices)
-
-            def _consume(generator) -> None:
-                for frame_idx, outputs in generator:
-                    ctx.check_cancel()
-                    mask, score = _extract_first_object(outputs)
-                    if mask is not None:
-                        collected[int(frame_idx)] = mask
-                        if score is not None:
-                            scores[int(frame_idx)] = float(score)
-                    done = len(collected)
-                    ctx.report_progress(
-                        0.25 + 0.7 * (done / max(total_frames, 1)),
-                        f"第 {int(frame_idx) - seed_frame_idx + seed_index} 帧",
-                    )
-                    if (
-                        ctx.params.drop_low_confidence_frames
-                        and score is not None
-                        and float(score) < ctx.params.confidence_threshold
-                    ):
-                        break
-
-            if ctx.params.forward_steps > 0:
-                _consume(
-                    predictor.model.propagate_in_video(
-                        inference_state=session_state,
-                        start_frame_idx=seed_frame_idx,
-                        max_frame_num_to_track=ctx.params.forward_steps,
-                        reverse=False,
-                    )
+            with autocast_ctx, torch.inference_mode():
+                ctx.report_progress(0.2, "添加种子提示")
+                predictor.add_prompt(
+                    inference_state=session_state,
+                    frame_idx=seed_frame_idx,
+                    text_str=text,
+                    points=None,
+                    point_labels=None,
+                    boxes_xywh=[list(box_norm)],
+                    box_labels=[1],
+                    obj_id=1,
                 )
-            if ctx.params.backward_steps > 0:
-                _consume(
-                    predictor.model.propagate_in_video(
-                        inference_state=session_state,
-                        start_frame_idx=seed_frame_idx,
-                        max_frame_num_to_track=ctx.params.backward_steps,
-                        reverse=True,
+
+                ctx.report_progress(0.25, "传播中")
+                collected: dict[int, np.ndarray] = {}
+                scores: dict[int, float] = {}
+                total_frames = len(indices)
+
+                def _consume(generator) -> None:
+                    for frame_idx, outputs in generator:
+                        ctx.check_cancel()
+                        mask, score = _extract_first_object(outputs)
+                        if mask is not None:
+                            collected[int(frame_idx)] = mask
+                            if score is not None:
+                                scores[int(frame_idx)] = float(score)
+                        done = len(collected)
+                        ctx.report_progress(
+                            0.25 + 0.7 * (done / max(total_frames, 1)),
+                            f"第 {int(frame_idx) - seed_frame_idx + seed_index} 帧",
+                        )
+                        if (
+                            ctx.params.drop_low_confidence_frames
+                            and score is not None
+                            and float(score) < ctx.params.confidence_threshold
+                        ):
+                            break
+
+                # The predictor IS the callable — no .model indirection.
+                # Verified via tools/smoke_sam3_video.py.
+                if ctx.params.forward_steps > 0:
+                    _consume(
+                        predictor.propagate_in_video(
+                            inference_state=session_state,
+                            start_frame_idx=seed_frame_idx,
+                            max_frame_num_to_track=ctx.params.forward_steps,
+                            reverse=False,
+                        )
                     )
-                )
+                if ctx.params.backward_steps > 0:
+                    _consume(
+                        predictor.propagate_in_video(
+                            inference_state=session_state,
+                            start_frame_idx=seed_frame_idx,
+                            max_frame_num_to_track=ctx.params.backward_steps,
+                            reverse=True,
+                        )
+                    )
         finally:
             ai_service.mark_ready()
             try:
@@ -289,32 +299,47 @@ def _seed_box_normalised(
 
 
 def _extract_first_object(outputs) -> tuple[np.ndarray | None, float | None]:
-    """SAM3 propagation outputs are usually ``{obj_id: {"masks": tensor,
-    "scores": tensor}}``. We track a single object (obj_id=1), so we extract
-    the first one we find.
+    """Pull the (mask, score) for our seeded object out of SAM3 video outputs.
+
+    The real schema (verified via tools/smoke_sam3_video.py) is::
+
+        {
+            "out_obj_ids":      [1, ...],
+            "out_probs":        tensor shape (n_obj,) — per-object score
+            "out_boxes_xywh":   tensor shape (n_obj, 4)
+            "out_binary_masks": tensor shape (n_obj, H, W) of bool
+            "frame_stats":      misc dict
+        }
+
+    We always seed a single object with obj_id=1; pick that one if present,
+    else fall back to slot 0.
     """
 
     if not isinstance(outputs, dict) or not outputs:
         return None, None
-    first_key = next(iter(outputs))
-    payload = outputs[first_key]
-    if isinstance(payload, dict):
-        masks = payload.get("masks")
-        scores = payload.get("scores")
-    else:
-        masks = payload
-        scores = None
-    if masks is None:
+    masks = outputs.get("out_binary_masks")
+    probs = outputs.get("out_probs")
+    obj_ids = outputs.get("out_obj_ids")
+    if masks is None or len(masks) == 0:
         return None, None
-    masks_np = _to_numpy(masks)
-    if masks_np.ndim == 4:
-        masks_np = masks_np.squeeze(1)
+    pick = 0
+    if obj_ids is not None:
+        try:
+            ids_list = list(obj_ids) if not hasattr(obj_ids, "tolist") else obj_ids.tolist()
+            if 1 in ids_list:
+                pick = ids_list.index(1)
+        except Exception:  # noqa: BLE001 — outputs schema differs across SAM3 versions
+            pick = 0
+    mask = masks[pick]
+    masks_np = _to_numpy(mask)
     if masks_np.ndim == 3:
         masks_np = masks_np[0]
-    mask = masks_np > 0
+    mask_bool = masks_np > 0
     score: float | None = None
-    if scores is not None:
-        scores_np = _to_numpy(scores).reshape(-1)
-        if scores_np.size > 0:
-            score = float(scores_np[0])
-    return mask, score
+    if probs is not None and len(probs) > pick:
+        prob_val = probs[pick]
+        if hasattr(prob_val, "item"):
+            score = float(prob_val.item())
+        else:
+            score = float(prob_val)
+    return mask_bool, score

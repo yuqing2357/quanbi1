@@ -49,12 +49,13 @@ class SAM3Config:
     # Whether to also build the video tracker (used for cross-slice
     # propagation). Skipping it roughly halves GPU memory.
     #
-    # Default OFF on Windows: the video tracker pulls in ``triton`` for one
-    # of its mask ops (sam3.model.edt) and ``triton`` does not have an
-    # official Windows wheel. Single-slice segmentation (SAM3SegmentAlgorithm
-    # + SAM3RefineAlgorithm) does not need triton, so we keep it usable by
-    # default and let users opt back in once triton is sorted out.
-    load_video_model: bool = False
+    # On Windows the video tracker depends on triton; install
+    # ``triton-windows`` (PyPI, maintained by triton-lang) and the
+    # video model loads fine. ``run_yj_studio.py`` sets
+    # KMP_DUPLICATE_LIB_OK=TRUE so triton + torch + MKL can share the
+    # process. If the load still fails for some reason (driver mismatch,
+    # missing CUDA), the loader catches it and falls back to image-only.
+    load_video_model: bool = True
     # SAM3 source tree must be importable. When the source lives outside
     # site-packages we prepend this path to sys.path before the import.
     sam3_source_root: Path | None = DEFAULT_SAM3_SOURCE_ROOT

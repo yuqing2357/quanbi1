@@ -25,6 +25,7 @@ from uuid import uuid4
 
 import numpy as np
 import logging
+from pathlib import Path
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -58,6 +59,55 @@ _AXIS_LABELS = {
     "i": "I 剖面 (inline)",
     "j": "J 剖面 (xline)",
 }
+
+
+def _extract_video_mask(outputs) -> tuple[np.ndarray | None, float | None]:
+    """Pull the (mask, score) for our seeded object out of a video frame.
+
+    The SAM3 video predictor yields ``(frame_idx, outputs)`` where
+    outputs is a dict like::
+
+        {
+            "out_obj_ids":      [1, ...],
+            "out_probs":        tensor shape (n_obj,) — per-object score
+            "out_boxes_xywh":   tensor shape (n_obj, 4)
+            "out_binary_masks": tensor shape (n_obj, H, W) of bool
+            "frame_stats":      misc dict
+        }
+
+    We always seed a single object with obj_id=1; pick that one. The
+    schema was verified live via tools/smoke_sam3_video.py.
+    """
+    if not isinstance(outputs, dict):
+        return None, None
+    masks = outputs.get("out_binary_masks")
+    probs = outputs.get("out_probs")
+    obj_ids = outputs.get("out_obj_ids")
+    if masks is None or len(masks) == 0:
+        return None, None
+    # Prefer obj_id=1 (our seed); fall back to slot 0.
+    pick = 0
+    if obj_ids is not None:
+        try:
+            ids_list = list(obj_ids) if not hasattr(obj_ids, "tolist") else obj_ids.tolist()
+            if 1 in ids_list:
+                pick = ids_list.index(1)
+        except Exception:    # noqa: BLE001 — outputs schema differs across SAM3 versions
+            pick = 0
+    mask = masks[pick]
+    if hasattr(mask, "detach"):
+        mask = mask.detach().cpu().numpy()
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim == 3:    # (1, H, W) sometimes
+        mask = mask[0]
+    score: float | None = None
+    if probs is not None and len(probs) > pick:
+        prob_val = probs[pick]
+        if hasattr(prob_val, "item"):
+            score = float(prob_val.item())
+        else:
+            score = float(prob_val)
+    return mask, score
 
 
 class SAM3Workbench(QWidget):
@@ -105,6 +155,11 @@ class SAM3Workbench(QWidget):
         # tracker lost the body or jumped to the wrong neighbour.
         self._tracked_masks: dict[int, np.ndarray] = {}
         self._track_range: tuple[int, int] | None = None    # (lo, hi) inclusive
+        # Frames rendered during the last sweep, keyed (axis, index).
+        # render_roi_section is ~1.5s/frame because of the cell quad
+        # rasterisation; reusing the renders here makes ▶ playback and
+        # spinbox scrubbing across tracked frames close to instant.
+        self._frame_cache: dict[tuple[str, int], SAM3Frame] = {}
         # Playback timer for the ▶ button. None when not playing.
         self._playback_timer = None
 
@@ -239,11 +294,20 @@ class SAM3Workbench(QWidget):
         self._propagate_button = QPushButton("沿轴追踪…")
         self._propagate_button.setEnabled(False)
         self._propagate_button.setToolTip(
-            "把当前 mask 沿剖面轴向前后追踪 N 帧,"
-            "汇聚成 3D 储层选择体。"
+            "按帧重新调 SAM3 image 模型,用上帧 mask 的 bbox 引导下帧。"
+            "稳定但短距,适合追踪十几帧。"
         )
         self._propagate_button.clicked.connect(self._propagate_along_axis)
         controls.addWidget(self._propagate_button)
+
+        self._video_track_button = QPushButton("视频追踪…")
+        self._video_track_button.setEnabled(False)
+        self._video_track_button.setToolTip(
+            "把整段轴当成视频,用 SAM3 video predictor 跨帧追踪。"
+            "带 appearance memory,长距追踪比 box tracking 稳定得多。"
+        )
+        self._video_track_button.clicked.connect(self._propagate_with_video_predictor)
+        controls.addWidget(self._video_track_button)
 
         controls.addStretch(1)
         self._info_label = QLabel("")
@@ -499,6 +563,7 @@ class SAM3Workbench(QWidget):
         self._last_mask = mask
         self._save_button.setEnabled(True)
         self._propagate_button.setEnabled(True)
+        self._video_track_button.setEnabled(True)
 
     @staticmethod
     def _qapp():
@@ -550,6 +615,271 @@ class SAM3Workbench(QWidget):
         self._index_spin.setValue(next_idx)
 
     # ------------------------------------------------------------------ propagation
+
+    def _propagate_with_video_predictor(self) -> None:
+        """Use SAM3's video predictor for cross-axis tracking.
+
+        Workflow:
+        1. Ask user how many frames forward / backward to track.
+        2. Render every frame in [seed-back, seed+fwd] through the
+           offscreen ROI pipeline, then dump them as JPEGs into a
+           temp directory (video predictor only accepts file paths).
+        3. Init a video session on that directory.
+        4. Add the current frame's mask as a box+text seed prompt.
+        5. Call ``propagate_in_video`` forward then backward; collect
+           per-frame masks and reverse-lookup their cells.
+        6. Emit a 3D selection layer just like box tracking.
+
+        Heavier than box tracking but much more stable across long
+        sweeps because the video predictor maintains an appearance
+        memory across frames.
+        """
+        from PyQt6.QtWidgets import QInputDialog
+        from PIL import Image
+        from yj_studio.scene.layers import ReservoirSelectionLayer
+
+        if self._frame is None or self._last_mask is None:
+            return
+        if self._ai_service is None or not self._ai_service.is_ready():
+            QMessageBox.warning(self, "SAM3", "AI 服务未就绪。")
+            return
+        predictor = self._ai_service.video_predictor
+        if predictor is None:
+            QMessageBox.warning(
+                self, "SAM3 视频追踪",
+                "未加载 SAM3 视频模型 — 请确认已 pip install triton-windows "
+                "并在配置里启用 load_video_model,然后重启 AI 服务。",
+            )
+            return
+
+        # Range to track over.
+        lo, hi = self._propagation_range()
+        seed_idx = self._frame.index
+        max_back = seed_idx - lo
+        max_fwd = (hi - 1) - seed_idx
+        n_each, ok = QInputDialog.getInt(
+            self, "SAM3 视频追踪",
+            f"种子帧 {self._axis}={seed_idx}\n"
+            f"前后各追踪多少帧? (范围 [-{max_back}, +{max_fwd}])",
+            value=min(20, max(max_back, max_fwd)),
+            min=1, max=max(1, max(max_back, max_fwd)),
+        )
+        if not ok:
+            return
+        idx_lo = max(lo, seed_idx - n_each)
+        idx_hi = min(hi - 1, seed_idx + n_each)
+        indices = list(range(idx_lo, idx_hi + 1))
+        seed_frame_in_window = seed_idx - idx_lo
+
+        # Seed bbox from current mask, normalised to xywh as SAM3 wants.
+        ys, xs = np.where(self._last_mask)
+        if xs.size == 0:
+            return
+        H, W = self._frame.image.shape[:2]
+        x0, y0 = float(xs.min()), float(ys.min())
+        x1, y1 = float(xs.max()), float(ys.max())
+        cx = (x0 + x1) / 2.0 / W
+        cy = (y0 + y1) / 2.0 / H
+        bw = (x1 - x0) / W
+        bh = (y1 - y0) / H
+        seed_box_xywh = [cx, cy, bw, bh]
+        text = self._text_edit.text().strip() or "visual"
+
+        # Reset stash so the viewer reflects this new run.
+        self._tracked_masks = {seed_idx: self._last_mask.copy()}
+
+        self._info_label.setText(f"渲染 {len(indices)} 帧…")
+        self._canvas.setEnabled(False)
+        QApp = self._qapp()
+        if QApp is not None:
+            QApp.processEvents()
+
+        import tempfile
+        tempdir = Path(tempfile.mkdtemp(prefix="yj_sam3_video_"))
+        frame_lookup: list[SAM3Frame] = []
+        try:
+            self._ai_service.mark_busy("SAM3 视频追踪 (渲染帧)")
+            # Render and dump every frame as JPEG. Use 5-digit padded
+            # filenames so SAM3's video loader sees them in order.
+            for offset, idx in enumerate(indices):
+                cache_key = (self._axis, idx)
+                frame = self._frame_cache.get(cache_key)
+                if frame is None:
+                    frame = render_roi_section(
+                        self._grid, self._axis, idx,
+                        self._roi, transform=self._transform,
+                    )
+                    self._frame_cache[cache_key] = frame
+                frame_lookup.append(frame)
+                Image.fromarray(frame.image).save(
+                    tempdir / f"{offset:05d}.jpg", quality=92,
+                )
+                if QApp is not None and offset % 4 == 0:
+                    self._info_label.setText(
+                        f"渲染 {offset + 1}/{len(indices)} 帧"
+                    )
+                    QApp.processEvents()
+
+            self._info_label.setText("初始化 SAM3 视频会话…")
+            QApp.processEvents() if QApp is not None else None
+            session_state = predictor.init_state(
+                resource_path=str(tempdir),
+                async_loading_frames=False,
+                video_loader_type="jpg",
+            )
+
+            # SAM3 video predictor's weights are bfloat16 once it has
+            # been loaded; the conv layers downstream of add_prompt /
+            # propagate_in_video expect the activations to match. SAM3
+            # itself decorates some entry points with autocast but NOT
+            # add_prompt or propagate_in_video, so callers have to
+            # provide the context (matching the official demo notebook).
+            import torch
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+            with autocast_ctx, torch.inference_mode():
+                predictor.add_prompt(
+                    inference_state=session_state,
+                    frame_idx=seed_frame_in_window,
+                    text_str=text,
+                    points=None,
+                    point_labels=None,
+                    boxes_xywh=[seed_box_xywh],
+                    box_labels=[1],
+                    obj_id=1,
+                )
+
+                collected: dict[int, np.ndarray] = {}
+                scores: dict[int, float] = {}
+
+                import torch as _torch
+                import time as _time
+
+                def _mem() -> str:
+                    free_b, total_b = _torch.cuda.mem_get_info()
+                    alloc_b = _torch.cuda.memory_allocated()
+                    resv_b = _torch.cuda.memory_reserved()
+                    return (
+                        f"free={free_b / 1024**3:.2f}G "
+                        f"alloc={alloc_b / 1024**3:.2f}G "
+                        f"resv={resv_b / 1024**3:.2f}G"
+                    )
+
+                def _consume(generator):
+                    last_t = _time.time()
+                    for frame_idx_local, outputs in generator:
+                        # Per-frame wall clock + GPU memory log. Lets us
+                        # see at a glance whether reverse propagation is
+                        # paying CPU↔GPU swap cost (free shrinking each
+                        # frame) or stuck on something else.
+                        now = _time.time()
+                        dt = now - last_t
+                        last_t = now
+                        logger.info(
+                            "sam3 video frame %d: %.2fs %s",
+                            int(frame_idx_local), dt, _mem(),
+                        )
+                        mask, score = _extract_video_mask(outputs)
+                        if mask is not None:
+                            collected[int(frame_idx_local)] = mask
+                            scores[int(frame_idx_local)] = float(score or 0.0)
+                        self._info_label.setText(
+                            f"传播帧 {len(collected)}/{len(indices)} "
+                            f"(score {(score or 0):.2f}, {dt:.1f}s)"
+                        )
+                        if QApp is not None:
+                            QApp.processEvents()
+
+                self._info_label.setText("正向传播…")
+                QApp.processEvents() if QApp is not None else None
+                # The video predictor *is* the callable — no .model
+                # indirection, unlike sam3_propagate.py's geometry-side
+                # predictor wrapper. Confirmed via tools/smoke_sam3_video.
+                # max_frame_num_to_track is relative to the JPEG window,
+                # not the absolute ROI. We exported only [idx_lo, idx_hi]
+                # so the predictor can walk at most n_each frames each
+                # way before running off the JPEG list.
+                fwd_budget = idx_hi - seed_idx
+                back_budget = seed_idx - idx_lo
+                _consume(predictor.propagate_in_video(
+                    inference_state=session_state,
+                    start_frame_idx=seed_frame_in_window,
+                    max_frame_num_to_track=fwd_budget,
+                    reverse=False,
+                ))
+                self._info_label.setText("反向传播…")
+                QApp.processEvents() if QApp is not None else None
+                _consume(predictor.propagate_in_video(
+                    inference_state=session_state,
+                    start_frame_idx=seed_frame_in_window,
+                    max_frame_num_to_track=back_budget,
+                    reverse=True,
+                ))
+        except Exception as exc:    # noqa: BLE001
+            logger.exception("SAM3 video propagation failed")
+            QMessageBox.critical(self, "SAM3 视频追踪", f"失败:{exc}")
+            self._info_label.setText("视频追踪失败")
+            return
+        finally:
+            self._ai_service.mark_ready()
+            self._canvas.setEnabled(True)
+            # Clean up temp JPEGs.
+            try:
+                import shutil
+                shutil.rmtree(tempdir, ignore_errors=True)
+            except Exception:    # noqa: BLE001
+                pass
+
+        if not collected:
+            self._info_label.setText("视频追踪未产生 mask")
+            return
+
+        # Reverse-lookup cells per frame; also cache masks for playback.
+        accumulated_cells: list[np.ndarray] = []
+        index_lo_actual = seed_idx
+        index_hi_actual = seed_idx
+        for offset, mask in collected.items():
+            frame = frame_lookup[offset]
+            idx_abs = indices[offset]
+            self._tracked_masks[idx_abs] = mask
+            valid = mask & (frame.cell_id_grid[..., 0] >= 0)
+            accumulated_cells.append(frame.cell_id_grid[valid])
+            index_lo_actual = min(index_lo_actual, idx_abs)
+            index_hi_actual = max(index_hi_actual, idx_abs)
+
+        if not accumulated_cells:
+            self._info_label.setText("视频追踪完成,但无 cell")
+            return
+        all_cells = np.concatenate(accumulated_cells, axis=0)
+        unique_cells = np.unique(all_cells, axis=0)
+        layer = ReservoirSelectionLayer(
+            name=(
+                f"SAM3 视频体 · {self._axis}=[{index_lo_actual},{index_hi_actual}] · "
+                f"{len(unique_cells):,} 单元"
+            ),
+            grid_layer_id=self._grid_layer_id,
+            grid_id=self._grid_id,
+            cell_ids=unique_cells,
+            source_axis=self._axis,
+            source_index_lo=index_lo_actual,
+            source_index_hi=index_hi_actual,
+            color=(1.0, 0.3, 0.2, 1.0),
+            opacity=1.0,
+            visible=True,
+        )
+        self.selection_committed.emit(layer)
+        self._track_range = (index_lo_actual, index_hi_actual)
+        self._info_label.setText(
+            f"视频追踪完成: {self._axis}=[{index_lo_actual}, {index_hi_actual}], "
+            f"{len(unique_cells):,} 单元 · 拖索引或 ▶ 回看"
+        )
+        # Snap back to seed frame to show its mask.
+        if self._index != seed_idx:
+            self._index_spin.setValue(seed_idx)
+        else:
+            self._render()
+        if hasattr(self, "_play_button"):
+            self._play_button.setEnabled(True)
 
     def _propagate_along_axis(self) -> None:
         """Sweep the propagation axis, re-segmenting each frame with
@@ -634,10 +964,14 @@ class SAM3Workbench(QWidget):
                     idx_next = idx + step
                     if (step > 0 and idx_next > end) or (step < 0 and idx_next < end):
                         break
-                    frame = render_roi_section(
-                        self._grid, self._axis, idx_next,
-                        self._roi, transform=self._transform,
-                    )
+                    cache_key = (self._axis, idx_next)
+                    frame = self._frame_cache.get(cache_key)
+                    if frame is None:
+                        frame = render_roi_section(
+                            self._grid, self._axis, idx_next,
+                            self._roi, transform=self._transform,
+                        )
+                        self._frame_cache[cache_key] = frame
                     pil = Image.fromarray(frame.image)
                     height, width = frame.image.shape[:2]
                     state = processor.set_image(pil)
@@ -781,13 +1115,17 @@ class SAM3Workbench(QWidget):
     # ------------------------------------------------------------------ rendering
 
     def _render(self) -> None:
-        frame = render_roi_section(
-            self._grid,
-            self._axis,
-            self._index,
-            self._roi,
-            transform=self._transform,
-        )
+        cache_key = (self._axis, self._index)
+        frame = self._frame_cache.get(cache_key)
+        if frame is None:
+            frame = render_roi_section(
+                self._grid,
+                self._axis,
+                self._index,
+                self._roi,
+                transform=self._transform,
+            )
+            self._frame_cache[cache_key] = frame
         self._frame = frame
 
         # Switching frames invalidates the prompts (they were drawn
@@ -804,6 +1142,8 @@ class SAM3Workbench(QWidget):
             self._save_button.setEnabled(False)
         if hasattr(self, "_propagate_button"):
             self._propagate_button.setEnabled(False)
+        if hasattr(self, "_video_track_button"):
+            self._video_track_button.setEnabled(False)
         # RectangleSelector holds an internal reference to the old
         # axes; drop it so a fresh one is created next time the user
         # enters box mode.

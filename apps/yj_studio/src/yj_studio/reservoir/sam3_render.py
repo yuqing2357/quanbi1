@@ -59,9 +59,9 @@ matplotlib.use("Agg", force=False)
 # don't get stretched. 768x2560 leaves room for SAM3 to see cell-level
 # detail in the vertical direction without sending GPU memory through
 # the roof.
-_TARGET_SHORT_PX = 768
-_MAX_LONG_PX = 2560
-_DPI = 100
+_TARGET_SHORT_PX = 1024
+_MAX_LONG_PX = 3200
+_DPI = 200
 
 
 @dataclass(slots=True)
@@ -171,9 +171,27 @@ def render_roi_section(
             facecolors=face_colors,
             edgecolors="none",
             linewidths=0.0,
-            antialiased=False,
+            antialiased=True,
         )
         axes.add_collection(coll)
+
+    # ROI 物理外框：每帧固定，标记 SAM3 看到的视野范围。
+    # 用 axes-fraction 坐标画，避免被 data-space 缩放吃掉。线宽用
+    # 像素换算，保证不同 DPI 下视觉宽度一致。
+    border_lw_px = max(2.0, h_px / 400.0)
+    for spine_xy in (
+        [(0, 0), (1, 0)], [(1, 0), (1, 1)],
+        [(1, 1), (0, 1)], [(0, 1), (0, 0)],
+    ):
+        axes.plot(
+            [spine_xy[0][0], spine_xy[1][0]],
+            [spine_xy[0][1], spine_xy[1][1]],
+            transform=axes.transAxes,
+            color="black",
+            linewidth=border_lw_px,
+            solid_capstyle="butt",
+            clip_on=False,
+        )
 
     canvas.draw()
     buf = np.asarray(canvas.buffer_rgba())
