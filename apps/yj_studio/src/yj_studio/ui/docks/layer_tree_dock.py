@@ -33,7 +33,7 @@ from yj_studio.ui.text import layer_kind_label
 
 
 _LAYER_TREE_PRIMARY_KINDS = {
-    "horizon", "fault_surface", "well",
+    "volume", "horizon", "fault_surface", "well",
     "reservoir_grid", "reservoir_property", "reservoir_selection",
 }
 
@@ -118,6 +118,8 @@ class LayerTreeDock(QDockWidget):
             self._updating = was_updating
 
     def _should_show_layer(self, layer: Layer) -> bool:
+        if layer.kind == "volume":
+            return not _is_hidden_layer(layer)
         return (
             not _is_hidden_layer(layer)
             and layer.kind in _LAYER_TREE_PRIMARY_KINDS
@@ -131,7 +133,11 @@ class LayerTreeDock(QDockWidget):
             if (
                 not _is_hidden_layer(layer)
                 and layer.kind in _LAYER_TREE_PRIMARY_KINDS
-                and (layer.visible or layer.id in selected_ids)
+                and (
+                    layer.kind == "volume"
+                    or layer.visible
+                    or layer.id in selected_ids
+                )
             ):
                 shown_ids.add(layer.id)
 

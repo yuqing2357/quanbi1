@@ -15,7 +15,7 @@ predictor API, or any downstream piece is wrong, without taking the
 
 Run via (cmd):
     set KMP_DUPLICATE_LIB_OK=TRUE
-    E:\\miniconda\\envs\\py312\\python.exe tools\\smoke_sam3_video.py
+    python tools\\smoke_sam3_video.py
 """
 
 from __future__ import annotations
@@ -28,9 +28,10 @@ from pathlib import Path
 
 # --- Mirror run_yj_studio.py's Triton workarounds ----------------
 
+ROOT = Path(__file__).resolve().parent.parent
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-_TRITON_CACHE = Path("C:/yj_triton_cache")
-_TRITON_CACHE.mkdir(exist_ok=True)
+_TRITON_CACHE = ROOT / "cache" / "triton"
+_TRITON_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ["TRITON_CACHE_DIR"] = str(_TRITON_CACHE)
 os.environ["TRITON_HOME"] = str(_TRITON_CACHE)
 os.environ["TMP"] = str(_TRITON_CACHE)
@@ -62,14 +63,18 @@ _install_triton_unc_workaround()
 
 # --- Paths --------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "apps" / "yj_studio" / "src"
 SAM3_SRC = ROOT / "libs"
 WEIGHTS = ROOT / "weights" / "sam3.pt"
+TOOLS = ROOT / "tools"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 if str(SAM3_SRC) not in sys.path:
     sys.path.insert(0, str(SAM3_SRC))
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+
+from project_paths import DEFAULT_RESERVOIR_MASTER
 
 
 def log(msg: str) -> None:
@@ -89,7 +94,7 @@ def main() -> int:
     log(f"torch {torch.__version__}, CUDA={torch.cuda.is_available()}")
 
     log("Loading reservoir grid (should be cache hit)...")
-    grid = ReservoirGrid.load_from_master(Path(r"F:\１２３４.GRDECL"))
+    grid = ReservoirGrid.load_from_master(DEFAULT_RESERVOIR_MASTER)
     log(f"  grid shape {grid.shape}, active {int(grid.active.sum()):,}")
 
     # Use a narrow centred ROI so this finishes quickly.

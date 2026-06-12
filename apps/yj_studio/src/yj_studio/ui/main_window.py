@@ -17,7 +17,13 @@ from yj_studio.config.paths import (
     existing_processed_root,
 )
 from yj_studio.config.styles import LITH_BODY_STYLE, PALETTE
-from yj_studio.data import VolumeStore, WellRepository, estimate_volume_clim
+from yj_studio.data import (
+    RemoteTargetStore,
+    RemoteVolumeStore,
+    VolumeStore,
+    WellRepository,
+    estimate_volume_clim,
+)
 from yj_studio.data.arbitrary_section import sample_arbitrary_section
 from yj_studio.io.readers.fault_mesh import discover_fault_mesh_summaries
 from yj_studio.io.readers.layers_npz import discover_layer_summaries
@@ -32,10 +38,13 @@ from yj_studio.scene.layers import (
     LithBodyLayer,
     ReservoirGridLayer,
     ReservoirPropertyLayer,
+    ReservoirSelectionLayer,
     VolumeLayer,
     WellLayer,
     WellLogLayer,
 )
+from yj_studio.scene.undo_commands import AddLayerCommand
+from yj_studio.reservoir import ReservoirRegistry, SeismicIndexTransform, default_roi
 from yj_studio.scene.manual_geometry import is_manual_geometry_layer, manual_geometry_points
 from yj_studio.services import (
     SectionAxis,
@@ -50,8 +59,7 @@ from yj_studio.ui.dialogs.arbitrary_section_dialog import ArbitrarySectionDialog
 from yj_studio.ui.docks.fault_dock import FaultDock
 from yj_studio.ui.docks.horizon_dock import HorizonDock
 from yj_studio.ui.docks.layer_tree_dock import LayerTreeDock
-from yj_studio.ai import AIService, SAM3Config
-from yj_studio.reservoir import ReservoirRegistry
+from yj_studio.ai import AIService, RemoteSAM3Client, SAM3Config
 from yj_studio.algorithms import AlgorithmRunner, registry as algorithm_registry
 from yj_studio.algorithms import builtin as _algorithm_builtin  # noqa: F401 — registers algorithms
 from yj_studio.ui.docks.ai_dock import AIDock
@@ -60,12 +68,15 @@ from yj_studio.ui.docks.measurement_dock import MeasurementDock
 from yj_studio.ui.docks.property_dock import PropertyDock
 from yj_studio.ui.docks.section_navigator_dock import SectionNavigatorDock
 from yj_studio.ui.docks.slice_controls_dock import SliceControlsDock
+from yj_studio.ui.docks.target_dock import TargetDock
 from yj_studio.ui.docks.tool_palette_dock import ToolPaletteDock
 from yj_studio.ui.docks.well_section_dock import WellSectionDock
 from yj_studio.ui.docks.wells_dock import WellsDock
 from yj_studio.ui.text import well_display_mode_label
 from yj_studio.view.views_area import ViewsArea
 from yj_studio.view.view_horizon_map import ViewHorizonMap
+from yj_studio.view.view_reservoir_section import ViewReservoirSection
+from yj_studio.view.view_sam3_workbench import SAM3Workbench
 from yj_studio.view.view_well_section import ViewWellSection
 
 logger = logging.getLogger(__name__)
@@ -77,25 +88,28 @@ class MainWindow(QMainWindow):
     def __init__(self, *, auto_load: bool = True, enable_3d: bool | None = None) -> None:
         super().__init__()
         self.layer_store = LayerStore()
-        self.volume_store = VolumeStore()
+        self.volume_store = _make_volume_store()
+        self.reservoir_registry = ReservoirRegistry()
         self.view_sync = ViewSyncService()
         self.tool_manager = ToolManager()
         self.undo_stack = QUndoStack(self)
         self.undo_stack.setUndoLimit(100)
         self.algorithm_runner = AlgorithmRunner(layer_store=self.layer_store, parent=self)
-        self.ai_service = AIService(SAM3Config(), parent=self)
+        self.ai_service = _make_sam3_backend(parent=self)
+        self.target_store = _make_target_store()
         # In-process algorithms (e.g. SAM3) reach the service via
         # ``ctx.services['ai_service']``; volume_store gives them slice access.
         self.algorithm_runner.register_service("ai_service", self.ai_service)
         self.algorithm_runner.register_service("volume_store", self.volume_store)
+        self.algorithm_runner.register_service("reservoir_registry", self.reservoir_registry)
         # Interactive AI prompt tools talk to the same service.
         self.tool_manager.register_service("ai_service", self.ai_service)
-        # Petrel reservoir grids live here. ReservoirGridLayer holds
-        # only a string grid_id; renderers and algorithms look the
-        # real ReservoirGrid up in this registry.
-        self.reservoir_registry = ReservoirRegistry()
-        self.algorithm_runner.register_service("reservoir_registry", self.reservoir_registry)
         self.tool_manager.register_service("reservoir_registry", self.reservoir_registry)
+        # Reservoir model data is treated as regular numpy volumes.
+        # The old Petrel/GRDECL grid path remains only in offline
+        # conversion/debug tools that regenerate those volumes.
+        self.layer_store.layer_changed.connect(self._on_main_layer_changed)
+        self.layer_store.selection_changed.connect(self._on_main_selection_changed)
         self.volume_specs: dict[str, VolumeSpec] = {}
         self._active_volume_layer_id: str | None = None
         self._loaded_horizon_paths: set[str] = set()
@@ -114,6 +128,7 @@ class MainWindow(QMainWindow):
         self._property_dock: PropertyDock | None = None
         self._algorithm_dock: AlgorithmDock | None = None
         self._ai_dock: AIDock | None = None
+        self._target_dock: TargetDock | None = None
         self._views_area: ViewsArea | None = None
         self._view_3d = None
         self._well_display_mode = "none"
@@ -136,6 +151,7 @@ class MainWindow(QMainWindow):
         self._build_well_section_dock()
         self._build_algorithm_dock()
         self._build_ai_dock()
+        self._build_target_dock()
         self._constrain_dock_sizes()
         # Tab bars for tabified docks are created lazily by Qt, so deferring
         # configuration until the event loop turns once is the most reliable
@@ -152,7 +168,7 @@ class MainWindow(QMainWindow):
         if enable_3d:
             self._discover_default_volumes()
             if auto_load:
-                self.load_default_volume()
+                self.add_default_volume_layers()
                 self.load_default_horizons()
                 self.load_default_faults()
                 self.load_default_lith_bodies()
@@ -194,8 +210,6 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu(self.tr("文件"))
         open_volume_action = file_menu.addAction(self.tr("打开体数据..."))
         open_volume_action.triggered.connect(self._open_volume_dialog)
-        open_reservoir_action = file_menu.addAction(self.tr("打开储层模型 (GRDECL)..."))
-        open_reservoir_action.triggered.connect(self._open_reservoir_dialog)
         file_menu.addSeparator()
         file_menu.addAction(self.tr("退出"), self.close)
 
@@ -217,8 +231,8 @@ class MainWindow(QMainWindow):
         arbitrary_action = view_menu.addAction(self.tr("新建任意剖面..."))
         arbitrary_action.triggered.connect(self._open_arbitrary_section_dialog)
         view_menu.addSeparator()
-        reservoir_section_action = view_menu.addAction(self.tr("新建储层剖面"))
-        reservoir_section_action.triggered.connect(self._open_reservoir_section)
+        reservoir_action = view_menu.addAction(self.tr("打开储层剖面"))
+        reservoir_action.triggered.connect(self._open_selected_reservoir_section)
 
         help_menu = self.menuBar().addMenu(self.tr("帮助"))
         help_menu.addAction(self.tr("关于"), self._show_about)
@@ -318,6 +332,40 @@ class MainWindow(QMainWindow):
         self._tabify_right(dock)
         self._ai_dock = dock
 
+    def _build_target_dock(self) -> None:
+        dock = TargetDock(
+            self.layer_store,
+            self.target_store,
+            undo_stack=self.undo_stack,
+            parent=self,
+        )
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._tabify_right(dock)
+        self._target_dock = dock
+        if self._ai_dock is not None:
+            self._ai_dock.track_finished.connect(self._on_ai_track_finished)
+
+    def _on_ai_track_finished(self, result: dict) -> None:
+        if self._target_dock is None:
+            return
+        self._target_dock.refresh()
+        self._target_dock.show_track_result(result)
+
+    def _on_reservoir_target_committed(self, _target: object) -> None:
+        if self._target_dock is not None:
+            self._target_dock.refresh()
+
+    def _on_reservoir_selection_committed(self, layer: object) -> None:
+        if not isinstance(layer, ReservoirSelectionLayer):
+            return
+        command = AddLayerCommand(self.layer_store, layer)
+        self.undo_stack.push(command)
+        if command.layer_id is not None:
+            self.layer_store.select([command.layer_id])
+        self.statusBar().showMessage(
+            self.tr("已添加储层选择：{count} 个单元").format(count=layer.n_cells)
+        )
+
     def _tabify_right(self, dock) -> None:
         """Attach ``dock`` to the right-side tab group anchored on
         ``_property_dock`` so the right column stays a single row of tabs
@@ -381,6 +429,7 @@ class MainWindow(QMainWindow):
                 self._well_section_dock,
                 self._algorithm_dock,
                 self._ai_dock,
+                self._target_dock,
             )
             if d is not None
         ]
@@ -435,12 +484,15 @@ class MainWindow(QMainWindow):
         self._slice_controls = dock
 
     def _discover_default_volumes(self) -> None:
-        processed_root = existing_processed_root()
-        specs, notes = load_available_volume_specs(
-            DEFAULT_SEISMIC_NPY,
-            processed_root / "地震属性",
-            DEFAULT_LITH_POR_MODEL_ROOT,
-        )
+        if isinstance(self.volume_store, RemoteVolumeStore):
+            specs, notes = self.volume_store.discover_specs()
+        else:
+            processed_root = existing_processed_root()
+            specs, notes = load_available_volume_specs(
+                DEFAULT_SEISMIC_NPY,
+                processed_root / "地震属性",
+                DEFAULT_LITH_POR_MODEL_ROOT,
+            )
         self.volume_specs = dict(specs)
         for spec in specs.values():
             self.volume_store.register(spec)
@@ -573,7 +625,7 @@ class MainWindow(QMainWindow):
                     **record.metadata,
                     "matched_csv_name": record.matched_csv_name or "",
                     "path": str(coords_csv),
-                    "depth_mapping": "sample_index = DEPT / 10.0 for F:/YJ-ALL-SEISMIC_depth_0_653.npy",
+                    "depth_mapping": "sample_index = DEPT / 10.0",
                 },
                 provenance={"source": "processed.well_coordinates"},
             )
@@ -629,64 +681,131 @@ class MainWindow(QMainWindow):
                     "cmap": str(spec["cmap"]),
                     "clim": spec["clim"],
                     "sample_count": int(samples.samples.shape[0]),
-                    "depth_mapping": "sample_index = DEPT / 10.0 for F:/YJ-ALL-SEISMIC_depth_0_653.npy",
+                    "depth_mapping": "sample_index = DEPT / 10.0",
                 },
                 provenance={"source": "processed.well_log"},
             )
             self.layer_store.add(layer)
             self._loaded_well_log_keys.add(key)
 
-    def load_default_volume(self) -> None:
+    def add_default_volume_layers(self) -> None:
         if not self.volume_specs:
             self.statusBar().showMessage(self.tr("未找到默认体数据"))
             return
-        volume_id = "seismic" if "seismic" in self.volume_specs else next(iter(self.volume_specs))
-        self.load_volume(volume_id)
+        for volume_id in ("seismic", "model_lithology", "model_porosity"):
+            if volume_id in self.volume_specs:
+                self._ensure_volume_layer(volume_id, visible=False)
+
+    def load_default_volume(self) -> None:
+        """Compatibility wrapper: create default volume layers without displaying them."""
+
+        self.add_default_volume_layers()
 
     def load_volume(self, volume_id: str) -> None:
+        layer = self._ensure_volume_layer(volume_id, visible=True)
+        if layer is None:
+            return
+        self._activate_volume_layer(layer.id, make_visible=True)
+
+    def _ensure_volume_layer(self, volume_id: str, *, visible: bool) -> VolumeLayer | None:
+        spec = self.volume_specs.get(volume_id)
+        if spec is None:
+            try:
+                spec = self.volume_store.spec(volume_id)
+            except KeyError:
+                self.statusBar().showMessage(
+                    self.tr("未找到体数据：{volume_id}").format(volume_id=volume_id)
+                )
+                return None
+        existing = self._volume_layer_for_id(volume_id)
+        if existing is not None:
+            if visible and not existing.visible:
+                self.layer_store.update(existing.id, visible=True)
+            return existing
+
         try:
             volume = self.volume_store.get_volume(volume_id)
             shape = tuple(int(value) for value in volume.shape)
         except Exception as exc:
             logger.exception("Failed to load volume %s", volume_id)
             QMessageBox.warning(self, self.tr("打开体数据"), str(exc))
+            return None
+
+        slice_indices = _default_slice_indices(shape)
+        clim = _initial_volume_clim(volume_id)
+        layer = VolumeLayer(
+            name=spec.label,
+            volume_id=volume_id,
+            shape=shape,
+            clim=clim,
+            cmap=spec.cmap,
+            slice_indices=slice_indices,
+            visible=visible,
+            metadata={"path": str(spec.path), "default_volume": True},
+            provenance={"source": "default.volume"},
+        )
+        self.layer_store.add(layer)
+        return layer
+
+    def _activate_volume_layer(
+        self,
+        layer_id: str,
+        *,
+        make_visible: bool,
+        emit_data: bool = True,
+    ) -> None:
+        layer = self.layer_store.get(layer_id)
+        if not isinstance(layer, VolumeLayer):
+            return
+        try:
+            volume = self.volume_store.get_volume(layer.volume_id)
+            shape = tuple(int(value) for value in volume.shape)
+        except Exception as exc:
+            logger.exception("Failed to activate volume %s", layer.volume_id)
+            QMessageBox.warning(self, self.tr("打开体数据"), str(exc))
             return
 
-        spec = self.volume_store.spec(volume_id)
-        slice_indices = _default_slice_indices(shape)
-        clim = tuple(estimate_volume_clim(volume_id, volume, *slice_indices.values()))
-        layer = self._active_volume_layer()
-        if layer is None:
-            layer = VolumeLayer(
-                name=spec.label,
-                volume_id=volume_id,
-                shape=shape,
-                clim=clim,
-                cmap=spec.cmap,
-                slice_indices=slice_indices,
-                metadata={"path": str(spec.path)},
-            )
-            self._active_volume_layer_id = self.layer_store.add(layer)
-        else:
-            layer.name = spec.label
-            layer.volume_id = volume_id
+        if layer.shape is None:
             layer.shape = shape
-            layer.clim = clim
-            layer.cmap = spec.cmap
-            layer.slice_indices = slice_indices
-            layer.metadata["path"] = str(spec.path)
+        if not layer.slice_indices:
+            layer.slice_indices = _default_slice_indices(shape)
+        if layer.clim is None:
+            layer.clim = tuple(
+                estimate_volume_clim(layer.volume_id, volume, *layer.slice_indices.values())
+            )
+        self._hide_other_volume_layers(layer.id)
+        self._active_volume_layer_id = layer.id
+        if make_visible and not layer.visible:
+            self.layer_store.update(layer.id, visible=True)
+            return
+        if emit_data:
             self.layer_store.layer_changed.emit(layer.id, "data")
 
-        if self._slice_controls is not None:
-            self._slice_controls.set_current_volume(volume_id)
-            self._slice_controls.set_shape(shape, slice_indices)
-            self._slice_controls.set_clim(clim)
-            self._slice_controls.set_cmap(spec.cmap)
+        self._sync_volume_controls(layer)
         if self._view_3d is not None:
             self._view_3d.reset_to_volume(shape)
         self.statusBar().showMessage(
-            self.tr("已加载 {label}：{shape}").format(label=spec.label, shape=shape)
+            self.tr("已加载 {label}：{shape}").format(label=layer.name, shape=shape)
         )
+
+    def _sync_volume_controls(self, layer: VolumeLayer) -> None:
+        if self._slice_controls is None or layer.shape is None:
+            return
+        self._slice_controls.set_current_volume(layer.volume_id)
+        self._slice_controls.set_shape(layer.shape, layer.slice_indices)
+        self._slice_controls.set_clim(layer.clim)
+        self._slice_controls.set_cmap(layer.cmap)
+
+    def _volume_layer_for_id(self, volume_id: str) -> VolumeLayer | None:
+        for layer in self.layer_store.iter_by_type(VolumeLayer):
+            if layer.volume_id == volume_id:
+                return layer
+        return None
+
+    def _hide_other_volume_layers(self, active_layer_id: str) -> None:
+        for other in self.layer_store.iter_by_type(VolumeLayer):
+            if other.id != active_layer_id and other.visible:
+                self.layer_store.update(other.id, visible=False)
 
     def _set_slice_index(self, axis: str, index: int) -> None:
         self._set_active_slice_index(axis, index, origin=self._slice_controls)
@@ -743,6 +862,196 @@ class MainWindow(QMainWindow):
                 text="修改 ROI",
             )
         )
+
+    def _open_selected_reservoir_section(self) -> None:
+        context = self._selected_reservoir_context()
+        if context is None or self._views_area is None:
+            self.statusBar().showMessage(self.tr("请先选择一个储层模型或储层属性图层"))
+            return
+        grid_layer, property_layer = context
+        grid = self.reservoir_registry.get(grid_layer.grid_id)
+        if grid is None:
+            self.statusBar().showMessage(
+                self.tr("储层网格尚未在当前会话注册：{grid_id}").format(grid_id=grid_layer.grid_id)
+            )
+            return
+
+        roi = grid_layer.roi or default_roi(grid)
+        property_name = property_layer.property_name if property_layer is not None else None
+        view = ViewReservoirSection(
+            grid,
+            axis="i",
+            property_name=property_name,
+            transform=SeismicIndexTransform(),
+            roi=roi,
+            parent=self._views_area,
+        )
+        view.setProperty("grid_layer_id", grid_layer.id)
+        view.setProperty("reservoir_grid_id", grid_layer.grid_id)
+        view.roi_changed.connect(
+            lambda new_roi, layer_id=grid_layer.id, origin=view: self._set_reservoir_roi(
+                layer_id, new_roi, origin=origin
+            )
+        )
+        view.roi_drawn.connect(
+            lambda new_roi, axis, layer_id=grid_layer.id: self._open_sam3_workbench_for_reservoir(
+                layer_id, new_roi, axis
+            )
+        )
+        self._views_area.add_internal_section(
+            view,
+            title=view.title,
+            axis=f"reservoir-{view.axis}",
+            index=view.index,
+        )
+        self.statusBar().showMessage(
+            self.tr("已打开储层剖面：{name}").format(name=grid_layer.name)
+        )
+
+    def _open_sam3_workbench_for_reservoir(
+        self,
+        grid_layer_id: str,
+        roi: object,
+        axis: str,
+    ) -> None:
+        if self._views_area is None:
+            return
+        try:
+            layer = self.layer_store.get(grid_layer_id)
+        except KeyError:
+            return
+        if not isinstance(layer, ReservoirGridLayer):
+            return
+        grid = self.reservoir_registry.get(layer.grid_id)
+        if grid is None:
+            self.statusBar().showMessage(
+                self.tr("储层网格尚未在当前会话注册：{grid_id}").format(grid_id=layer.grid_id)
+            )
+            return
+        if axis not in {"i", "j"}:
+            self.statusBar().showMessage(self.tr("储层 SAM3 工作台仅支持 I/J 剖面"))
+            return
+
+        roi_tuple = tuple(int(v) for v in roi)  # type: ignore[arg-type]
+        workbench = SAM3Workbench(
+            grid,
+            roi_tuple,
+            axis=axis,
+            transform=SeismicIndexTransform(),
+            ai_service=self.ai_service,
+            target_store=self.target_store,
+            grid_layer_id=layer.id,
+            grid_id=layer.grid_id,
+            parent=self._views_area,
+        )
+        workbench.setProperty("grid_layer_id", layer.id)
+        workbench.setProperty("reservoir_grid_id", layer.grid_id)
+        workbench.selection_committed.connect(self._on_reservoir_selection_committed)
+        workbench.target_committed.connect(self._on_reservoir_target_committed)
+        self._views_area.add_internal_section(
+            workbench,
+            title=workbench.title,
+            axis=f"sam3-{axis}",
+            index=workbench.index,
+        )
+        self.statusBar().showMessage(self.tr("已打开储层 SAM3 工作台"))
+
+    def _set_reservoir_roi(
+        self,
+        grid_layer_id: str,
+        roi: object,
+        *,
+        origin: object | None = None,
+    ) -> None:
+        from yj_studio.scene.undo_commands import SetLayerFieldCommand
+
+        try:
+            layer = self.layer_store.get(grid_layer_id)
+        except KeyError:
+            return
+        if not isinstance(layer, ReservoirGridLayer):
+            return
+        new_roi = tuple(int(v) for v in roi)  # type: ignore[arg-type]
+        if layer.roi == new_roi:
+            self._sync_reservoir_roi_views(grid_layer_id, new_roi, origin=origin)
+            return
+        self.undo_stack.push(
+            SetLayerFieldCommand(
+                self.layer_store,
+                layer.id,
+                "roi",
+                new_roi,
+                text="修改储层 ROI",
+            )
+        )
+        self._sync_reservoir_roi_views(grid_layer_id, new_roi, origin=origin)
+
+    def _sync_reservoir_roi_views(
+        self,
+        grid_layer_id: str,
+        roi: tuple[int, int, int, int, int, int],
+        *,
+        origin: object | None = None,
+    ) -> None:
+        if self._views_area is None:
+            return
+        for index in range(self._views_area.count()):
+            widget = self._views_area.widget(index)
+            if widget is origin:
+                continue
+            if widget.property("grid_layer_id") != grid_layer_id:
+                continue
+            set_roi = getattr(widget, "set_roi", None)
+            if callable(set_roi):
+                set_roi(roi)
+
+    def _selected_reservoir_context(
+        self,
+    ) -> tuple[ReservoirGridLayer, ReservoirPropertyLayer | None] | None:
+        for layer_id in self.layer_store.selection:
+            try:
+                layer = self.layer_store.get(layer_id)
+            except KeyError:
+                continue
+            if isinstance(layer, ReservoirGridLayer):
+                return layer, self._reservoir_property_for_grid(layer)
+            if isinstance(layer, ReservoirPropertyLayer):
+                grid_layer = self._reservoir_grid_layer_for_property(layer)
+                if grid_layer is not None:
+                    return grid_layer, layer
+        first = next(self.layer_store.iter_by_type(ReservoirGridLayer), None)
+        if first is None:
+            return None
+        return first, self._reservoir_property_for_grid(first)
+
+    def _reservoir_grid_layer_for_property(
+        self,
+        property_layer: ReservoirPropertyLayer,
+    ) -> ReservoirGridLayer | None:
+        if property_layer.grid_layer_id:
+            try:
+                layer = self.layer_store.get(property_layer.grid_layer_id)
+            except KeyError:
+                layer = None
+            if isinstance(layer, ReservoirGridLayer):
+                return layer
+        for layer in self.layer_store.iter_by_type(ReservoirGridLayer):
+            if layer.grid_id == property_layer.grid_id:
+                return layer
+        return None
+
+    def _reservoir_property_for_grid(
+        self,
+        grid_layer: ReservoirGridLayer,
+    ) -> ReservoirPropertyLayer | None:
+        candidates = [
+            layer for layer in self.layer_store.iter_by_type(ReservoirPropertyLayer)
+            if layer.grid_layer_id == grid_layer.id or layer.grid_id == grid_layer.grid_id
+        ]
+        for layer in candidates:
+            if layer.visible:
+                return layer
+        return candidates[0] if candidates else None
 
     def _open_section(self, axis: SectionAxis) -> None:
         layer = self._active_volume_layer()
@@ -910,231 +1219,6 @@ class MainWindow(QMainWindow):
             self._slice_controls.set_volume_specs(self.volume_specs)
         self.load_volume(volume_id)
 
-    def _open_reservoir_dialog(self) -> None:
-        """Pick a master GRDECL, load it on a worker, add layers on success."""
-
-        from yj_studio.ui.dialogs.reservoir_load_dialog import run_reservoir_load_dialog
-
-        path_text, _ = QFileDialog.getOpenFileName(
-            self,
-            self.tr("打开储层模型"),
-            "",
-            self.tr("GRDECL 主文件 (*.GRDECL *.grdecl)"),
-        )
-        if not path_text:
-            return
-        master_path = Path(path_text)
-        # Filter out the include companions — the user should pick the
-        # master, not COORD/ZCORN/ACTNUM. We catch the common case here
-        # and warn; the loader itself will fail with a clearer error
-        # if it really is an include companion.
-        upper = master_path.name.upper()
-        if any(tag in upper for tag in ("_COORD", "_ZCORN", "_ACTNUM")):
-            QMessageBox.warning(
-                self,
-                self.tr("打开储层模型"),
-                self.tr(
-                    "选择的是 INCLUDE 子文件 ({name})。\n"
-                    "请选择 Petrel 导出的主 GRDECL 文件 (不带 _COORD/_ZCORN/_ACTNUM 后缀)。"
-                ).format(name=master_path.name),
-            )
-            return
-
-        grid = run_reservoir_load_dialog(self, master_path)
-        if grid is None:
-            return
-
-        grid_id = self.reservoir_registry.register(grid)
-        bounds = self._reservoir_bounds(grid)
-
-        # ROI seeded to the active-cell bbox: gives users a sensible
-        # initial window without having to drag a box, and lets every
-        # downstream consumer (2D section, 3D render, SAM3) speak in
-        # terms of a stable IJK frame from day one.
-        from yj_studio.reservoir import default_roi
-        initial_roi = default_roi(grid)
-
-        grid_layer = ReservoirGridLayer(
-            name=master_path.stem,
-            grid_id=grid_id,
-            master_path=str(master_path),
-            shape=grid.shape,
-            bounds=bounds,
-            color=(0.7, 0.7, 0.8, 1.0),
-            # Slightly translucent so SAM3 selection layers drawn
-            # inside the grid stay visible. Users can crank it back
-            # to 1.0 via the property dock if they want a solid look.
-            opacity=0.45,
-            roi=initial_roi,
-        )
-        self.layer_store.add(grid_layer)
-
-        # Default property layer: prefer LITHOLOGIES, otherwise the
-        # first available property. Skip silently if the grid has no
-        # properties at all (still useful as wireframe-only).
-        default_prop = None
-        for name in ("LITHOLOGIES", "PORO"):
-            if grid.has_property(name):
-                default_prop = name
-                break
-        if default_prop is None and grid.property_names():
-            default_prop = grid.property_names()[0]
-        if default_prop is not None:
-            arr = grid.property(default_prop)
-            is_int = bool(np.issubdtype(arr.dtype, np.integer))
-            prop_layer = ReservoirPropertyLayer(
-                name=f"{master_path.stem} · {default_prop}",
-                grid_layer_id=grid_layer.id,
-                grid_id=grid_id,
-                property_name=default_prop,
-                is_integer=is_int,
-                cmap=("tab10" if is_int else "viridis"),
-                clim=None if is_int else (float(arr.min()), float(arr.max())),
-            )
-            self.layer_store.add(prop_layer)
-
-        self.statusBar().showMessage(
-            self.tr("已加载储层模型：{name} ({nx}×{ny}×{nz}, {active:,} 活动单元)").format(
-                name=master_path.name,
-                nx=grid.shape[0], ny=grid.shape[1], nz=grid.shape[2],
-                active=int(grid.active.sum()),
-            )
-        )
-
-    def _open_reservoir_section(self) -> None:
-        """Open a 2D cell-section view for the first loaded reservoir grid."""
-
-        if self._views_area is None:
-            self.statusBar().showMessage(self.tr("视图尚未就绪"))
-            return
-        # Pick the first ReservoirGridLayer in the scene. Multi-grid
-        # selection UI is a future concern.
-        grid_layer = None
-        for layer in self.layer_store.iter_layers():
-            if isinstance(layer, ReservoirGridLayer):
-                grid_layer = layer
-                break
-        if grid_layer is None:
-            self.statusBar().showMessage(self.tr("请先加载储层模型 (GRDECL)"))
-            return
-        grid = self.reservoir_registry.get(grid_layer.grid_id)
-        if grid is None:
-            self.statusBar().showMessage(self.tr("储层模型未注册"))
-            return
-
-        from yj_studio.view.view_reservoir_section import ViewReservoirSection
-
-        view = ViewReservoirSection(
-            grid,
-            axis="i",
-            roi=grid_layer.roi,
-            parent=self._views_area,
-        )
-        # Forward this view's ROI changes to the layer + every other
-        # open reservoir section so the UI stays in lockstep.
-        view.roi_changed.connect(
-            lambda new_roi, gid=grid_layer.id: self._on_reservoir_roi_changed(gid, new_roi)
-        )
-        # When the user draws a box on this section, spin up a SAM3
-        # workbench bound to that ROI + propagation axis.
-        view.roi_drawn.connect(
-            lambda new_roi, axis, gid=grid_layer.id:
-                self._open_sam3_workbench(gid, new_roi, axis)
-        )
-        self._views_area.add_internal_section(
-            view,
-            title=view.title,
-            axis=view.axis,
-            index=view.index,
-        )
-
-    def _open_sam3_workbench(
-        self, grid_layer_id: str, roi: tuple, axis: str
-    ) -> None:
-        """Spin up a SAM3 workbench bound to ``roi`` on ``axis``.
-
-        The workbench renders ROI-scoped frames through the offscreen
-        ``render_roi_section`` pipeline, giving SAM3 a stable pixel
-        grid for prompts and (later) video propagation. Each draw on
-        a reservoir section opens its own workbench tab — users can
-        keep several experiments alive simultaneously.
-        """
-
-        if self._views_area is None:
-            return
-        layer = self.layer_store.get(grid_layer_id)
-        if not isinstance(layer, ReservoirGridLayer):
-            return
-        grid = self.reservoir_registry.get(layer.grid_id)
-        if grid is None:
-            return
-
-        from yj_studio.view.view_sam3_workbench import SAM3Workbench
-
-        wb = SAM3Workbench(
-            grid=grid,
-            roi=roi,
-            axis=axis,
-            ai_service=self.ai_service,
-            grid_layer_id=layer.id,
-            grid_id=layer.grid_id,
-            parent=self._views_area,
-        )
-        wb.selection_committed.connect(self._on_selection_committed)
-        self._views_area.add_internal_section(
-            wb,
-            title=wb.title,
-            axis=wb.axis,
-            index=wb.index,
-        )
-
-    def _on_selection_committed(self, layer) -> None:
-        """Add a SAM3-produced selection layer to the scene."""
-        self.layer_store.add(layer)
-        self.statusBar().showMessage(
-            self.tr("已添加储层选择图层：{name}").format(name=layer.name)
-        )
-
-    def _on_reservoir_roi_changed(self, grid_layer_id: str, new_roi: tuple) -> None:
-        """Push a new ROI onto the grid layer and broadcast to all open
-        reservoir section views referencing the same grid."""
-
-        try:
-            layer = self.layer_store.get(grid_layer_id)
-        except (KeyError, LookupError):
-            return
-        if not isinstance(layer, ReservoirGridLayer):
-            return
-        layer.roi = tuple(int(v) for v in new_roi)
-        # Iterate all open tabs and reframe any section view that
-        # belongs to this grid.
-        if self._views_area is not None:
-            from yj_studio.view.view_reservoir_section import ViewReservoirSection
-            for i in range(self._views_area.count()):
-                w = self._views_area.widget(i)
-                if isinstance(w, ViewReservoirSection) and w._grid.master_path == Path(layer.master_path):
-                    w.set_roi(layer.roi)
-
-    @staticmethod
-    def _reservoir_bounds(grid) -> tuple[float, float, float, float, float, float]:
-        """Derive a (xmin,xmax,ymin,ymax,zmin,zmax) bbox from the grid's COORD.
-
-        Uses pillar endpoints — these are exact bounds of the pillar
-        envelope, which is a superset of the actual cell envelope, so
-        the scene's bbox slightly overestimates. Good enough for camera
-        framing on first load.
-        """
-
-        coord = grid.coord
-        xs = np.concatenate([coord[..., 0].ravel(), coord[..., 3].ravel()])
-        ys = np.concatenate([coord[..., 1].ravel(), coord[..., 4].ravel()])
-        zs = np.concatenate([coord[..., 2].ravel(), coord[..., 5].ravel()])
-        return (
-            float(xs.min()), float(xs.max()),
-            float(ys.min()), float(ys.max()),
-            float(zs.min()), float(zs.max()),
-        )
-
     def _open_horizon_structure_map(self, layer_id: str) -> None:
         if self._views_area is None:
             return
@@ -1210,6 +1294,9 @@ class MainWindow(QMainWindow):
     def _activate_layer_from_dock(self, layer_id: str) -> None:
         self.layer_store.select([layer_id])
         layer = self.layer_store.get(layer_id)
+        if isinstance(layer, VolumeLayer):
+            self._activate_volume_layer(layer.id, make_visible=True)
+            return
         if isinstance(layer, WellLayer):
             self._open_well_adjacent_section(layer)
             return
@@ -1222,6 +1309,34 @@ class MainWindow(QMainWindow):
         if head_position is not None:
             self._focus_3d_on_point(head_position)
         self.statusBar().showMessage(self.tr("已选中 {name}").format(name=layer.name))
+
+    def _on_main_layer_changed(self, layer_id: str, field: str) -> None:
+        try:
+            layer = self.layer_store.get(layer_id)
+        except KeyError:
+            return
+        if not isinstance(layer, VolumeLayer):
+            return
+        if field == "visible":
+            if layer.visible:
+                self._activate_volume_layer(layer.id, make_visible=False, emit_data=False)
+            elif layer.id == self._active_volume_layer_id:
+                self._active_volume_layer_id = None
+            return
+        if layer.id == self._active_volume_layer_id and field in {
+            "data", "slice_indices", "clim", "cmap",
+        }:
+            self._sync_volume_controls(layer)
+
+    def _on_main_selection_changed(self, layer_ids: list[str]) -> None:
+        if not layer_ids:
+            return
+        try:
+            layer = self.layer_store.get(layer_ids[0])
+        except KeyError:
+            return
+        if isinstance(layer, VolumeLayer):
+            self._activate_volume_layer(layer.id, make_visible=True)
 
     def _open_well_adjacent_section(self, layer: WellLayer) -> None:
         if layer.head_position is None:
@@ -1347,6 +1462,18 @@ def _default_slice_indices(shape: tuple[int, int, int]) -> dict[str, int]:
     return {"inline": shape[0] // 2, "xline": shape[1] // 2, "z": shape[2] // 2}
 
 
+def _initial_volume_clim(volume_id: str) -> tuple[float, float] | None:
+    if volume_id == "model_lithology":
+        return (-0.5, 1.5)
+    if volume_id == "model_porosity":
+        return (0.0, 0.30)
+    if volume_id == "coherence":
+        return (0.0, 1.0)
+    if volume_id == "azimuth_deg":
+        return (0.0, 360.0)
+    return None
+
+
 def _next_layer_name(layer_store: LayerStore, prefix: str) -> str:
     count = sum(1 for layer in layer_store.iter_layers() if layer.name.startswith(prefix))
     return f"{prefix} {count + 1}"
@@ -1403,6 +1530,62 @@ def _well_display_label(mode: str) -> str:
         "por": "孔隙度",
         "perm": "渗透率",
     }.get(mode, "仅井轨迹")
+
+
+def _make_volume_store():
+    backend = os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local").strip().lower()
+    if backend != "remote":
+        return VolumeStore()
+    server_url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
+    if not server_url:
+        logger.warning("YJ_STUDIO_VOLUME_BACKEND=remote but YJ_STUDIO_SERVER_URL is empty; using local volumes")
+        return VolumeStore()
+    try:
+        timeout_s = float(os.environ.get("YJ_STUDIO_REQUEST_TIMEOUT_S", "30"))
+    except ValueError:
+        timeout_s = 30.0
+    logger.info("Using remote volume backend: %s", server_url)
+    return RemoteVolumeStore(server_url, timeout_s=timeout_s)
+
+
+def _make_target_store() -> RemoteTargetStore | None:
+    backend = (
+        os.environ.get("YJ_STUDIO_TARGET_BACKEND")
+        or os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local")
+    ).strip().lower()
+    if backend != "remote":
+        return None
+    server_url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
+    if not server_url:
+        logger.warning("YJ_STUDIO_TARGET_BACKEND=remote but YJ_STUDIO_SERVER_URL is empty")
+        return None
+    try:
+        timeout_s = float(os.environ.get("YJ_STUDIO_REQUEST_TIMEOUT_S", "180"))
+    except ValueError:
+        timeout_s = 180.0
+    project_id = os.environ.get("YJ_STUDIO_PROJECT_ID", "default").strip() or "default"
+    logger.info("Using remote target backend: %s project=%s", server_url, project_id)
+    return RemoteTargetStore(server_url, project_id=project_id, timeout_s=timeout_s)
+
+
+def _make_sam3_backend(parent=None):
+    backend = (
+        os.environ.get("YJ_STUDIO_SAM3_BACKEND")
+        or os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local")
+    ).strip().lower()
+    if backend != "remote":
+        return AIService(SAM3Config(), parent=parent)
+    server_url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
+    if not server_url:
+        logger.warning("YJ_STUDIO_SAM3_BACKEND=remote but YJ_STUDIO_SERVER_URL is empty; using local SAM3")
+        return AIService(SAM3Config(), parent=parent)
+    try:
+        timeout_s = float(os.environ.get("YJ_STUDIO_REQUEST_TIMEOUT_S", "180"))
+    except ValueError:
+        timeout_s = 180.0
+    project_id = os.environ.get("YJ_STUDIO_PROJECT_ID", "default").strip() or "default"
+    logger.info("Using remote SAM3 backend: %s", server_url)
+    return RemoteSAM3Client(server_url, project_id=project_id, timeout_s=timeout_s, parent=parent)
 
 
 def _lith_body_rgba(class_value: int, metadata: dict[str, object]) -> tuple[float, float, float, float]:

@@ -1,4 +1,4 @@
-"""End-to-end verification of the GRDECL parser on the real F:\\ files.
+"""End-to-end verification of the GRDECL parser on the bundled files.
 
 What it does:
 
@@ -16,7 +16,7 @@ What it does:
    Petrel.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\verify_grdecl_parser.py F:\\
+    python tools\\verify_grdecl_parser.py
 """
 
 from __future__ import annotations
@@ -28,9 +28,12 @@ from pathlib import Path
 
 # Make the package importable when the user runs this script directly.
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import RESERVOIR_GRDECL_ROOT, add_app_src_to_path
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -77,10 +80,7 @@ def _find_quartet(root: Path) -> dict[str, Path]:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: verify_grdecl_parser.py <dir-with-GRDECL-files>")
-        sys.exit(2)
-    root = Path(sys.argv[1])
+    root = Path(sys.argv[1]) if len(sys.argv) >= 2 else RESERVOIR_GRDECL_ROOT
     q = _find_quartet(root)
     for key in ("master", "coord", "zcorn", "actnum"):
         if key not in q:

@@ -12,21 +12,11 @@ from __future__ import annotations
 from .horizon_autotrack import HorizonAutotrackAlgorithm
 from .auto_track_horizon_3d import AutoTrackHorizon3DAlgorithm
 from .fault_autopick import FaultAutopickAlgorithm
-from .sandbody_extract import SandbodyExtractAlgorithm
-from .connectivity import ConnectivityAlgorithm
-from .closure_contour import ClosureContourAlgorithm
-from .trap_detect import TrapDetectAlgorithm
-from .trap_evaluate import TrapEvaluateAlgorithm
 from .region_grow import RegionGrowAlgorithm
 
 __all__ = [
     "AutoTrackHorizon3DAlgorithm",
-    "ClosureContourAlgorithm",
-    "ConnectivityAlgorithm",
     "FaultAutopickAlgorithm",
     "HorizonAutotrackAlgorithm",
     "RegionGrowAlgorithm",
-    "SandbodyExtractAlgorithm",
-    "TrapDetectAlgorithm",
-    "TrapEvaluateAlgorithm",
 ]

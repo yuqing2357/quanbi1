@@ -9,7 +9,7 @@ expands ECLIPSE's RLE form (`56064*0`), and prints an inventory:
   - rough memory estimate for the various data structures we might use
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\probe_grdecl.py F:\\
+    python tools\\probe_grdecl.py
 
 If the only argument is a directory, looks for the standard Petrel
 quartet (`*_COORD.GRDECL`, `*_ZCORN.GRDECL`, `*_ACTNUM.GRDECL` and the
@@ -21,6 +21,11 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
+
+try:
+    from project_paths import RESERVOIR_GRDECL_ROOT
+except Exception:  # pragma: no cover - direct use outside this repo
+    RESERVOIR_GRDECL_ROOT = None
 
 
 def _open_text(path: Path):
@@ -160,10 +165,10 @@ def find_quartet(root: Path) -> dict[str, Path]:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
+    target = Path(sys.argv[1]) if len(sys.argv) >= 2 else RESERVOIR_GRDECL_ROOT
+    if target is None:
         print("usage: probe_grdecl.py <dir-or-master-grdecl>")
         sys.exit(2)
-    target = Path(sys.argv[1])
     if target.is_dir():
         q = find_quartet(target)
         for key in ("master", "coord", "zcorn", "actnum"):

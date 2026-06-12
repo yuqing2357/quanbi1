@@ -1,10 +1,10 @@
-"""Smoke-test the IJK section extractors on the F:\\ grid.
+"""Smoke-test the IJK section extractors on the bundled GRDECL grid.
 
 Loads ReservoirGrid (cache hits), extracts one K / I / J section,
 verifies shapes, prints quad bounds and a few sample cells.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\smoke_reservoir_sections.py F:\\
+    python tools\\smoke_reservoir_sections.py data\\reservoir\\grdecl
 """
 
 from __future__ import annotations
@@ -14,9 +14,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import add_app_src_to_path, reservoir_master_from_arg
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -30,14 +33,7 @@ from yj_studio.reservoir.sections import (
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: smoke_reservoir_sections.py <dir>")
-        sys.exit(2)
-    root = Path(sys.argv[1])
-    master = next(p for p in root.glob("*.GRDECL")
-                  if "_COORD" not in p.name.upper()
-                  and "_ZCORN" not in p.name.upper()
-                  and "_ACTNUM" not in p.name.upper())
+    master = reservoir_master_from_arg(sys.argv[1] if len(sys.argv) >= 2 else None)
     print(f"master: {master}")
 
     grid = ReservoirGrid.load_from_master(master)

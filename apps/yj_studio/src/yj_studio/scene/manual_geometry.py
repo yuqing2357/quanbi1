@@ -6,10 +6,10 @@ import numpy as np
 
 from yj_studio.services.section_service import SectionAxis
 
-from .layers import ArbitrarySectionLayer, FaultStickLayer, HorizonStickLayer, MeasurementLayer, PolygonLayer
+from .layers import ArbitrarySectionLayer, FaultStickLayer, HorizonStickLayer, MeasurementLayer, PolygonLayer, TrapLayer
 
 ManualGeometryLayer = (
-    ArbitrarySectionLayer | PolygonLayer | HorizonStickLayer | FaultStickLayer | MeasurementLayer
+    ArbitrarySectionLayer | PolygonLayer | HorizonStickLayer | FaultStickLayer | MeasurementLayer | TrapLayer
 )
 MANUAL_GEOMETRY_TYPES = (
     ArbitrarySectionLayer,
@@ -17,6 +17,7 @@ MANUAL_GEOMETRY_TYPES = (
     HorizonStickLayer,
     FaultStickLayer,
     MeasurementLayer,
+    TrapLayer,
 )
 
 
@@ -35,6 +36,8 @@ def manual_geometry_points(layer: ManualGeometryLayer) -> np.ndarray | None:
         return as_world_points(layer.sticks)
     if isinstance(layer, MeasurementLayer):
         return as_world_points(layer.geometry)
+    if isinstance(layer, TrapLayer):
+        return as_world_points(layer.boundary)
     return None
 
 

@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "YJ Studio: Run Viewer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/local/run_viewer.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            }
+        },
+        {
+            "name": "YJ Studio: Run Server",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/server/run_server.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONDONTWRITEBYTECODE": "1"
+            }
+        }
+    ]
+}

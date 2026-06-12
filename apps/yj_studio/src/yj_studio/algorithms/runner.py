@@ -18,10 +18,12 @@ import queue
 import traceback
 from typing import Any, Protocol
 
+import numpy as np
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from yj_studio.scene.layer import Layer
 from yj_studio.scene.layer_store import LayerStore
+from yj_studio.scene.layers import VolumeLayer
 
 from .algorithm import Algorithm
 from .context import AlgorithmContext
@@ -274,6 +276,278 @@ class InProcessAlgorithmTask(QObject):
         self._thread.wait(2000)
 
 
+class RemoteSAM3Task(QObject):
+    """``AlgorithmTask``-shaped handle for remote single-slice SAM3 jobs."""
+
+    progress = pyqtSignal(float, str)
+    finished = pyqtSignal(list, str)
+    errored = pyqtSignal(str, str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        client: Any,
+        params: dict[str, Any],
+        input_layers: dict[str, Layer],
+        *,
+        layer_store: LayerStore | None = None,
+        parent: QObject | None = None,
+        auto_attach_outputs: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._params = dict(params)
+        self._input_layers = dict(input_layers)
+        self._layer_store = layer_store
+        self._auto_attach_outputs = auto_attach_outputs
+        self._job_id: str | None = None
+        self._finished_emitted = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(400)
+        self._timer.timeout.connect(self._poll)
+
+    def start(self) -> None:
+        volume_layer = self._input_layers.get("volume")
+        if not isinstance(volume_layer, VolumeLayer):
+            self._emit_error("需要一个作为 'volume' 输入的 VolumeLayer", "")
+            return
+        if not self._client.is_ready():
+            self._emit_error("远程 SAM3 服务未就绪，请先在 AI 面板中启动 AI。", "")
+            return
+        try:
+            self._client.mark_busy("远程 SAM3 分割中")
+            self._job_id = self._client.submit_segment(
+                volume_id=volume_layer.volume_id,
+                axis=str(self._params.get("axis", "inline")),
+                index=int(self._params.get("slice_index", 0)),
+                text=str(self._params.get("text_prompt", "")),
+                boxes=list(self._params.get("boxes", [])),
+                points=list(self._params.get("points", [])),
+                point_box_radius_px=float(self._params.get("point_box_radius_px", 8.0)),
+                confidence=float(self._params.get("confidence_threshold", 0.4)),
+                keep_top_k=int(self._params.get("keep_top_k", 3)),
+                target_type=str(self._params.get("target_type", "unknown")),
+            )
+        except Exception as exc:  # noqa: BLE001 - UI task boundary
+            self._client.mark_ready()
+            self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            return
+        self.progress.emit(0.02, "已提交远程 SAM3 任务")
+        self._timer.start()
+
+    def cancel(self) -> None:
+        if self._job_id is not None:
+            try:
+                self._client.cancel(self._job_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to cancel remote SAM3 job")
+        self._stop_timer()
+        self._client.mark_ready()
+        if not self._finished_emitted:
+            self._finished_emitted = True
+            self.cancelled.emit()
+
+    def _poll(self) -> None:
+        if self._job_id is None:
+            return
+        try:
+            status = self._client.poll(self._job_id)
+        except Exception as exc:  # noqa: BLE001
+            self._stop_timer()
+            self._client.mark_ready()
+            self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            return
+
+        state = str(status.get("state", ""))
+        progress = float(status.get("progress", 0.0) or 0.0)
+        message = str(status.get("message", ""))
+        self.progress.emit(progress, message)
+        if state in {"queued", "running"}:
+            return
+
+        self._stop_timer()
+        self._client.mark_ready()
+        if state == "done":
+            try:
+                result = self._client.result(self._job_id)
+                layers = self._build_layers(result)
+            except Exception as exc:  # noqa: BLE001
+                self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+                return
+            if self._auto_attach_outputs and self._layer_store is not None:
+                for layer in layers:
+                    self._layer_store.add(layer)
+            self._finished_emitted = True
+            axis = str(self._params.get("axis", "inline"))
+            index = int(self._params.get("slice_index", 0))
+            self.finished.emit(layers, f"远程 SAM3：在 {axis}={index} 上生成 {len(layers)} 个候选掩膜")
+        elif state == "cancelled":
+            self._finished_emitted = True
+            self.cancelled.emit()
+        else:
+            self._emit_error(str(status.get("error") or "远程 SAM3 任务失败"), "")
+
+    def _build_layers(self, result: dict[str, Any]) -> list[Layer]:
+        from yj_studio.ai.adapters import build_mask_layer, sam3_mask_to_layer
+
+        if self._job_id is None:
+            return []
+        axis = str(result.get("axis", self._params.get("axis", "inline")))
+        slice_index = int(result.get("index", self._params.get("slice_index", 0)))
+        volume_id = str(result.get("volume_id", ""))
+        text_prompt = str(self._params.get("text_prompt", ""))
+        name_prefix = str(self._params.get("name_prefix", "SAM3"))
+        candidates = result.get("candidates", [])
+        if not isinstance(candidates, list):
+            return []
+
+        layers: list[Layer] = []
+        for order, candidate in enumerate(candidates, start=1):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_index = int(candidate.get("index", order - 1))
+            mask = self._client.fetch_mask(self._job_id, candidate_index)
+            if np.asarray(mask).ndim != 2:
+                raise ValueError(f"Remote SAM3 mask must be 2D, got shape {np.asarray(mask).shape}")
+            sam3_mask = sam3_mask_to_layer(mask)
+            score = float(candidate.get("score", 0.0))
+            target_id = str(candidate.get("target_id", "") or "")
+            target_type = str(candidate.get("target_type", "unknown") or "unknown")
+            layers.append(
+                build_mask_layer(
+                    sam3_mask,
+                    name=f"{name_prefix} {target_id or order}（{score:.2f}）",
+                    axis=axis,
+                    slice_index=slice_index,
+                    score=score,
+                    metadata={
+                        "target_id": target_id,
+                        "target_type": target_type,
+                        "box": list(candidate.get("box", [])),
+                        "text_prompt": text_prompt,
+                        "volume_id": volume_id,
+                        "remote_job_id": self._job_id,
+                        "remote_mask_path": candidate.get("mask_path"),
+                    },
+                )
+            )
+        return layers
+
+    def _emit_error(self, message: str, tb: str) -> None:
+        if self._finished_emitted:
+            return
+        self._finished_emitted = True
+        self.errored.emit(message, tb)
+
+    def _stop_timer(self) -> None:
+        if self._timer.isActive():
+            self._timer.stop()
+
+
+class RemoteSAM3TrackTask(QObject):
+    """Qt task handle for remote multi-frame SAM3 tracking.
+
+    Tracking persists results into the server-side target store.  It therefore
+    returns the job result payload instead of local output layers.
+    """
+
+    progress = pyqtSignal(float, str)
+    finished = pyqtSignal(dict, str)
+    errored = pyqtSignal(str, str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        client: Any,
+        track_params: dict[str, Any],
+        *,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._client = client
+        self._params = dict(track_params)
+        self._job_id: str | None = None
+        self._finished_emitted = False
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._poll)
+
+    def start(self) -> None:
+        if not self._client.is_ready():
+            self._emit_error("远程 SAM3 服务未就绪，请先在 AI 面板中启动 AI。", "")
+            return
+        if not callable(getattr(self._client, "submit_track", None)):
+            self._emit_error("当前 AI 后端不支持远程追踪。", "")
+            return
+        try:
+            self._client.mark_busy("远程 SAM3 追踪中")
+            self._job_id = self._client.submit_track(**self._params)
+        except Exception as exc:  # noqa: BLE001 - UI task boundary
+            self._client.mark_ready()
+            self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            return
+        self.progress.emit(0.02, "已提交远程 SAM3 追踪任务")
+        self._timer.start()
+
+    def cancel(self) -> None:
+        if self._job_id is not None:
+            try:
+                self._client.cancel(self._job_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to cancel remote SAM3 track job")
+        self._stop_timer()
+        self._client.mark_ready()
+        if not self._finished_emitted:
+            self._finished_emitted = True
+            self.cancelled.emit()
+
+    def _poll(self) -> None:
+        if self._job_id is None:
+            return
+        try:
+            status = self._client.poll(self._job_id)
+        except Exception as exc:  # noqa: BLE001
+            self._stop_timer()
+            self._client.mark_ready()
+            self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+            return
+
+        state = str(status.get("state", ""))
+        progress = float(status.get("progress", 0.0) or 0.0)
+        message = str(status.get("message", ""))
+        self.progress.emit(progress, message)
+        if state in {"queued", "running"}:
+            return
+
+        self._stop_timer()
+        self._client.mark_ready()
+        if state == "done":
+            try:
+                result = self._client.result(self._job_id)
+            except Exception as exc:  # noqa: BLE001
+                self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
+                return
+            self._finished_emitted = True
+            target_ids = result.get("target_ids", [])
+            count = len(target_ids) if isinstance(target_ids, list) else 0
+            self.finished.emit(result, f"追踪完成：{count} 个目标")
+        elif state == "cancelled":
+            self._finished_emitted = True
+            self.cancelled.emit()
+        else:
+            self._emit_error(str(status.get("error") or "远程 SAM3 追踪失败"), "")
+
+    def _emit_error(self, message: str, tb: str) -> None:
+        if self._finished_emitted:
+            return
+        self._finished_emitted = True
+        self.errored.emit(message, tb)
+
+    def _stop_timer(self) -> None:
+        if self._timer.isActive():
+            self._timer.stop()
+
+
 def _level_for(level: str) -> int:
     return {
         "debug": logging.DEBUG,
@@ -311,7 +585,7 @@ class AlgorithmRunner(QObject):
         input_layers: dict[str, Layer],
         *,
         auto_attach_outputs: bool = False,
-    ) -> "AlgorithmTask | InProcessAlgorithmTask":
+    ) -> "AlgorithmTask | InProcessAlgorithmTask | RemoteSAM3Task":
         """Start ``algorithm_cls`` and return a task handle.
 
         Routes to a worker process or a worker thread based on
@@ -325,8 +599,19 @@ class AlgorithmRunner(QObject):
         skip the wrapping.
         """
 
-        if algorithm_cls.runs_in_subprocess:
-            task: AlgorithmTask | InProcessAlgorithmTask = AlgorithmTask(
+        remote_sam3 = self._services.get("ai_service")
+        task: AlgorithmTask | InProcessAlgorithmTask | RemoteSAM3Task
+        if _uses_remote_sam3(algorithm_cls, remote_sam3):
+            task = RemoteSAM3Task(
+                remote_sam3,
+                params,
+                input_layers,
+                layer_store=self._layer_store,
+                parent=self,
+                auto_attach_outputs=auto_attach_outputs,
+            )
+        elif algorithm_cls.runs_in_subprocess:
+            task = AlgorithmTask(
                 algorithm_cls,
                 params,
                 input_layers,
@@ -380,3 +665,12 @@ class AlgorithmRunner(QObject):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Algorithm %s failed", algorithm_cls.id)
             return AlgorithmResult.failure(f"{type(exc).__name__}: {exc}")
+
+
+def _uses_remote_sam3(algorithm_cls: type[Algorithm], service: Any) -> bool:
+    return (
+        getattr(algorithm_cls, "id", "") == "ai.sam3.segment"
+        and service is not None
+        and callable(getattr(service, "submit_segment", None))
+        and callable(getattr(service, "fetch_mask", None))
+    )

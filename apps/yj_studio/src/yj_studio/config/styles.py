@@ -67,7 +67,7 @@ LITH_BODY_STYLE = {
 }
 
 VOLUME_DISPLAY_STYLE = {
-    "seismic": {"filename": "seismic.npy", "label": "地震体", "cmap": "Petrel"},
+    "seismic": {"filename": "seismic.npy", "label": "地震体数据", "cmap": "Petrel"},
     "coherence": {"filename": "coherence.npy", "label": "相干体", "cmap": "viridis"},
     "dip_angle_deg": {"filename": "dip_angle_deg.npy", "label": "倾角", "cmap": "turbo"},
     "azimuth_deg": {"filename": "azimuth_deg.npy", "label": "方位角", "cmap": "hsv"},
@@ -85,13 +85,13 @@ VOLUME_DISPLAY_STYLE = {
 
 MODEL_VOLUME_DISPLAY_STYLE = {
     "model_lithology": {
-        "filename": "lithology_volume_seismic.npy",
-        "label": "岩相模型",
+        "filename": "lithology_binary_3x_uint8.npy",
+        "label": "岩性模型",
         "cmap": "tab10",
     },
     "model_porosity": {
-        "filename": "porosity_volume_seismic.npy",
-        "label": "模型孔隙度",
+        "filename": "porosity_3x_float16.npy",
+        "label": "孔隙度模型",
         "cmap": "viridis",
     },
 }

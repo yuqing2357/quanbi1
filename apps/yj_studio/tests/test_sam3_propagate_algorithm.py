@@ -50,7 +50,12 @@ class _FakeVideoModel:
             mask[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = True
             score = 0.9 if not seen_seed else 0.7
             seen_seed = True
-            yield frame_idx, {1: {"masks": mask[None, None], "scores": np.array([score])}}
+            # Real SAM3 video schema (see _extract_first_object / smoke_sam3_video.py).
+            yield frame_idx, {
+                "out_obj_ids": [1],
+                "out_probs": np.array([score], dtype=np.float32),
+                "out_binary_masks": mask[None],  # (n_obj, H, W)
+            }
 
 
 class _FakeVideoPredictor:
@@ -66,6 +71,11 @@ class _FakeVideoPredictor:
                    boxes_xywh, box_labels, obj_id):
         self.calls.append(("add_prompt", (frame_idx, text_str, boxes_xywh, box_labels, obj_id)))
         return frame_idx, None
+
+    def propagate_in_video(self, **kwargs):
+        # Production calls this on the predictor itself (no .model indirection),
+        # matching the real SAM3 API in sam3_video_predictor.py.
+        return self.model.propagate_in_video(**kwargs)
 
 
 @dataclass

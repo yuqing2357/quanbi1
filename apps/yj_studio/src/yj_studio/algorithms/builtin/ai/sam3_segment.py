@@ -19,7 +19,7 @@ from typing import ClassVar, Literal
 import numpy as np
 from pydantic import BaseModel, Field
 
-from yj_studio.ai.adapters import build_mask_layer, slice_to_rgb_image
+from yj_studio.ai.adapters import build_mask_layer, sam3_mask_to_layer, slice_to_rgb_image
 from yj_studio.ai.adapters.mask_to_layer import decode_sam3_masks
 from yj_studio.algorithms.algorithm import Algorithm
 from yj_studio.algorithms.context import AlgorithmContext
@@ -175,15 +175,10 @@ class SAM3SegmentAlgorithm(Algorithm):
         output_layers: list[MaskLayer] = []
         axis_name = {"inline": "Inline", "xline": "Xline", "z": "Z"}.get(ctx.params.axis, ctx.params.axis)
         for i, det in enumerate(detections, start=1):
-            # SAM3 returns a mask in image-pixel shape (rows=H, cols=W) where
-            # H matches the slice's "z / sample" axis and W matches the
-            # in-slice "inline / xline" axis. The rest of YJ Studio (brush
-            # tool, MaskLayer renderer, view_2d_section._mask_rgba) stores
-            # mask arrays in axis-1 × axis-2 order — i.e. transposed. So we
-            # transpose SAM3 output once at the seam between the AI subsystem
-            # and the scene/view layers, which keeps the SAM3 mask aligned
-            # with the user's prompt box in every downstream view.
-            sam3_mask = np.ascontiguousarray(np.asarray(det["mask"]).T)
+            # Convert SAM3 image-order mask (rows=samples, cols=inline/xline)
+            # to MaskLayer orientation via the single canonical helper — do not
+            # hand-write another .T. See mask_to_layer.sam3_mask_to_layer.
+            sam3_mask = sam3_mask_to_layer(det["mask"])
             output_layers.append(
                 build_mask_layer(
                     sam3_mask,

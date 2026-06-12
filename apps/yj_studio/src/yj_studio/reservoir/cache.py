@@ -15,7 +15,7 @@ I/O — typically 5–10 s for the YJ reference grid.
 
 Layout::
 
-    F:\\.yj_cache\\<stem>.<grdecl-mtime>.<spec-fingerprint>.grid.npz
+    <grdecl-folder>\\.yj_cache\\<stem>.<grdecl-mtime>.<spec-fingerprint>.grid.npz
 
     spec.npz:
         - actnum            int8  (nx, ny, nz)

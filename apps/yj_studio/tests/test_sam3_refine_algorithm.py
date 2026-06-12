@@ -76,7 +76,8 @@ def test_refine_rejects_empty_mask(qapp) -> None:
         services={"ai_service": ai_service, "volume_store": volume_store},
     )
     assert not result.ok
-    assert "empty" in (result.error or "").lower()
+    # Error wording is localized ("编辑后的掩膜为空").
+    assert "为空" in (result.error or "")
 
 
 def _corner_mask(h: int, w: int) -> np.ndarray:

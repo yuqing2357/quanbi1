@@ -1,0 +1,16 @@
+[Unit]
+Description=YJ Studio remote server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/quanbi
+Environment=YJ_STUDIO_ROOT=/root/quanbi
+Environment=YJ_STUDIO_CONDA_ENV=yjstudio-server
+ExecStart=/bin/bash /root/quanbi/server/scripts/start_server.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

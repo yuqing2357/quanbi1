@@ -64,6 +64,7 @@ class VolumeSliceRenderer:
             )
             return
         raw_slice = self._volume_store.get_slice(layer.volume_id, axis, index)
+        mask_slice = self._display_mask_slice(layer, axis, index)
         slice_image = build_slice_image(
             raw_slice,
             layer.shape,
@@ -72,6 +73,7 @@ class VolumeSliceRenderer:
             layer.clim,
             layer.cmap,
             roi=roi,
+            display_mask=mask_slice,
         )
         mesh = _quad(slice_image.points)
         texture = pv.numpy_to_texture(slice_image.image)
@@ -85,6 +87,18 @@ class VolumeSliceRenderer:
             pickable=True,
             show_edges=False,
         )
+
+    def _display_mask_slice(
+        self, layer: VolumeLayer, axis: SliceAxis, index: int
+    ) -> np.ndarray | None:
+        mask_volume_id = _model_mask_volume_id(layer.volume_id)
+        if mask_volume_id is None or mask_volume_id not in self._volume_store.volume_ids:
+            return None
+        try:
+            mask_slice = self._volume_store.get_slice(mask_volume_id, axis, index)
+        except (KeyError, IndexError, ValueError):
+            return None
+        return np.isfinite(mask_slice)
 
     def clear(self) -> None:
         for actor_name in self.ACTOR_NAMES.values():
@@ -100,6 +114,7 @@ def build_slice_image(
     clim: tuple[float, float] | None,
     cmap: str,
     roi: tuple[int, int, int, int, int, int] | None = None,
+    display_mask: np.ndarray | None = None,
 ) -> SliceImage:
     """Return a colorized image and its 3D quad points for one slice.
 
@@ -115,12 +130,17 @@ def build_slice_image(
 
     if axis == "inline":
         values = np.asarray(raw_slice, dtype=np.float32).T  # shape (nz, ny)
+        mask = _prepare_display_mask(display_mask)
         values = values[k0 : k1 + 1, j0 : j1 + 1]
+        if mask is not None:
+            mask = mask[k0 : k1 + 1, j0 : j1 + 1]
         # Spatial quad places shallow (k0) at the top after display_z flip, but
         # VTK's texture v-axis maps v=0 to the LAST image row; without flipping
         # the texture along sample axis the seismic image renders upside-down
         # relative to horizons/wells/faults. Flip rows here to match the quad.
         values = values[::-1, :]
+        if mask is not None:
+            mask = mask[::-1, :]
         points = np.asarray(
             [
                 [index, j0, display_z(float(k0), nz)],
@@ -132,8 +152,13 @@ def build_slice_image(
         )
     elif axis == "xline":
         values = np.asarray(raw_slice, dtype=np.float32).T  # shape (nz, nx)
+        mask = _prepare_display_mask(display_mask)
         values = values[k0 : k1 + 1, i0 : i1 + 1]
+        if mask is not None:
+            mask = mask[k0 : k1 + 1, i0 : i1 + 1]
         values = values[::-1, :]  # match flipped display Z, see inline branch
+        if mask is not None:
+            mask = mask[::-1, :]
         points = np.asarray(
             [
                 [i0, index, display_z(float(k0), nz)],
@@ -145,13 +170,31 @@ def build_slice_image(
         )
     else:
         values = np.asarray(raw_slice, dtype=np.float32).T  # shape (ny, nx)
+        mask = _prepare_display_mask(display_mask)
         values = values[j0 : j1 + 1, i0 : i1 + 1]
+        if mask is not None:
+            mask = mask[j0 : j1 + 1, i0 : i1 + 1]
         z_pos = display_z(float(index), nz)
         points = np.asarray(
             [[i0, j0, z_pos], [i1, j0, z_pos], [i1, j1, z_pos], [i0, j1, z_pos]],
             dtype=np.float32,
         )
-    return SliceImage(image=colorize_slice(values, clim, cmap), points=points)
+    return SliceImage(image=colorize_slice(values, clim, cmap, display_mask=mask), points=points)
+
+
+def _prepare_display_mask(display_mask: np.ndarray | None) -> np.ndarray | None:
+    if display_mask is None:
+        return None
+    # Match the value orientation created from raw_slice in build_slice_image().
+    return np.asarray(display_mask, dtype=bool).T
+
+
+def _model_mask_volume_id(volume_id: str) -> str | None:
+    if volume_id == "model_lithology":
+        return "model_porosity"
+    if volume_id == "model_porosity":
+        return volume_id
+    return None
 
 
 def _slice_within_roi(axis: SliceAxis, index: int, roi: tuple[int, int, int, int, int, int]) -> bool:
@@ -163,11 +206,24 @@ def _slice_within_roi(axis: SliceAxis, index: int, roi: tuple[int, int, int, int
     return k0 <= index <= k1
 
 
-def colorize_slice(values: np.ndarray, clim: tuple[float, float] | None, cmap: str) -> np.ndarray:
+def colorize_slice(
+    values: np.ndarray,
+    clim: tuple[float, float] | None,
+    cmap: str,
+    display_mask: np.ndarray | None = None,
+) -> np.ndarray:
     finite = np.isfinite(values)
+    visible = finite
+    use_alpha = display_mask is not None
+    if display_mask is not None:
+        mask = np.asarray(display_mask, dtype=bool)
+        if mask.shape == values.shape:
+            visible = finite & mask
+        else:
+            use_alpha = False
     if clim is None:
-        if np.any(finite):
-            vmin, vmax = np.percentile(values[finite], [2.0, 98.0])
+        if np.any(visible):
+            vmin, vmax = np.percentile(values[visible], [2.0, 98.0])
         else:
             vmin, vmax = 0.0, 1.0
     else:
@@ -176,17 +232,29 @@ def colorize_slice(values: np.ndarray, clim: tuple[float, float] | None, cmap: s
         vmin, vmax = 0.0, 1.0
 
     normalized = np.zeros(values.shape, dtype=np.float32)
-    normalized[finite] = np.clip((values[finite] - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0)
+    normalized[visible] = np.clip(
+        (values[visible] - float(vmin)) / (float(vmax) - float(vmin)),
+        0.0,
+        1.0,
+    )
 
     cmap_name = _matplotlib_cmap_name(cmap)
     if colormaps is None:
         rgb = np.repeat((normalized * 255.0).astype(np.uint8)[..., None], 3, axis=2)
-        rgb[~finite] = 0
+        rgb[~visible] = 0
+        if use_alpha:
+            alpha = np.zeros(values.shape, dtype=np.uint8)
+            alpha[visible] = 255
+            return np.dstack((rgb, alpha))
         return rgb
 
     rgba = colormaps[cmap_name](normalized)
     rgb = (rgba[..., :3] * 255.0).astype(np.uint8)
-    rgb[~finite] = 0
+    rgb[~visible] = 0
+    if use_alpha:
+        alpha = np.zeros(values.shape, dtype=np.uint8)
+        alpha[visible] = 255
+        return np.dstack((rgb, alpha))
     return rgb
 
 

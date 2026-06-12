@@ -17,9 +17,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import DEFAULT_RESERVOIR_MASTER, add_app_src_to_path
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -27,7 +30,7 @@ from yj_studio.reservoir import ReservoirGrid
 
 
 def main() -> None:
-    grid = ReservoirGrid.load_from_master(Path(r"F:\１２３４.GRDECL"))
+    grid = ReservoirGrid.load_from_master(DEFAULT_RESERVOIR_MASTER)
     nx, ny, nz = grid.shape
     coord = grid.coord    # (nx+1, ny+1, 6)
     active = grid.active != 0    # (nx, ny, nz)

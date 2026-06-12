@@ -9,15 +9,15 @@ EXPECTED_IDS = {
     "horizon.thickness",
     "measure.distance",
     "measure.area",
+    "volume.connectivity",
+    "reservoir.sandbody_extract",
+    "horizon.closure_contour",
+    "trap.detect_structural",
+    "trap.evaluate",
     # stubs
     "horizon.autotrack",
     "horizon.autotrack_3d",
     "fault.autopick",
-    "reservoir.sandbody_extract",
-    "reservoir.connectivity",
-    "trap.closure_contour",
-    "trap.detect_structural",
-    "trap.evaluate",
     "mask.region_grow",
 }
 
@@ -32,10 +32,10 @@ def test_phase_two_stubs_fail_with_friendly_message() -> None:
     from yj_studio.algorithms import AlgorithmRunner
 
     runner = AlgorithmRunner()
-    stub_cls = registry.get("trap.detect_structural")
+    stub_cls = registry.get("fault.autopick")
     result = runner.run_sync(
         stub_cls,
-        params={"structural_only": True, "score_threshold": 0.5},
+        params={},
         input_layers={},
     )
     assert not result.ok

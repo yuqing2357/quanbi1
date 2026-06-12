@@ -68,13 +68,14 @@ class ReservoirSelectionLayer(Layer):
 
     def to_dict(self) -> dict[str, Any]:
         payload = Layer.to_dict(self)
+        cell_payload = [] if self.metadata.get("external_cells_ref") else self.cell_ids.tolist()
         payload.update(
             {
                 "grid_layer_id": self.grid_layer_id,
                 "grid_id": self.grid_id,
-                # Serialise as a plain list-of-lists to keep the JSON
-                # payload compact and editor-friendly.
-                "cell_ids": self.cell_ids.tolist(),
+                # Remote target selections keep the full cell list on the
+                # server and only hold it in memory for display.
+                "cell_ids": cell_payload,
                 "source_axis": self.source_axis,
                 "source_index_lo": self.source_index_lo,
                 "source_index_hi": self.source_index_hi,

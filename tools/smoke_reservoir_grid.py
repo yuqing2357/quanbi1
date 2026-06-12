@@ -1,4 +1,4 @@
-"""Smoke-test ReservoirGrid end-to-end on the F:\\ files.
+"""Smoke-test ReservoirGrid end-to-end on the bundled GRDECL files.
 
 Loads the grid (ZCORN cache hit if already built), checks shapes,
 exercises the chunk cache, prints a few cells from different K
@@ -12,9 +12,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import add_app_src_to_path, reservoir_master_from_arg
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -26,19 +29,7 @@ def _progress(frac: float, msg: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: smoke_reservoir_grid.py <master.GRDECL>")
-        sys.exit(2)
-    master = Path(sys.argv[1])
-    if master.is_dir():
-        cands = [p for p in master.glob("*.GRDECL")
-                 if "_COORD" not in p.name.upper()
-                 and "_ZCORN" not in p.name.upper()
-                 and "_ACTNUM" not in p.name.upper()]
-        if not cands:
-            print(f"!! no master GRDECL in {master}")
-            sys.exit(2)
-        master = cands[0]
+    master = reservoir_master_from_arg(sys.argv[1] if len(sys.argv) >= 2 else None)
     print(f"master: {master}")
 
     print()

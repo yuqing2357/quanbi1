@@ -1,0 +1,48 @@
+# Server-side runtime dependencies.
+# Install from the project root:
+#   /root/anaconda3/envs/yjstudio-server/bin/python -m pip install -r server/requirements-server.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+fastapi
+uvicorn
+httptools
+websockets
+watchfiles
+python-dotenv
+python-multipart
+aiofiles
+orjson
+httpx
+requests
+cachetools
+
+numpy
+scipy
+matplotlib
+pillow
+PyYAML
+pydantic
+pyzmq
+psutil
+zarr
+numcodecs
+segyio
+
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+timm
+transformers
+safetensors
+tokenizers
+huggingface_hub
+einops
+ftfy
+iopath
+opencv-python-headless
+regex
+tqdm
+rich
+colorlog
+
+pytest

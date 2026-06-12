@@ -10,6 +10,7 @@ from yj_studio.scene.layers import (
     HorizonStickLayer,
     MeasurementLayer,
     PolygonLayer,
+    TrapLayer,
 )
 from yj_studio.view.display_coordinates import transform_points_z
 from yj_studio.view.highlight import highlight_color, highlight_opacity
@@ -24,7 +25,7 @@ class ManualGeometryRenderer:
 
     def render(
         self,
-        layer: ArbitrarySectionLayer | PolygonLayer | HorizonStickLayer | FaultStickLayer | MeasurementLayer,
+        layer: ArbitrarySectionLayer | PolygonLayer | HorizonStickLayer | FaultStickLayer | MeasurementLayer | TrapLayer,
         *,
         highlighted: bool = False,
         z_count: int | None = None,
@@ -38,10 +39,21 @@ class ManualGeometryRenderer:
             self.clear(layer.id)
             return
         display_points = transform_points_z(points, z_count)
-        mesh = _line_mesh(display_points, close=bool(getattr(layer, "closed", False)))
+        mesh = _line_mesh(display_points, close=bool(getattr(layer, "closed", False)) or isinstance(layer, TrapLayer))
         point_mesh = pv.PolyData(display_points)
         color = highlight_color(layer.color, highlighted)
         self.clear(layer.id, render=False)
+        if isinstance(layer, TrapLayer):
+            surface = build_trap_surface(layer, z_count=z_count)
+            if surface.n_cells:
+                self._plotter.add_mesh(
+                    surface,
+                    name=f"{actor_name}-surface",
+                    color=color,
+                    opacity=highlight_opacity(max(0.18, layer.opacity * 0.35), highlighted),
+                    lighting=False,
+                    pickable=True,
+                )
         if mesh.n_points >= 2:
             self._plotter.add_mesh(
                 mesh,
@@ -69,6 +81,7 @@ class ManualGeometryRenderer:
         self._plotter.remove_actor(actor_name, reset_camera=False, render=False)
         self._plotter.remove_actor(f"{actor_name}-line", reset_camera=False, render=False)
         self._plotter.remove_actor(f"{actor_name}-points", reset_camera=False, render=False)
+        self._plotter.remove_actor(f"{actor_name}-surface", reset_camera=False, render=False)
         if render:
             self._plotter.render()
 
@@ -82,3 +95,21 @@ def _line_mesh(points: np.ndarray, *, close: bool) -> pv.PolyData:
     if points.shape[0] < 2:
         return pv.PolyData()
     return pv.lines_from_points(points, close=close)
+
+
+def build_trap_surface(layer: TrapLayer, *, z_count: int | None = None) -> pv.PolyData:
+    points = manual_geometry_points(layer)
+    if points is None or points.shape[0] < 3:
+        return pv.PolyData()
+    display_points = transform_points_z(points, z_count)
+    if np.linalg.norm(display_points[0] - display_points[-1]) <= 1e-5:
+        display_points = display_points[:-1]
+    if display_points.shape[0] < 3:
+        return pv.PolyData()
+    faces = np.concatenate(
+        [
+            np.asarray([display_points.shape[0]], dtype=np.int64),
+            np.arange(display_points.shape[0], dtype=np.int64),
+        ]
+    )
+    return pv.PolyData(display_points.astype(np.float32, copy=False), faces)

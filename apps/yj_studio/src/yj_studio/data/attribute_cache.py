@@ -29,10 +29,11 @@ def estimate_volume_clim(
     if volume_key == "azimuth_deg":
         return [0.0, 360.0]
     if volume_key == "model_lithology":
-        return [-0.5, 2.5]
+        return [-0.5, 1.5]
+    if volume_key == "model_porosity":
+        return [0.0, 0.30]
     clim = estimate_clim(volume, x_idx, y_idx, z_idx)
     if volume_key.startswith("curvature_"):
         limit = max(abs(clim[0]), abs(clim[1]))
         return [-float(limit), float(limit)]
     return clim
-

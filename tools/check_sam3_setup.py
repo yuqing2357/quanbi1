@@ -2,7 +2,7 @@
 
 Run this **after** copying assets in via tools/copy_sam3_assets.ps1.
 
-    & 'E:\\miniconda\\envs\\py312\\python.exe' tools\\check_sam3_setup.py
+    python tools/check_sam3_setup.py
 
 Exits 0 if everything is in place, 1 otherwise. Does NOT load the model
 (that would take 30s and 1.5 GB GPU); only checks paths and ``import sam3``.
@@ -22,10 +22,7 @@ def main() -> int:
     sam3_pkg = ROOT / "libs" / "sam3"
     if not (sam3_pkg / "__init__.py").exists():
         print(f"[FAIL] {sam3_pkg / '__init__.py'} not found")
-        print(
-            "       Copy D:\\商书记项目\\sam3\\sam3\\sam3\\ -> "
-            "f:\\圈闭软件\\libs\\sam3\\"
-        )
+        print("       Run tools/copy_sam3_assets.ps1 with an explicit -SourceRoot")
         ok = False
     else:
         print(f"[OK]   {sam3_pkg / '__init__.py'} exists")
@@ -48,8 +45,7 @@ def main() -> int:
     ckpt = ROOT / "weights" / "sam3.pt"
     if not ckpt.exists():
         print(f"[FAIL] {ckpt} not found")
-        print("       Copy D:\\商书记项目\\sam3\\sam3\\weights\\sam3.pt -> "
-              "f:\\圈闭软件\\weights\\sam3.pt")
+        print("       Run tools/copy_sam3_assets.ps1 with an explicit -SourceRoot")
         ok = False
     else:
         size_gb = ckpt.stat().st_size / 1024**3

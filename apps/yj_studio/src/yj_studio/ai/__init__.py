@@ -18,6 +18,7 @@ runner, schema-form and dock plumbing for free.
 from __future__ import annotations
 
 from .config import SAM3Config
+from .remote_client import RemoteSAM3Client, RemoteSAM3Config
 from .service import AIService, AIServiceState
 
-__all__ = ["AIService", "AIServiceState", "SAM3Config"]
+__all__ = ["AIService", "AIServiceState", "RemoteSAM3Client", "RemoteSAM3Config", "SAM3Config"]

@@ -1,0 +1,70 @@
+# Copy to server/config/server.yaml on the server and adjust if needed.
+
+host: 0.0.0.0
+port: 8765
+log_level: info
+project_id: default
+
+project_root: /root/quanbi
+data_root: /root/quanbi/data
+runtime_root: /root/quanbi/runtime/server
+results_root: /root/quanbi/data/results
+slice_cache_max_gb: 100
+
+auth:
+  enabled: false
+  token_env: YJ_STUDIO_SERVER_TOKEN
+
+sam3:
+  checkpoint: weights/sam3.pt
+  source_root: libs
+  device: cuda
+  resolution: 1008
+  load_video: true
+  results_subdir: sam3
+  gpu_ids: [0, 1, 2, 3]
+  worker_count: 4
+  target_types:
+    - trap
+    - turbidite
+    - fault
+    - sandbody
+    - unknown
+
+training:
+  dataset_subdir: sam3/datasets
+  models_subdir: sam3/models
+  output_subdir: sam3/training_runs
+  active_model: null
+  # Optional. When set, /sam3/train/jobs exports the dataset, then runs this
+  # command with YJ_DATASET_DIR and YJ_TRAIN_OUTPUT_DIR in the environment.
+  # Placeholders are also supported:
+  # command:
+  #   - python
+  #   - server/training/train_sam3.py
+  #   - --dataset
+  #   - "{dataset_dir}"
+  #   - --output
+  #   - "{output_dir}"
+  # timeout_s: 86400
+
+volumes:
+  seismic:
+    label: 地震体数据
+    path: seismic/YJ-ALL-SEISMIC.npy
+    cmap: Petrel
+    clim: null
+
+  model_lithology:
+    label: 岩性模型
+    path: reservoir/numpy_3x/lithology_binary_3x_uint8.npy
+    cmap: viridis
+    clim: [-0.5, 1.5]
+    mask_volume: model_porosity
+
+  model_porosity:
+    label: 孔隙度模型
+    path: reservoir/numpy_3x/porosity_3x_float16.npy
+    cmap: viridis
+    clim: [0.0, 0.30]
+    mask_volume: model_porosity

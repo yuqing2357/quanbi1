@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QUndoStack
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -45,11 +45,12 @@ from PyQt6.QtWidgets import (
 )
 
 from yj_studio.ai.service import AIService, AIServiceState
-from yj_studio.algorithms.runner import AlgorithmRunner
+from yj_studio.algorithms.runner import AlgorithmRunner, RemoteSAM3TrackTask
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import VolumeLayer
 from yj_studio.scene.undo_commands import AddLayerCommand
 from yj_studio.tools.tool_manager import ToolManager
+from yj_studio.targets import BUILTIN_TARGET_TYPES
 from yj_studio.ui.text import ai_state_label, section_axis_label
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,8 @@ _AXES = ("inline", "xline", "z")
 
 
 class AIDock(QDockWidget):
+    track_finished = pyqtSignal(dict)
+
     def __init__(
         self,
         layer_store: LayerStore,
@@ -156,16 +159,32 @@ class AIDock(QDockWidget):
         self._top_k_spin.setRange(1, 50)
         self._top_k_spin.setValue(3)
         run_form.addRow("保留前 K", self._top_k_spin)
+        self._target_type_combo = QComboBox(body)
+        self._target_type_combo.setEditable(True)
+        self._target_type_combo.addItems(list(BUILTIN_TARGET_TYPES))
+        self._target_type_combo.setCurrentText("unknown")
+        run_form.addRow("目标类型", self._target_type_combo)
+        self._track_back_spin = QSpinBox(body)
+        self._track_back_spin.setRange(0, 5000)
+        self._track_back_spin.setValue(20)
+        run_form.addRow("种子前帧数", self._track_back_spin)
+        self._track_fwd_spin = QSpinBox(body)
+        self._track_fwd_spin.setRange(0, 5000)
+        self._track_fwd_spin.setValue(20)
+        run_form.addRow("种子后帧数", self._track_fwd_spin)
         outer.addLayout(run_form)
 
         # Run row
         run_row = QHBoxLayout()
         self._run_button = QPushButton("运行 SAM3 分割", body)
         self._run_button.clicked.connect(self._on_run_clicked)
+        self._track_button = QPushButton("追踪", body)
+        self._track_button.clicked.connect(self._on_track_clicked)
         self._cancel_button = QPushButton("取消", body)
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self._on_cancel_clicked)
         run_row.addWidget(self._run_button)
+        run_row.addWidget(self._track_button)
         run_row.addWidget(self._cancel_button)
         outer.addLayout(run_row)
 
@@ -207,6 +226,9 @@ class AIDock(QDockWidget):
         self._start_button.setEnabled(state in {AIServiceState.IDLE, AIServiceState.ERROR})
         self._stop_button.setEnabled(state in {AIServiceState.READY, AIServiceState.ERROR})
         self._run_button.setEnabled(state == AIServiceState.READY)
+        self._track_button.setEnabled(
+            state == AIServiceState.READY and callable(getattr(self._ai_service, "submit_track", None))
+        )
 
     def _on_box_prompt(
         self, axis: str, slice_index: int, x_min: float, y_min: float, x_max: float, y_max: float
@@ -277,6 +299,7 @@ class AIDock(QDockWidget):
             "points": list(self._points),
             "confidence_threshold": float(self._confidence_spin.value()),
             "keep_top_k": int(self._top_k_spin.value()),
+            "target_type": self._target_type_combo.currentText().strip() or "unknown",
             "name_prefix": "SAM3",
         }
         if not params["text_prompt"] and not params["boxes"] and not params["points"]:
@@ -305,6 +328,43 @@ class AIDock(QDockWidget):
         task.errored.connect(self._on_errored)
         task.cancelled.connect(self._on_cancelled)
 
+    def _on_track_clicked(self) -> None:
+        volume_layer = self._active_volume_layer()
+        if volume_layer is None:
+            QMessageBox.information(self, "SAM3 追踪", "请先加载体数据，再运行追踪。")
+            return
+        if not callable(getattr(self._ai_service, "submit_track", None)):
+            QMessageBox.information(self, "SAM3 追踪", "追踪需要远程 SAM3 后端。")
+            return
+        if not self._boxes:
+            QMessageBox.information(self, "SAM3 追踪", "请先在剖面上框选至少一个目标。")
+            return
+        params = {
+            "volume_id": volume_layer.volume_id,
+            "axis": str(self._axis_combo.currentData() or self._axis_combo.currentText()),
+            "seed": int(self._slice_spin.value()),
+            "back": int(self._track_back_spin.value()),
+            "fwd": int(self._track_fwd_spin.value()),
+            "boxes": list(self._boxes),
+            "text": self._text_edit.toPlainText().strip(),
+            "confidence": float(self._confidence_spin.value()),
+            "keep_top_k": int(self._top_k_spin.value()),
+            "target_type": self._target_type_combo.currentText().strip() or "unknown",
+        }
+        self._summary_label.setText("")
+        self._progress_bar.setValue(0)
+        self._run_button.setEnabled(False)
+        self._track_button.setEnabled(False)
+        self._cancel_button.setEnabled(True)
+
+        task = RemoteSAM3TrackTask(self._ai_service, params, parent=self)
+        self._current_task = task
+        task.progress.connect(self._on_progress)
+        task.finished.connect(self._on_track_finished)
+        task.errored.connect(self._on_errored)
+        task.cancelled.connect(self._on_cancelled)
+        task.start()
+
     def _on_cancel_clicked(self) -> None:
         if self._current_task is not None:
             self._current_task.cancel()
@@ -330,6 +390,12 @@ class AIDock(QDockWidget):
                     self._layer_store.add(layer)
         self._summary_label.setText(summary or f"已生成 {len(output_layers)} 个掩膜。")
 
+    def _on_track_finished(self, result: dict, summary: str) -> None:
+        self._reset_run_buttons()
+        self._progress_bar.setValue(100)
+        self._summary_label.setText(summary or "追踪完成。")
+        self.track_finished.emit(dict(result))
+
     def _on_errored(self, message: str, traceback_text: str) -> None:
         self._reset_run_buttons()
         self._summary_label.setText(f"错误：{message}")
@@ -341,6 +407,10 @@ class AIDock(QDockWidget):
 
     def _reset_run_buttons(self) -> None:
         self._run_button.setEnabled(self._ai_service.state == AIServiceState.READY)
+        self._track_button.setEnabled(
+            self._ai_service.state == AIServiceState.READY
+            and callable(getattr(self._ai_service, "submit_track", None))
+        )
         self._cancel_button.setEnabled(False)
         self._current_task = None
 

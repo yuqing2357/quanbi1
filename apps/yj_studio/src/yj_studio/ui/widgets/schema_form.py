@@ -101,7 +101,9 @@ class SchemaForm(QWidget):
             self._current_model.model_validate(collected["params"])
         except ValidationError as exc:
             return str(exc)
-        for role in self._current_layer_spec:
+        for role, kind_filter in self._current_layer_spec.items():
+            if _layer_spec_optional(kind_filter):
+                continue
             if role not in collected["layers"]:
                 return f"缺少图层输入：{parameter_role_label(role)}"
         return None
@@ -132,8 +134,10 @@ class SchemaForm(QWidget):
 
     def _build_layer_combo(self, role: str, kind_filter: str) -> QComboBox:
         combo = QComboBox(self)
-        human_filter = "、".join(layer_kind_label(token.strip()) for token in kind_filter.split("|") if token.strip())
-        combo.setToolTip(f"{parameter_role_label(role)}：可选 {human_filter or '全部类型'}")
+        tokens = _layer_spec_tokens(kind_filter)
+        human_filter = "、".join(layer_kind_label(token) for token in tokens)
+        suffix = "（可选）" if _layer_spec_optional(kind_filter) else ""
+        combo.setToolTip(f"{parameter_role_label(role)}{suffix}：可选 {human_filter or '全部类型'}")
         combo.addItem("— 请选择 —", "")
         for label, layer_id in self._iter_matching_layers(kind_filter):
             combo.addItem(label, layer_id)
@@ -141,7 +145,7 @@ class SchemaForm(QWidget):
         return combo
 
     def _iter_matching_layers(self, kind_filter: str) -> Iterable[tuple[str, str]]:
-        wanted = {token.strip() for token in kind_filter.split("|") if token.strip()}
+        wanted = set(_layer_spec_tokens(kind_filter))
         for layer in self._layer_store.iter_layers():
             if wanted and layer.kind not in wanted:
                 continue
@@ -221,6 +225,23 @@ def _widget_value(widget: QWidget) -> Any:
     if isinstance(widget, QLineEdit):
         return widget.text()
     return None
+
+
+def _layer_spec_optional(kind_filter: str) -> bool:
+    return any(token.strip().endswith("?") for token in kind_filter.split("|") if token.strip())
+
+
+def _layer_spec_tokens(kind_filter: str) -> list[str]:
+    tokens: list[str] = []
+    for token in kind_filter.split("|"):
+        clean = token.strip()
+        if not clean:
+            continue
+        if clean.endswith("?"):
+            clean = clean[:-1]
+        if clean:
+            tokens.append(clean)
+    return tokens
 
 
 def _numeric_range(field: FieldInfo, *, default_int: bool) -> tuple[float, float]:

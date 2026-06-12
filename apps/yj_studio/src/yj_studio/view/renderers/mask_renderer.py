@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
+from skimage.measure import marching_cubes
 
 from yj_studio.scene.layers import MaskLayer
 from yj_studio.view.display_coordinates import display_z, layer_z_count
@@ -34,10 +35,24 @@ class MaskRenderer:
             self.clear(layer.id)
             return
         mask = np.asarray(layer.mask)
+        if mask.ndim == 3:
+            mesh = build_mask_volume_mesh(layer, z_count=layer_z_count(layer.metadata) or z_count)
+            if mesh.n_cells == 0:
+                self.clear(layer.id)
+                return
+            self._plotter.remove_actor(actor_name, reset_camera=False, render=False)
+            self._plotter.add_mesh(
+                mesh,
+                name=actor_name,
+                color=highlight_color(layer.color, highlighted),
+                opacity=highlight_opacity(layer.opacity, highlighted),
+                smooth_shading=True,
+                lighting=False,
+                pickable=True,
+            )
+            self._plotter.render()
+            return
         if mask.ndim != 2:
-            # 3D masks (e.g. SAM3 propagation output) are not yet handled by
-            # this renderer; skip silently — the LayerTree still lists them
-            # and downstream algorithms can still consume them.
             self.clear(layer.id)
             return
         z_count_for_axis = layer_z_count(layer.metadata) or z_count
@@ -122,6 +137,51 @@ def build_mask_mesh(layer: MaskLayer, *, z_count: int | None = None) -> pv.PolyD
         dtype=np.float32,
     )
     return mesh
+
+
+def build_mask_volume_mesh(layer: MaskLayer, *, z_count: int | None = None) -> pv.PolyData:
+    """Build a marching-cubes surface for a tracked target ``mask3d``.
+
+    Server-side target masks are stored in image order per frame. For a
+    tracked volume, the raw shape is ``(frame, image_row, image_col)`` where
+    ``image_row`` is sample/depth for inline/xline frames and ``image_col`` is
+    trace. This function converts that into scene coordinates ``(inline,
+    xline, sample_z)`` before applying the usual display-z flip.
+    """
+
+    raw = np.asarray(layer.mask)
+    if raw.ndim != 3 or raw.size == 0 or not np.any(raw > 0):
+        return pv.PolyData()
+    axis = str(layer.axis or layer.metadata.get("axis") or "z")
+    index_lo = int(layer.metadata.get("mask3d_index_lo", layer.slice_index or 0))
+    world = _mask3d_to_world_bool(raw, axis)
+    if not np.any(world):
+        return pv.PolyData()
+
+    padded = np.pad(world.astype(np.float32, copy=False), 1, mode="constant")
+    verts, faces, _normals, _values = marching_cubes(padded, level=0.5)
+    verts = verts.astype(np.float32, copy=False) - 1.0
+    if axis == "inline":
+        verts[:, 0] += float(index_lo)
+    elif axis in {"xline", "crossline"}:
+        verts[:, 1] += float(index_lo)
+    else:
+        verts[:, 2] += float(index_lo)
+    if z_count is not None:
+        verts[:, 2] = display_z(verts[:, 2], z_count)
+
+    face_prefix = np.full((faces.shape[0], 1), 3, dtype=np.int64)
+    vtk_faces = np.hstack([face_prefix, faces.astype(np.int64, copy=False)]).ravel()
+    return pv.PolyData(verts, vtk_faces)
+
+
+def _mask3d_to_world_bool(mask: np.ndarray, axis: str) -> np.ndarray:
+    arr = np.asarray(mask, dtype=bool)
+    if axis == "inline":
+        return np.ascontiguousarray(np.transpose(arr, (0, 2, 1)))
+    if axis in {"xline", "crossline"}:
+        return np.ascontiguousarray(np.transpose(arr, (2, 0, 1)))
+    return np.ascontiguousarray(np.transpose(arr, (2, 1, 0)))
 
 
 def build_mask_texture(layer: MaskLayer) -> np.ndarray:

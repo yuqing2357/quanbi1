@@ -1,0 +1,10 @@
+name: yjstudio-server
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - setuptools
+  - wheel
+  - pip:
+      - -r server/requirements-server.txt

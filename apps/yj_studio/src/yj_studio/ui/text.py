@@ -31,6 +31,7 @@ SECTION_AXIS_LABELS = {
 ALGORITHM_CATEGORY_LABELS = {
     "horizon": "层位",
     "fault": "断层",
+    "volume": "体数据",
     "reservoir": "储层",
     "trap": "圈闭",
     "measure": "测量",
@@ -49,6 +50,8 @@ PARAM_ROLE_LABELS = {
     "horizon": "层位",
     "mask": "掩膜",
     "trap": "圈闭",
+    "porosity": "孔隙度体",
+    "lithology": "岩性体",
 }
 
 PARAM_NAME_LABELS = {
@@ -68,6 +71,21 @@ PARAM_NAME_LABELS = {
     "pad_box_px": "外扩像素",
     "depth_step_m": "每采样米数",
     "name": "名称",
+    "threshold": "阈值",
+    "comparator": "比较符",
+    "connectivity": "连通性",
+    "min_voxels": "最小体素数",
+    "top_k": "保留前 K",
+    "porosity_cutoff": "孔隙度下限",
+    "use_lithology": "使用岩性",
+    "sand_code": "砂岩码",
+    "cell_volume_m3": "单体素体积",
+    "net_to_gross": "净毛比",
+    "water_saturation": "含水饱和度",
+    "cell_area_m2": "单网格面积",
+    "z_step_m": "每采样米数",
+    "formation_volume_factor": "地层体积系数",
+    "default_porosity": "默认孔隙度",
     "structural_only": "仅结构",
     "score_threshold": "分数阈值",
     "use_well_data": "使用井数据",

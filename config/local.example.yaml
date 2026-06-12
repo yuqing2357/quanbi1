@@ -1,0 +1,19 @@
+mode: remote
+server_url: http://114.214.170.109:8765
+project_id: default
+request_timeout_s: 180
+probe_server_on_start: true
+require_server: false
+
+cache_root: local/cache
+log_root: local/logs
+
+volume_backend: remote
+sam3_backend: remote
+target_backend: remote
+default_layers:
+  - seismic
+  - model_lithology
+  - model_porosity
+
+disable_3d: false

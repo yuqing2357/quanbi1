@@ -49,4 +49,6 @@ def test_thickness_rejects_shape_mismatch() -> None:
         input_layers={"top": top, "bottom": bot},
     )
     assert not result.ok
-    assert "shape" in (result.error or "").lower()
+    # Error wording is localized; assert on the language-independent shapes.
+    assert "(4, 4)" in (result.error or "")
+    assert "(4, 5)" in (result.error or "")

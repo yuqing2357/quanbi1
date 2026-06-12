@@ -10,7 +10,7 @@ Public API:
 
     from yj_studio.reservoir import ReservoirGrid
 
-    grid = ReservoirGrid.load_from_master(Path("F:/1234.GRDECL"))
+    grid = ReservoirGrid.load_from_master(Path("data/reservoir/grdecl/１２３４.GRDECL"))
     corners = grid.corners_for_k_chunk(0, 32)
     poro = grid.property("PORO")
     print(grid.active.sum(), "active cells")

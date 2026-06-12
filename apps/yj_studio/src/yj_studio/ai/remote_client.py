@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from io import BytesIO
+from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+import numpy as np
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from .service import AIServiceState
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteSAM3Config:
+    server_url: str
+
+    @property
+    def checkpoint_path(self) -> str:
+        return f"{self.server_url.rstrip('/')}/sam3"
+
+    def checkpoint_exists(self) -> bool:
+        return True
+
+
+class RemoteSAM3Client(QObject):
+    """Qt-shaped SAM3 service that submits inference jobs to YJ Studio Server."""
+
+    state_changed = pyqtSignal(AIServiceState, str)
+    box_prompt_added = pyqtSignal(str, int, float, float, float, float)
+    point_prompt_added = pyqtSignal(str, int, float, float)
+
+    def __init__(
+        self,
+        server_url: str,
+        *,
+        project_id: str = "default",
+        timeout_s: float = 180.0,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.server_url = server_url.rstrip("/")
+        self.project_id = project_id or "default"
+        self.timeout_s = float(timeout_s)
+        self._state = AIServiceState.IDLE
+        self._message = "远程 SAM3 未连接"
+        self._config = RemoteSAM3Config(self.server_url)
+
+    @property
+    def state(self) -> AIServiceState:
+        return self._state
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+    @property
+    def config(self) -> RemoteSAM3Config:
+        return self._config
+
+    def is_ready(self) -> bool:
+        return self._state == AIServiceState.READY
+
+    def start(self) -> None:
+        self._set_state(AIServiceState.LOADING, "正在连接远程 SAM3 服务")
+        try:
+            health = self._get_json("/health", timeout_s=min(self.timeout_s, 10.0))
+        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            self._set_state(AIServiceState.ERROR, f"远程服务器不可用：{exc}")
+            return
+        status = health.get("status", "unknown") if isinstance(health, dict) else "unknown"
+        self._set_state(AIServiceState.READY, f"远程 SAM3 已就绪（server={status}）")
+
+    def shutdown(self) -> None:
+        self._set_state(AIServiceState.IDLE, "远程 SAM3 已断开")
+
+    def mark_busy(self, message: str = "运行中") -> None:
+        if self._state == AIServiceState.READY:
+            self._set_state(AIServiceState.BUSY, message)
+
+    def mark_ready(self, message: str = "远程 SAM3 已就绪") -> None:
+        if self._state == AIServiceState.BUSY:
+            self._set_state(AIServiceState.READY, message)
+
+    def emit_box_prompt(
+        self,
+        axis: str,
+        slice_index: int,
+        x_min: float,
+        y_min: float,
+        x_max: float,
+        y_max: float,
+    ) -> None:
+        self.box_prompt_added.emit(
+            axis, int(slice_index), float(x_min), float(y_min), float(x_max), float(y_max)
+        )
+
+    def emit_point_prompt(self, axis: str, slice_index: int, x: float, y: float) -> None:
+        self.point_prompt_added.emit(axis, int(slice_index), float(x), float(y))
+
+    def submit_segment(
+        self,
+        *,
+        volume_id: str,
+        axis: str,
+        index: int,
+        text: str = "",
+        boxes: list[tuple[float, float, float, float]] | None = None,
+        points: list[tuple[float, float]] | None = None,
+        point_box_radius_px: float = 8.0,
+        confidence: float = 0.4,
+        keep_top_k: int = 3,
+        target_type: str = "unknown",
+    ) -> str:
+        body = {
+            "kind": "segment",
+            "project": self.project_id,
+            "volume_id": volume_id,
+            "axis": axis,
+            "index": int(index),
+            "target_type": target_type or "unknown",
+            "prompts": {
+                "text": text,
+                "boxes": [list(box) for box in (boxes or [])],
+                "points": [list(point) for point in (points or [])],
+            },
+            "point_box_radius_px": float(point_box_radius_px),
+            "confidence": float(confidence),
+            "keep_top_k": int(keep_top_k),
+        }
+        payload = self._post_json("/sam3/jobs", body)
+        job_id = str(payload.get("job_id", ""))
+        if not job_id:
+            raise RuntimeError("Remote SAM3 server did not return a job_id")
+        return job_id
+
+    def submit_track(
+        self,
+        *,
+        volume_id: str,
+        axis: str,
+        seed: int,
+        back: int,
+        fwd: int,
+        boxes: list[tuple[float, float, float, float]] | None = None,
+        text: str = "",
+        confidence: float = 0.4,
+        keep_top_k: int = 3,
+        target_type: str = "unknown",
+    ) -> str:
+        body = {
+            "kind": "track",
+            "project": self.project_id,
+            "volume_id": volume_id,
+            "axis": axis,
+            "index": {
+                "seed": int(seed),
+                "back": int(back),
+                "fwd": int(fwd),
+            },
+            "target_type": target_type or "unknown",
+            "prompts": {
+                "text": text,
+                "boxes": [list(box) for box in (boxes or [])],
+            },
+            "confidence": float(confidence),
+            "keep_top_k": int(keep_top_k),
+        }
+        payload = self._post_json("/sam3/jobs", body)
+        job_id = str(payload.get("job_id", ""))
+        if not job_id:
+            raise RuntimeError("Remote SAM3 server did not return a job_id for track")
+        return job_id
+
+    def poll(self, job_id: str) -> dict[str, Any]:
+        payload = self._get_json(f"/sam3/jobs/{job_id}", timeout_s=self.timeout_s)
+        if not isinstance(payload, dict):
+            raise ValueError("SAM3 job status must be a JSON object")
+        return payload
+
+    def result(self, job_id: str) -> dict[str, Any]:
+        payload = self._get_json(f"/sam3/jobs/{job_id}/result", timeout_s=self.timeout_s)
+        if not isinstance(payload, dict):
+            raise ValueError("SAM3 job result must be a JSON object")
+        return payload
+
+    def fetch_mask(self, job_id: str, candidate_index: int) -> np.ndarray:
+        with urlopen(
+            f"{self.server_url}/sam3/jobs/{job_id}/mask/{int(candidate_index)}",
+            timeout=self.timeout_s,
+        ) as response:
+            data = response.read()
+        return np.load(BytesIO(data), allow_pickle=False)
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        return self._post_json(f"/sam3/jobs/{job_id}/cancel", {})
+
+    def _set_state(self, state: AIServiceState, message: str) -> None:
+        self._state = state
+        self._message = message
+        self.state_changed.emit(state, message)
+
+    def _get_json(self, path: str, *, timeout_s: float) -> Any:
+        with urlopen(f"{self.server_url}{path}", timeout=timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            f"{self.server_url}{path}",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=self.timeout_s) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected JSON response from {path}")
+        return data

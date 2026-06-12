@@ -11,11 +11,12 @@ import numpy as np
 SCRIPT_PATH = Path(__file__).resolve()
 CODE_DIR = SCRIPT_PATH.parent
 VISUAL_ROOT = CODE_DIR.parent
-BUNDLE_ROOT = VISUAL_ROOT.parent
-PROCESSED_ROOT = BUNDLE_ROOT / "处理后文件"
-FULL_DEPTH_SEISMIC_NPY = Path(r"F:\YJ-ALL-SEISMIC_depth_0_653.npy")
-FULL_DEPTH_PROCESSED_ROOT = Path(r"F:\YJ-ALL-SEISMIC_depth_0_653_processed")
-LITH_POR_MODEL_ROOT = Path(r"F:\YJ-LITH-POR_model_numpy")
+BUNDLE_ROOT = VISUAL_ROOT
+DATA_ROOT = BUNDLE_ROOT / "data"
+PROCESSED_ROOT = DATA_ROOT / "seismic" / "processed"
+FULL_DEPTH_SEISMIC_NPY = DATA_ROOT / "seismic" / "YJ-ALL-SEISMIC_depth_0_653.npy"
+FULL_DEPTH_PROCESSED_ROOT = PROCESSED_ROOT
+LITH_POR_MODEL_ROOT = DATA_ROOT / "reservoir" / "numpy"
 
 
 def ensure_inside_bundle(path: Path, label: str) -> Path:
@@ -1246,8 +1247,7 @@ def main() -> None:
         if not lith_body_nodes:
             missing_lith_body_text = "\n".join(f"- `{name}`" for name in missing_lith_body_meshes)
             generate_lith_body_command = (
-                r"E:\miniconda\envs\py312\python.exe -B "
-                r"D:\商书记项目\tools\create_lithology_body_meshes.py --overwrite"
+                "python -B tools/create_lithology_body_meshes.py --overwrite"
             )
             server.gui.add_markdown(
                 "未找到岩性透明体网格文件，暂时无法显示透明体。\n\n"

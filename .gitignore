@@ -12,4 +12,18 @@ tools/_sam3_smoke_out/
 .venv/
 dist/
 *.egg-info/
-weights/
+/weights/
+/data/
+/cache/
+/runtime/
+/server/logs/
+/local/cache/
+/local/logs/
+portable_manifest.json
+
+# Live (machine-specific) configs stay out of git; *.example.yaml are tracked.
+config/local.yaml
+config/server.yaml
+# Legacy locations (pre-config/ consolidation), kept ignored for old checkouts.
+server/config/server.yaml
+local/config/local.yaml

@@ -1,10 +1,10 @@
-"""Smoke-test downsampling pipeline on the F:\\ grid.
+"""Smoke-test downsampling pipeline on the bundled reservoir grid.
 
 Loads ReservoirGrid (fast — cache hit), then downsamples with the
 default (2, 2, 4) block. Reports timing and sanity-checks the result.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\smoke_downsample.py F:\\
+    python tools\\smoke_downsample.py data\\reservoir\\grdecl
 """
 
 from __future__ import annotations
@@ -14,9 +14,12 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import add_app_src_to_path, reservoir_master_from_arg
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -29,16 +32,7 @@ def _progress(frac: float, msg: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: smoke_downsample.py <master.GRDECL or dir>")
-        sys.exit(2)
-    master = Path(sys.argv[1])
-    if master.is_dir():
-        cands = [p for p in master.glob("*.GRDECL")
-                 if "_COORD" not in p.name.upper()
-                 and "_ZCORN" not in p.name.upper()
-                 and "_ACTNUM" not in p.name.upper()]
-        master = cands[0]
+    master = reservoir_master_from_arg(sys.argv[1] if len(sys.argv) >= 2 else None)
     print(f"master: {master}")
 
     print()

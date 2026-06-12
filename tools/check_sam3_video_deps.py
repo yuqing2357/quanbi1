@@ -7,7 +7,7 @@ the missing third-party module names. Lets us batch-install with one
 
 Run via:
     set KMP_DUPLICATE_LIB_OK=TRUE
-    E:\\miniconda\\envs\\py312\\python.exe tools\\check_sam3_video_deps.py
+    python tools\\check_sam3_video_deps.py
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def main() -> None:
         print()
         cmd = " ".join(sorted(missing))
         print(f"Suggested install:")
-        print(f"  E:\\miniconda\\envs\\py312\\python.exe -m pip install {cmd}")
+        print(f"  python -m pip install {cmd}")
     else:
         print("All targeted modules imported cleanly — SAM3 video deps OK.")
 

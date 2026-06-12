@@ -27,9 +27,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 #    Chinese characters like the ones in this project's name — Triton
 #    blows up with "'utf-8' codec can't decode byte 0xb1 ...".
 #
-# Both go away if we point Triton at a SHORT, ASCII-ONLY path. We pick
-# C:\yj_triton_cache, completely outside the project tree, so the
-# Chinese folder name doesn't leak into any env var Triton reads.
+# Both go away if we point Triton at a SHORT, ASCII-ONLY path. Keep it
+# inside the portable project so a copied project remains self-contained.
 # --- Triton-on-Windows workarounds --------------------------------
 #
 # triton-windows requires three independent Windows-only fixes for
@@ -41,8 +40,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 #    %LOCALAPPDATA%\Temp can be very long. Hard-override, not
 #    setdefault — Windows already populates TMP/TEMP from the user
 #    profile and we need to win.
-_TRITON_CACHE = Path("C:/yj_triton_cache")
-_TRITON_CACHE.mkdir(exist_ok=True)
+_TRITON_CACHE = ROOT / "cache" / "triton"
+_TRITON_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ["TRITON_CACHE_DIR"] = str(_TRITON_CACHE)
 os.environ["TRITON_HOME"] = str(_TRITON_CACHE)
 os.environ["TMP"] = str(_TRITON_CACHE)

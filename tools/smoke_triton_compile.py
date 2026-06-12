@@ -16,7 +16,7 @@ If this script passes, the SAM3 video predictor's NMS kernel will
 compile too — they hit the exact same triton.runtime.build code path.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\smoke_triton_compile.py
+    python tools\\smoke_triton_compile.py
 """
 
 from __future__ import annotations

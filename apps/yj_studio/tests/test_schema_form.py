@@ -44,9 +44,20 @@ def test_schema_form_lists_matching_layers(qapp) -> None:
     # The placeholder counts as one entry, plus the single matching horizon.
     assert combo.count() == 2
     assert combo.itemData(1) == horizon_id
-    # Validation should fail until the user picks a layer.
-    assert form.validate() == "Missing layer input: top"
+    # Validation should fail until the user picks a layer. The message is
+    # localized, so assert on the stable prefix rather than the full string.
+    message = form.validate()
+    assert message is not None and message.startswith("缺少图层输入")
     combo.setCurrentIndex(1)
     assert form.validate() is None
     collected = form.collect()
     assert collected["layers"] == {"top": horizon_id}
+
+
+def test_schema_form_allows_optional_layer_inputs(qapp) -> None:
+    store = LayerStore()
+    form = SchemaForm(store)
+    form.set_algorithm(_Params, layer_inputs={"porosity": "volume?"})
+
+    assert form.validate() is None
+    assert form.collect()["layers"] == {}

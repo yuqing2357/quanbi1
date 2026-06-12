@@ -25,6 +25,7 @@ from yj_studio.scene.layers import (
     MaskLayer,
     MeasurementLayer,
     PolygonLayer,
+    TrapLayer,
     VolumeLayer,
     WellLayer,
     WellLogLayer,
@@ -198,13 +199,21 @@ class View2DSection(QWidget):
                 self._draw_well_log(layer, highlighted=highlighted)
             elif isinstance(layer, MaskLayer):
                 if layer.axis == self.axis and layer.slice_index == self.index and layer.mask is not None:
+                    color = highlight_color(layer.color, highlighted)
                     self._axes.imshow(
-                        _mask_rgba(layer.mask, highlight_color(layer.color, highlighted), float(layer.opacity)),
+                        _mask_rgba(layer.mask, color, float(layer.opacity)),
                         origin="upper",
                         aspect="equal",
                         extent=self._current_extent,
                         interpolation="nearest",
                         zorder=8 if highlighted else 5,
+                    )
+                    _draw_target_mask_overlay(
+                        self._axes,
+                        layer,
+                        self._current_extent,
+                        color,
+                        highlighted=highlighted,
                     )
             elif is_manual_geometry_layer(layer):
                 self._draw_manual_geometry(layer, highlighted=highlighted)
@@ -324,7 +333,7 @@ class View2DSection(QWidget):
         if x.size == 0:
             return
         color = highlight_color(layer.color, highlighted)
-        if isinstance(layer, PolygonLayer) and layer.closed and x.size >= 3:
+        if isinstance(layer, (PolygonLayer, TrapLayer)) and bool(getattr(layer, "closed", True)) and x.size >= 3:
             x = np.append(x, x[0])
             y = np.append(y, y[0])
         if x.size >= 2:
@@ -358,6 +367,27 @@ class View2DSection(QWidget):
                     va="bottom",
                     zorder=11,
                 )
+        if isinstance(layer, TrapLayer) and self.axis == "z" and x.size >= 3:
+            label = _trap_label(layer)
+            if label:
+                self._axes.text(
+                    float(np.nanmean(x)),
+                    float(np.nanmean(y)),
+                    label,
+                    color="white",
+                    fontsize=9 if highlighted else 8,
+                    fontweight="bold",
+                    ha="center",
+                    va="center",
+                    bbox={
+                        "facecolor": color,
+                        "edgecolor": "white",
+                        "linewidth": 0.6,
+                        "alpha": 0.85,
+                        "pad": 1.8,
+                    },
+                    zorder=11,
+                )
 
     def _draw_message(self, message: str) -> None:
         self._axes.clear()
@@ -371,7 +401,7 @@ class View2DSection(QWidget):
             self.refresh()
             return
         layer = self._layer_store.get(layer_id)
-        if isinstance(layer, (HorizonLayer, FaultSurfaceLayer, ArbitrarySectionLayer, PolygonLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, MaskLayer, WellLayer, WellLogLayer)):
+        if isinstance(layer, (HorizonLayer, FaultSurfaceLayer, ArbitrarySectionLayer, PolygonLayer, TrapLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, MaskLayer, WellLayer, WellLogLayer)):
             self.refresh()
 
     def _on_layer_added(self, layer_id: str) -> None:
@@ -379,7 +409,7 @@ class View2DSection(QWidget):
             layer = self._layer_store.get(layer_id)
         except KeyError:
             return
-        if isinstance(layer, (HorizonLayer, FaultSurfaceLayer, ArbitrarySectionLayer, PolygonLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, MaskLayer, WellLayer, WellLogLayer)):
+        if isinstance(layer, (HorizonLayer, FaultSurfaceLayer, ArbitrarySectionLayer, PolygonLayer, TrapLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, MaskLayer, WellLayer, WellLogLayer)):
             if layer.visible:
                 self.refresh()
 
@@ -502,6 +532,74 @@ def _mask_rgba(mask: np.ndarray, color: tuple[float, float, float, float], opaci
     return np.transpose(rgba, (1, 0, 2))
 
 
+def _draw_target_mask_overlay(
+    axes,
+    layer: MaskLayer,
+    extent: tuple[float, float, float, float] | None,
+    color: tuple[float, float, float, float],
+    *,
+    highlighted: bool = False,
+) -> None:
+    target_id = str(layer.metadata.get("target_id") or "")
+    if not target_id or extent is None or layer.mask is None:
+        return
+    image_mask = np.asarray(layer.mask, dtype=bool).T
+    if image_mask.ndim != 2 or min(image_mask.shape) < 2 or not image_mask.any():
+        return
+    x0, x1, y0, y1 = (float(value) for value in extent)
+    height, width = image_mask.shape
+    xs = np.linspace(x0, x1, width)
+    ys = np.linspace(y0, y1, height)
+    line_width = 2.2 if highlighted else 1.2
+    try:
+        axes.contour(
+            xs,
+            ys,
+            image_mask.astype(np.float32),
+            levels=[0.5],
+            colors=[color],
+            linewidths=line_width,
+            zorder=10 if highlighted else 7,
+        )
+    except ValueError:
+        return
+    label_xy = _mask_centroid_data_coords(image_mask, extent)
+    if label_xy is None:
+        return
+    axes.text(
+        label_xy[0],
+        label_xy[1],
+        target_id,
+        color="white",
+        fontsize=9 if highlighted else 8,
+        fontweight="bold",
+        ha="center",
+        va="center",
+        bbox={
+            "facecolor": color,
+            "edgecolor": "white",
+            "linewidth": 0.6,
+            "alpha": 0.88,
+            "pad": 1.8,
+        },
+        zorder=11 if highlighted else 8,
+    )
+
+
+def _mask_centroid_data_coords(
+    image_mask: np.ndarray,
+    extent: tuple[float, float, float, float],
+) -> tuple[float, float] | None:
+    ys, xs = np.nonzero(np.asarray(image_mask, dtype=bool))
+    if xs.size == 0:
+        return None
+    x0, x1, y0, y1 = (float(value) for value in extent)
+    height, width = image_mask.shape
+    x = x0 + (float(xs.mean()) / max(width - 1, 1)) * (x1 - x0)
+    y = y0 + (float(ys.mean()) / max(height - 1, 1)) * (y1 - y0)
+    return x, y
+
+
 def _measurement_label(layer: MeasurementLayer) -> str:
     if "area" in layer.values:
         unit = layer.units.get("area", "")
@@ -513,6 +611,17 @@ def _measurement_label(layer: MeasurementLayer) -> str:
         unit = layer.units.get("thickness", "")
         return f"{measurement_value_label('thickness')} {layer.values['thickness']:.2f}{_unit_suffix(unit)}"
     return ""
+
+
+def _trap_label(layer: TrapLayer) -> str:
+    score = layer.score
+    relief = layer.attributes.get("relief_m") if isinstance(layer.attributes, dict) else None
+    parts = []
+    if score is not None:
+        parts.append(f"{float(score):.2f}")
+    if isinstance(relief, (int, float)):
+        parts.append(f"{float(relief):.0f}m")
+    return "\n".join(parts)
 
 
 def _unit_suffix(unit: str) -> str:

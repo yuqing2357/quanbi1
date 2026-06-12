@@ -28,10 +28,9 @@ corners in a *grid-local* xy frame (not UTM), so two steps are needed:
        axis1 = (world_y - Y0) / DY
        sample = z_m / DZ
 
-The defaults here are the YJ project values copied from
-``D:\\商书记项目\\tools\\convert_grdecl_lith_por_to_numpy.py`` (the
-rasteriser that wrote ``lithology_volume_seismic.npy``), so anything
-produced by this transform aligns with what the legacy tool produced.
+The defaults here are the YJ project values copied from the legacy
+GRDECL-to-numpy rasteriser that wrote ``lithology_volume_seismic.npy``,
+so anything produced by this transform aligns with that reference output.
 A different Petrel project would override the dataclass fields.
 """
 
@@ -42,7 +41,7 @@ from dataclasses import dataclass
 import numpy as np
 
 
-# Constants from convert_grdecl_lith_por_to_numpy.py at D:/商书记项目/.
+# Constants from the legacy convert_grdecl_lith_por_to_numpy.py rasteriser.
 DEFAULT_MAPAXES = (
     632661.7332, 4173682.699,   # x1, y1 — point on local +Y axis
     632661.7332, 4174682.699,   # x2, y2 — local origin (in UTM)

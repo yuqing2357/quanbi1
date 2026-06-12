@@ -19,6 +19,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from yj_studio.scene.layers import MaskLayer
+from yj_studio.targets import mask_summary, target_type_color
 
 
 def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -54,6 +55,23 @@ def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
     return detections
 
 
+def sam3_mask_to_layer(mask: np.ndarray) -> np.ndarray:
+    """Convert a SAM3/server mask into desktop ``MaskLayer`` orientation.
+
+    SAM3 (and the server's stored masks) are in **image order**: rows are
+    samples/depth, columns are trace (inline/xline). The desktop scene/view
+    stack — ``MaskLayer``, the brush tool, ``view_2d_section._mask_rgba`` —
+    stores masks transposed (axis1 × axis2, i.e. trace × samples). This is the
+    **single, canonical place** desktop code flips that orientation; every
+    consumer (single-slice algorithm, remote task, target dock) calls this
+    instead of hand-writing ``.T``. Do NOT add another transpose downstream.
+
+    See docs/project_review_and_remediation.md §1.2 for the convention and the
+    golden round-trip test that guards it.
+    """
+    return np.ascontiguousarray(np.asarray(mask, dtype=bool).T)
+
+
 def build_mask_layer(
     mask: np.ndarray,
     *,
@@ -73,9 +91,15 @@ def build_mask_layer(
     meta = dict(metadata or {})
     meta.setdefault("axis", axis)
     meta.setdefault("slice_index", int(slice_index))
+    summary = mask_summary(mask_arr)
+    for key, value in summary.items():
+        if value is not None:
+            meta.setdefault(key, value)
     if score is not None:
         score_value = round(float(score), 6)
         meta.setdefault("score", score_value)
+    if meta.get("target_type") and color == (1.0, 0.2, 0.2, 0.55):
+        color = target_type_color(str(meta.get("target_type")), alpha=color[3])
     prov = dict(provenance or {})
     prov.setdefault("source", "ai.sam3")
     return MaskLayer(

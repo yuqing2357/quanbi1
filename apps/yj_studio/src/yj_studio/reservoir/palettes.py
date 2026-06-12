@@ -6,8 +6,8 @@ section view, the 3D overview renderer, and any future legend or
 mesh export. Define each palette once here.
 
 YJ project notes — these palettes encode the on-site geological
-interpretation of value codes, which intentionally overrides
-``F:/YJ-LITH-POR_model_numpy/metadata.json``:
+interpretation of value codes, which intentionally overrides the
+initial value labels in ``data/reservoir/numpy/metadata.json``:
 
     LITHOLOGIES:
         0 → 泥岩 (mud)     grey

@@ -10,7 +10,7 @@ Saves the three frames as PNGs in tools/_sam3_smoke_out/ so the user
 can eyeball them.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\smoke_sam3_render.py F:\\
+    python tools\\smoke_sam3_render.py
 """
 
 from __future__ import annotations
@@ -26,23 +26,19 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "apps" / "yj_studio" / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
 
 import numpy as np
 from PIL import Image
 
 from yj_studio.reservoir import ReservoirGrid, default_roi
 from yj_studio.reservoir.sam3_render import render_roi_section
+from project_paths import reservoir_master_from_arg
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: smoke_sam3_render.py <dir>")
-        sys.exit(2)
-    root = Path(sys.argv[1])
-    master = next(p for p in root.glob("*.GRDECL")
-                  if "_COORD" not in p.name.upper()
-                  and "_ZCORN" not in p.name.upper()
-                  and "_ACTNUM" not in p.name.upper())
+    master = reservoir_master_from_arg(sys.argv[1] if len(sys.argv) >= 2 else None)
 
     grid = ReservoirGrid.load_from_master(master)
     print(f"grid: {grid.shape}, active={int(grid.active.sum()):,}")

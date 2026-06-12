@@ -1,8 +1,9 @@
-"""SAM3 workbench: ROI-bound view for prompt + segment + propagate.
+"""SAM3 workbench: global-frame view for prompt + segment + propagate.
 
 Opened when the user draws an ROI on a regular reservoir section. The
-workbench owns a fixed ROI for its entire lifetime; cells outside the
-ROI are never drawn. Inside the ROI the user can:
+drawn ROI is now a display zoom window only. SAM3 sees the stable active
+reservoir model frame, so masks, prompts, and propagation stay in one
+global pixel coordinate system. Inside the zoomed view the user can:
 
 - (this step) Step through frames along the ROI's propagation axis
   (i or j) and see the corner-point section coloured by lithology.
@@ -13,10 +14,10 @@ ROI are never drawn. Inside the ROI the user can:
 - (Step 5) Sweep the propagation axis to drive the SAM3 video
   predictor, yielding a 3D ReservoirBodyLayer.
 
-The image shown here is rendered through ``render_roi_section`` so
-it's pixel-stable across frames — that's what SAM3 video propagation
-needs. The user-facing reservoir section view (``view_reservoir_section``)
-remains free to zoom/pan; this workbench does not.
+The image shown here is rendered through ``render_roi_section`` using the
+active model ROI, then the matplotlib axes are zoomed to the user-drawn
+ROI. The rendered image shape is therefore stable across frames and across
+display zooms, which is what SAM3 video propagation needs.
 """
 
 from __future__ import annotations
@@ -48,8 +49,9 @@ from PyQt6.QtWidgets import (
 from yj_studio.algorithms.builtin.ai.sam3_segment import _apply_box_prompt
 from yj_studio.ai.adapters.mask_to_layer import decode_sam3_masks
 from yj_studio.ai.service import AIService
+from yj_studio.data.remote_target_store import RemoteTargetStore
 from yj_studio.reservoir import ReservoirGrid, SeismicIndexTransform
-from yj_studio.reservoir.roi import ROI
+from yj_studio.reservoir.roi import ROI, default_roi, roi_xy_bounds, roi_z_bounds
 from yj_studio.reservoir.sam3_render import SAM3Frame, render_roi_section
 
 logger = logging.getLogger(__name__)
@@ -111,7 +113,7 @@ def _extract_video_mask(outputs) -> tuple[np.ndarray | None, float | None]:
 
 
 class SAM3Workbench(QWidget):
-    """A ROI-bound section view that will host SAM3 prompts in step 3."""
+    """A global-coordinate section view with ROI-as-zoom interaction."""
 
     # Emitted whenever a new frame finishes rendering, so that future
     # SAM3-related panels (mask preview, status bar, etc.) can react.
@@ -119,6 +121,7 @@ class SAM3Workbench(QWidget):
     # Emitted when the user clicks "save as selection" — main_window
     # creates and registers the ReservoirSelectionLayer.
     selection_committed = pyqtSignal(object)     # ReservoirSelectionLayer instance
+    target_committed = pyqtSignal(object)        # GeoTarget instance
 
     def __init__(
         self,
@@ -129,6 +132,7 @@ class SAM3Workbench(QWidget):
         index: int | None = None,
         transform: SeismicIndexTransform | None = None,
         ai_service: AIService | None = None,
+        target_store: RemoteTargetStore | None = None,
         grid_layer_id: str = "",
         grid_id: str = "",
         section_id: str | None = None,
@@ -141,9 +145,12 @@ class SAM3Workbench(QWidget):
         self.section_id = section_id or str(uuid4())
         self._grid = grid
         self._roi = roi
+        self._view_roi = roi
+        self._sam3_roi = default_roi(grid)
         self._axis = axis
         self._transform = transform or SeismicIndexTransform()
         self._ai_service = ai_service
+        self._target_store = target_store
         self._grid_layer_id = grid_layer_id
         self._grid_id = grid_id
         self._frame: SAM3Frame | None = None
@@ -201,13 +208,13 @@ class SAM3Workbench(QWidget):
 
     @property
     def roi(self) -> ROI:
-        return self._roi
+        return self._view_roi
 
     @property
     def title(self) -> str:
-        il, ih, jl, jh, kl, kh = self._roi
+        il, ih, jl, jh, kl, kh = self._view_roi
         roi_str = f"i[{il}:{ih}] j[{jl}:{jh}] k[{kl}:{kh}]"
-        return f"SAM3 · {_AXIS_LABELS[self._axis]} · {roi_str}"
+        return f"SAM3 · {_AXIS_LABELS[self._axis]} · zoom {roi_str}"
 
     def current_frame(self) -> SAM3Frame | None:
         """The most recently rendered frame, or None before first render."""
@@ -557,6 +564,8 @@ class SAM3Workbench(QWidget):
         self._mask_artist = self._axes.imshow(
             overlay, interpolation="nearest", aspect="equal",
         )
+        if self._frame is not None:
+            self._apply_view_zoom(self._frame)
         self._canvas.draw_idle()
         # Stash the mask + enable "save" and "propagate" — both need
         # the mask plus the current frame's cell-id grid.
@@ -702,14 +711,7 @@ class SAM3Workbench(QWidget):
             # Render and dump every frame as JPEG. Use 5-digit padded
             # filenames so SAM3's video loader sees them in order.
             for offset, idx in enumerate(indices):
-                cache_key = (self._axis, idx)
-                frame = self._frame_cache.get(cache_key)
-                if frame is None:
-                    frame = render_roi_section(
-                        self._grid, self._axis, idx,
-                        self._roi, transform=self._transform,
-                    )
-                    self._frame_cache[cache_key] = frame
+                frame = self._render_frame(idx)
                 frame_lookup.append(frame)
                 Image.fromarray(frame.image).save(
                     tempdir / f"{offset:05d}.jpg", quality=92,
@@ -867,7 +869,7 @@ class SAM3Workbench(QWidget):
             opacity=1.0,
             visible=True,
         )
-        self.selection_committed.emit(layer)
+        self._commit_selection_layer(layer, source="sam3_reservoir_video")
         self._track_range = (index_lo_actual, index_hi_actual)
         self._info_label.setText(
             f"视频追踪完成: {self._axis}=[{index_lo_actual}, {index_hi_actual}], "
@@ -964,14 +966,7 @@ class SAM3Workbench(QWidget):
                     idx_next = idx + step
                     if (step > 0 and idx_next > end) or (step < 0 and idx_next < end):
                         break
-                    cache_key = (self._axis, idx_next)
-                    frame = self._frame_cache.get(cache_key)
-                    if frame is None:
-                        frame = render_roi_section(
-                            self._grid, self._axis, idx_next,
-                            self._roi, transform=self._transform,
-                        )
-                        self._frame_cache[cache_key] = frame
+                    frame = self._render_frame(idx_next)
                     pil = Image.fromarray(frame.image)
                     height, width = frame.image.shape[:2]
                     state = processor.set_image(pil)
@@ -1047,7 +1042,7 @@ class SAM3Workbench(QWidget):
             opacity=1.0,
             visible=True,
         )
-        self.selection_committed.emit(layer)
+        self._commit_selection_layer(layer, source="sam3_reservoir_track")
         self._track_range = (index_lo, index_hi)
         self._info_label.setText(
             f"追踪完成: {self._axis}=[{index_lo}, {index_hi}], "
@@ -1107,25 +1102,44 @@ class SAM3Workbench(QWidget):
             opacity=1.0,
             visible=True,
         )
-        self.selection_committed.emit(layer)
+        self._commit_selection_layer(layer, source="sam3_reservoir_single")
         self._info_label.setText(
             f"已保存 {len(unique_cells):,} 单元到图层"
         )
 
+    def _commit_selection_layer(self, layer, *, source: str) -> None:
+        if self._target_store is not None:
+            try:
+                target = self._target_store.create_cell_target(
+                    layer.cell_ids,
+                    axis=str(layer.source_axis or self._axis),
+                    index=int(layer.source_index_lo if layer.source_index_lo is not None else self._index),
+                    index_hi=layer.source_index_hi,
+                    volume_id=self._grid_id or None,
+                    target_type="sandbody",
+                    name=layer.name,
+                    source=source,
+                    grid_id=self._grid_id or None,
+                    grid_layer_id=self._grid_layer_id or None,
+                )
+                layer.metadata.update(
+                    {
+                        "target_id": target.id,
+                        "target_ref": f"/sam3/targets/{target.id}",
+                        "external_cells_ref": f"/sam3/targets/{target.id}/cells",
+                    }
+                )
+                layer.provenance = {**layer.provenance, "target_source": source}
+                self.target_committed.emit(target)
+            except Exception as exc:  # noqa: BLE001 - keep the local layer even if remote sync fails
+                logger.exception("Failed to create remote reservoir target")
+                QMessageBox.warning(self, "目标库", f"储层选择已保留为本地图层，但写入远程目标库失败：{exc}")
+        self.selection_committed.emit(layer)
+
     # ------------------------------------------------------------------ rendering
 
     def _render(self) -> None:
-        cache_key = (self._axis, self._index)
-        frame = self._frame_cache.get(cache_key)
-        if frame is None:
-            frame = render_roi_section(
-                self._grid,
-                self._axis,
-                self._index,
-                self._roi,
-                transform=self._transform,
-            )
-            self._frame_cache[cache_key] = frame
+        frame = self._render_frame(self._index)
         self._frame = frame
 
         # Switching frames invalidates the prompts (they were drawn
@@ -1163,6 +1177,7 @@ class SAM3Workbench(QWidget):
             interpolation="nearest",
             aspect="equal",
         )
+        self._apply_view_zoom(frame)
 
         # If this frame is part of a recent ▶ sweep, redisplay the
         # cached SAM3 mask. Useful for spotting frames where the
@@ -1186,9 +1201,77 @@ class SAM3Workbench(QWidget):
 
     # ------------------------------------------------------------------ helpers
 
+    def _render_frame(self, index: int) -> SAM3Frame:
+        cache_key = (self._axis, int(index))
+        frame = self._frame_cache.get(cache_key)
+        if frame is None:
+            frame = render_roi_section(
+                self._grid,
+                self._axis,
+                int(index),
+                self._sam3_roi,
+                transform=self._transform,
+            )
+            self._frame_cache[cache_key] = frame
+        return frame
+
+    def _apply_view_zoom(self, frame: SAM3Frame) -> None:
+        window = _data_bbox_to_pixel_window(
+            frame.data_bbox,
+            self._view_roi_data_bbox(),
+            frame.image.shape[:2],
+        )
+        if window is None:
+            return
+        x0, x1, y0, y1 = window
+        self._axes.set_xlim(x0, x1)
+        self._axes.set_ylim(y1, y0)
+
+    def _view_roi_data_bbox(self) -> tuple[float, float, float, float]:
+        x0, x1, y0_xy, y1_xy = roi_xy_bounds(self._grid, self._view_roi)
+        z_min, z_max = roi_z_bounds(self._grid, self._view_roi)
+        v_lo = -z_max / self._transform.z_step
+        v_hi = -z_min / self._transform.z_step
+        if self._axis == "i":
+            return (y0_xy, y1_xy, v_lo, v_hi)
+        return (x0, x1, v_lo, v_hi)
+
     def _propagation_range(self) -> tuple[int, int]:
         """Half-open index range along the section's slicing axis."""
-        il, ih, jl, jh, _kl, _kh = self._roi
+        il, ih, jl, jh, _kl, _kh = self._sam3_roi
         if self._axis == "i":
             return il, ih
         return jl, jh
+
+
+def _data_bbox_to_pixel_window(
+    frame_bbox: tuple[float, float, float, float],
+    view_bbox: tuple[float, float, float, float],
+    image_shape: tuple[int, int],
+) -> tuple[float, float, float, float] | None:
+    """Map a data-coordinate view bbox onto image pixel coordinates.
+
+    Returns ``(x0, x1, y0, y1)`` where y grows downward in image space.
+    """
+
+    h, w = (int(image_shape[0]), int(image_shape[1]))
+    if h <= 0 or w <= 0:
+        return None
+    xmin, xmax, ymin, ymax = frame_bbox
+    vxmin, vxmax, vymin, vymax = view_bbox
+    bw = float(xmax - xmin)
+    bh = float(ymax - ymin)
+    if bw <= 0.0 or bh <= 0.0:
+        return None
+
+    x0 = (float(vxmin) - xmin) / bw * w
+    x1 = (float(vxmax) - xmin) / bw * w
+    y0 = h - (float(vymax) - ymin) / bh * h
+    y1 = h - (float(vymin) - ymin) / bh * h
+    x0 = max(0.0, min(float(w), x0))
+    x1 = max(0.0, min(float(w), x1))
+    y0 = max(0.0, min(float(h), y0))
+    y1 = max(0.0, min(float(h), y1))
+    if x1 - x0 < 2.0 or y1 - y0 < 2.0:
+        return None
+    return (x0, x1, y0, y1)

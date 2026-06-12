@@ -1,16 +1,17 @@
 #requires -Version 5.0
 <#
 .SYNOPSIS
-    Copy SAM3 source + weights from D:\商书记项目\sam3\sam3\ into the project.
+    Copy SAM3 source + weights from a user-supplied checkout into the project.
 
 .DESCRIPTION
     YJ Studio's AI Dock looks for SAM3 in two places inside this repo:
       - libs\sam3\          (Python package — model_builder.py, model/, agent/, ...)
       - weights\sam3.pt     (model checkpoint, ~5 GB)
 
-    The original assets live outside the project at:
-      D:\商书记项目\sam3\sam3\sam3\     ← the inner-most "sam3" is the Python pkg
-      D:\商书记项目\sam3\sam3\weights\  ← all checkpoints
+    Pass -SourceRoot if you need to refresh them from an external checkout.
+    The inner layout is expected to be:
+      <SourceRoot>\sam3\     ← the Python package
+      <SourceRoot>\weights\  ← checkpoints
 
     This script copies them in with robocopy, skipping .git and large eval
     toolkits we don't need at inference time.
@@ -23,19 +24,23 @@
     Override the upstream SAM3 git checkout location.
 
 .EXAMPLE
-    PS> .\tools\copy_sam3_assets.ps1
+    PS> .\tools\copy_sam3_assets.ps1 -SourceRoot X:\path\to\sam3
 
 .EXAMPLE
-    PS> .\tools\copy_sam3_assets.ps1 -SkipWeights
+    PS> .\tools\copy_sam3_assets.ps1 -SourceRoot X:\path\to\sam3 -SkipWeights
 #>
 
 param(
-    [string] $SourceRoot = 'D:\商书记项目\sam3\sam3',
+    [string] $SourceRoot,
     [switch] $SkipWeights
 )
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
+
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    throw "Pass -SourceRoot pointing to a SAM3 checkout with 'sam3' and 'weights' subfolders."
+}
 
 $SourcePkg = Join-Path $SourceRoot 'sam3'        # inner sam3 — the python package
 $SourceWeights = Join-Path $SourceRoot 'weights'

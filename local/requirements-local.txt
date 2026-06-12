@@ -1,0 +1,4 @@
+# Local desktop/development dependencies.
+# This intentionally points at the existing project runtime requirements.
+
+-r ../requirements.txt

@@ -23,7 +23,7 @@ How it works:
 5. Emit the parameters as code we can drop into SeismicIndexTransform.
 
 Run via:
-    E:\\miniconda\\envs\\py312\\python.exe tools\\calibrate_reservoir_transform.py F:\\
+    python tools\\calibrate_reservoir_transform.py
 """
 
 from __future__ import annotations
@@ -33,9 +33,16 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SRC = HERE.parent / "apps" / "yj_studio" / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from project_paths import (
+    RESERVOIR_GRDECL_ROOT,
+    RESERVOIR_NUMPY_ROOT,
+    add_app_src_to_path,
+)
+
+add_app_src_to_path()
 
 import numpy as np
 
@@ -43,10 +50,7 @@ from yj_studio.reservoir import ReservoirGrid
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: calibrate_reservoir_transform.py <dir>")
-        sys.exit(2)
-    root = Path(sys.argv[1])
+    root = Path(sys.argv[1]) if len(sys.argv) >= 2 else RESERVOIR_GRDECL_ROOT
 
     # ---- find files ----
     master = None
@@ -60,7 +64,7 @@ def main() -> None:
         sys.exit(2)
     print(f"master: {master}")
 
-    model_dir = Path(r"F:\YJ-LITH-POR_model_numpy")
+    model_dir = RESERVOIR_NUMPY_ROOT
     vis_path = model_dir / "lithology_points_seismic_vis.npy"
     zc_path = model_dir / "z_center_native_i_j_k.npy"
     actnum_path = model_dir / "actnum_native_i_j_k.npy"

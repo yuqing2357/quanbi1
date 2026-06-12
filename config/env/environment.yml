@@ -1,0 +1,22 @@
+name: py312
+channels:
+  - defaults
+dependencies:
+  - python=3.12.13
+  - pip=26.0.1
+  - setuptools=70.2.0
+  - wheel=0.46.3
+
+  # 原生加速 / 数学库：留给 conda，避免 pip 装到 CPU-only 的 OpenBLAS 版本
+  - mkl=2025.0.0
+  - mkl-service=2.5.2
+  - mkl_fft=2.1.1
+  - mkl_random=1.3.0
+  - intel-openmp=2025.0.0
+  - tbb=2022.3.0
+  - blas=1.0=mkl
+  - numpy=2.4.4
+
+  # 其余 Python 依赖走 pip（精确版本见 requirements.lock.txt）
+  - pip:
+      - -r requirements.lock.txt
