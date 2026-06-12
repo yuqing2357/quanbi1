@@ -26,16 +26,36 @@ class SAM3Engine:
         self.load_video = bool(load_video)
         self._processor: Any | None = None
         self._video_predictor: Any | None = None
+        self._video_load_error: str | None = None
         self._track_state: Any | None = None
 
     @property
     def is_loaded(self) -> bool:
         return self._processor is not None
 
+    @property
+    def video_loaded(self) -> bool:
+        return self._video_predictor is not None
+
+    @property
+    def video_load_error(self) -> str | None:
+        return self._video_load_error
+
+    def status_payload(self) -> dict[str, Any]:
+        return {
+            "image_loaded": self.is_loaded,
+            "video_enabled": self.load_video,
+            "video_loaded": self.video_loaded,
+            "video_error": self._video_load_error,
+            "device": self.device,
+            "resolution": self.resolution,
+        }
+
     def reload_checkpoint(self, checkpoint_path: str | Path) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self._processor = None
         self._video_predictor = None
+        self._video_load_error = None
         self._track_state = None
 
     def segment(
@@ -105,13 +125,7 @@ class SAM3Engine:
         Yields ``(frame_idx_local: int, {obj_id: mask (H,W) bool})`` for every
         propagated frame, forward then backward from the seed.
         """
-        self._ensure_processor()
-        predictor = self._video_predictor
-        if predictor is None:
-            raise RuntimeError(
-                "SAM3 video predictor not loaded (load_video=False, or triton/CUDA unavailable);"
-                " cross-frame tracking is disabled."
-            )
+        predictor = self._ensure_video_predictor()
         with self._autocast_ctx(), self._inference_ctx():
             for seed in seeds:
                 predictor.add_prompt(
@@ -137,12 +151,7 @@ class SAM3Engine:
 
     def init_track_state(self, frames_dir: str | Path):
         """Open a video session on a JPEG frame directory. Call before track_video."""
-        self._ensure_processor()
-        predictor = self._video_predictor
-        if predictor is None:
-            raise RuntimeError(
-                "SAM3 video predictor not loaded; cross-frame tracking is disabled."
-            )
+        predictor = self._ensure_video_predictor()
         self._track_state = predictor.init_state(
             resource_path=str(frames_dir),
             async_loading_frames=False,
@@ -199,12 +208,42 @@ class SAM3Engine:
             device=self.device,
         )
         if self.load_video:
-            self._video_predictor = build_sam3_video_model(
-                checkpoint_path=str(self.checkpoint_path),
-                device=self.device,
-                strict_state_dict_loading=False,
-            )
+            try:
+                self._load_video_predictor(build_sam3_video_model)
+            except Exception as exc:  # noqa: BLE001 - keep image segmentation usable
+                self._video_load_error = f"{type(exc).__name__}: {exc}"
         return self._processor
+
+    def _ensure_video_predictor(self):
+        self._ensure_processor()
+        if self._video_predictor is not None:
+            return self._video_predictor
+        if not self.load_video:
+            raise RuntimeError(
+                "SAM3 video predictor is disabled by server config: sam3.load_video=false. "
+                "Set sam3.load_video=true and restart the server to enable cross-frame tracking."
+            )
+        try:
+            from sam3.model_builder import build_sam3_video_model
+
+            self._load_video_predictor(build_sam3_video_model)
+        except Exception as exc:  # noqa: BLE001 - surface dependency/CUDA detail to the job error
+            self._video_load_error = f"{type(exc).__name__}: {exc}"
+        if self._video_predictor is None:
+            detail = f" Last video load error: {self._video_load_error}" if self._video_load_error else ""
+            raise RuntimeError(
+                "SAM3 video predictor is not loaded; cross-frame tracking is disabled."
+                f"{detail}"
+            )
+        return self._video_predictor
+
+    def _load_video_predictor(self, builder) -> None:
+        self._video_predictor = builder(
+            checkpoint_path=str(self.checkpoint_path),
+            device=self.device,
+            strict_state_dict_loading=False,
+        )
+        self._video_load_error = None
 
 
 def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -279,5 +318,12 @@ def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach") and hasattr(value, "cpu"):
         value = value.detach().cpu()
     if hasattr(value, "numpy"):
-        return np.asarray(value.numpy())
+        try:
+            return np.asarray(value.numpy())
+        except TypeError:
+            # numpy has no equivalent for some torch dtypes (e.g. bfloat16,
+            # float8). Upcast to float32 before converting.
+            if hasattr(value, "float"):
+                return np.asarray(value.float().numpy())
+            raise
     return np.asarray(value)
