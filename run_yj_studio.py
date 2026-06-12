@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
-PROJECT_SRC = ROOT / "apps" / "yj_studio" / "src"
+PROJECT_SRC = ROOT / "local" / "app" / "src"
+SHARED_SRC = ROOT / "shared" / "src"
 
 # Allow PyTorch + Triton + MKL to coexist on Windows. All three ship
 # their own libiomp5md.dll; without this Windows aborts the process on
@@ -89,9 +90,10 @@ def main() -> int:
     """Run YJ Studio from the repository root without manual PYTHONPATH setup."""
 
     sys.dont_write_bytecode = True
-    src_text = str(PROJECT_SRC)
-    if src_text not in sys.path:
-        sys.path.insert(0, src_text)
+    for src in (SHARED_SRC, PROJECT_SRC):
+        src_text = str(src)
+        if src_text not in sys.path:
+            sys.path.insert(0, src_text)
 
     from yj_studio.app import run
 

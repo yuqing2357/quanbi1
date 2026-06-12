@@ -11,7 +11,7 @@ from yj_studio.ai.adapters import (
     stretch_to_uint8,
 )
 from yj_studio.scene.layers import MaskLayer
-from yj_studio.targets import target_type_color
+from yj_studio_core.targets import target_type_color
 
 
 def test_stretch_to_uint8_robust_to_outliers() -> None:

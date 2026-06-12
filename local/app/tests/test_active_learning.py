@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from yj_studio.targets import GeoTarget, TargetSet, TargetStatus, review_queue, target_uncertainty
-from yj_studio.targets.model import TargetFrame
+from yj_studio_core.targets import GeoTarget, TargetSet, TargetStatus, review_queue, target_uncertainty
+from yj_studio_core.targets.model import TargetFrame
 
 
 def _target(target_id: str, *, score: float, areas: list[int], status: TargetStatus = TargetStatus.ACTIVE) -> GeoTarget:

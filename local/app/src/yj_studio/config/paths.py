@@ -7,8 +7,7 @@ def _find_workspace_root() -> Path:
     """Locate the repo root by markers instead of a fragile parent depth.
 
     Walks up from this file looking for the project root. Using markers keeps
-    this correct even if the package is moved to a different depth (e.g. the
-    planned apps/yj_studio -> local/ migration).
+    this correct even if the package is moved to a different depth.
     """
 
     here = Path(__file__).resolve()

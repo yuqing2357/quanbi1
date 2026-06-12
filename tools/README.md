@@ -1,7 +1,7 @@
 # Tool Script Index
 
 The top-level `tools/` folder contains project utilities, not application UI
-tools. Application interaction tools live in `apps/yj_studio/src/yj_studio/tools/`.
+tools. Application interaction tools live in `local/app/src/yj_studio/tools/`.
 
 Keep these files at their current paths until all references in docs, tests, and
 comments are updated.

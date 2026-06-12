@@ -1,4 +1,10 @@
-"""Server-side access to shared target models."""
+"""Server-side access to shared target models.
+
+Target data models live in the shared core package (`yj_studio_core.targets`)
+used by both the desktop app and the server. This module ensures that package
+is importable (adding `shared/src` to sys.path if a launcher didn't already) and
+re-exports the public surface the server uses.
+"""
 
 from __future__ import annotations
 
@@ -6,23 +12,23 @@ import sys
 from pathlib import Path
 
 
-def _ensure_desktop_src_on_path() -> None:
+def _ensure_shared_src_on_path() -> None:
     try:
-        import yj_studio.targets  # noqa: F401
+        import yj_studio_core.targets  # noqa: F401
 
         return
     except ModuleNotFoundError:
         pass
 
     repo_root = Path(__file__).resolve().parents[3]
-    desktop_src = repo_root / "apps" / "yj_studio" / "src"
-    if desktop_src.exists() and str(desktop_src) not in sys.path:
-        sys.path.insert(0, str(desktop_src))
+    shared_src = repo_root / "shared" / "src"
+    if shared_src.exists() and str(shared_src) not in sys.path:
+        sys.path.insert(0, str(shared_src))
 
 
-_ensure_desktop_src_on_path()
+_ensure_shared_src_on_path()
 
-from yj_studio.targets import (  # noqa: E402
+from yj_studio_core.targets import (  # noqa: E402
     GeoTarget,
     TargetFrame,
     TargetSet,

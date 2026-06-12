@@ -26,7 +26,7 @@ from yj_studio.data import RemoteTargetStore
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import MaskLayer, ReservoirGridLayer, ReservoirPropertyLayer, ReservoirSelectionLayer
 from yj_studio.scene.undo_commands import AddLayerCommand
-from yj_studio.targets import BUILTIN_TARGET_TYPES, GeoTarget, TargetFrame, TargetSet, TargetStatus, review_queue
+from yj_studio_core.targets import BUILTIN_TARGET_TYPES, GeoTarget, TargetFrame, TargetSet, TargetStatus, review_queue
 
 
 class TargetDock(QDockWidget):
@@ -554,7 +554,7 @@ def _mask3d_index_lo(target: GeoTarget, axis: str | None) -> int:
 
 
 def _target_mask_color(target_type: str) -> tuple[float, float, float, float]:
-    from yj_studio.targets import target_type_color
+    from yj_studio_core.targets import target_type_color
 
     return target_type_color(target_type or "unknown", alpha=0.46)
 

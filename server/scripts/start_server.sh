@@ -26,7 +26,7 @@ mkdir -p "$ROOT/runtime/server/logs" "$ROOT/runtime/server/cache" "$ROOT/runtime
 
 export YJ_STUDIO_ROOT="$ROOT"
 export YJ_STUDIO_SERVER_CONFIG="$CONFIG"
-export PYTHONPATH="$ROOT/server/src:$ROOT/apps/yj_studio/src:$ROOT/libs:${PYTHONPATH:-}"
+export PYTHONPATH="$ROOT/server/src:$ROOT/shared/src:$ROOT/local/app/src:$ROOT/libs:${PYTHONPATH:-}"
 
 HOST="${YJ_STUDIO_SERVER_HOST:-0.0.0.0}"
 PORT="${YJ_STUDIO_SERVER_PORT:-8765}"

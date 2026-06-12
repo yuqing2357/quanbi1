@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from yj_studio.targets import GeoTarget, TargetFrame, TargetSet, TargetStatus
+from yj_studio_core.targets import GeoTarget, TargetFrame, TargetSet, TargetStatus
 from yj_studio.ui.docks.target_dock import _ReviewQueueDialog, _review_rows
 
 

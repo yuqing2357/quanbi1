@@ -28,10 +28,9 @@ D:\yj_studio\
 
 ```
 D:\yj_studio\
-├── apps\yj_studio\           ← 应用源码
-├── server\                   ← 服务器端代码
-├── local\                    ← 本地运行/启动脚本
-├── shared\                   ← 桌面端与服务器共用核心包（Phase 2 引入）
+├── local\                   ← 本地运行：桌面端 app(local\app\) + 启动脚本
+├── server\                  ← 服务器端代码
+├── shared\                  ← 桌面端与服务器共用核心包 yj_studio_core
 ├── config\                   ← 统一配置：config\*.yaml + config\env\（environment/requirements）
 │   ├── env\environment.yml   ← 本指南要用
 │   └── env\requirements.lock.txt
@@ -126,7 +125,7 @@ Triton 在 Windows 长路径下的 bug。`run_yj_studio.py` 里已经 monkey-pat
 
 ### GPU 显存不够（SAM3 视频追踪卡死/超慢）
 
-SAM3 视频追踪每多一帧 KV 缓存涨一截。16 GB 显存大约能撑 10 帧 1024×3200 的画面。如果你的卡 < 16 GB，把 `apps\yj_studio\src\yj_studio\reservoir\sam3_render.py` 里的 `_DPI = 200` 改成 `100`，分辨率减半、显存压力减到 1/4。
+SAM3 视频追踪每多一帧 KV 缓存涨一截。16 GB 显存大约能撑 10 帧 1024×3200 的画面。如果你的卡 < 16 GB，把 `local\app\src\yj_studio\reservoir\sam3_render.py` 里的 `_DPI = 200` 改成 `100`，分辨率减半、显存压力减到 1/4。
 
 ### opencv (cv2) 找不到
 

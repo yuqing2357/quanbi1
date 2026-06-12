@@ -17,8 +17,8 @@ for _src in (_REPO_ROOT / "server" / "src", _REPO_ROOT / "apps" / "yj_studio" / 
     if str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
 
-from yj_studio.targets import TargetStore  # noqa: E402
-from yj_studio.targets.model import TargetStatus  # noqa: E402
+from yj_studio_core.targets import TargetStore  # noqa: E402
+from yj_studio_core.targets.model import TargetStatus  # noqa: E402
 from yj_studio_server.sam3.reassociate import link_targets_by_iou  # noqa: E402
 from yj_studio_server.sam3.tracking import collect_object_frames, persist_tracked_targets  # noqa: E402
 

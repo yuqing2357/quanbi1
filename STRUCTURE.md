@@ -6,10 +6,10 @@
 
 | 目录 | 职责 | 是否进 git |
 |---|---|---|
-| `apps/yj_studio/` | 桌面端应用（UI / 视图 / 算法 / 工具）。**Phase 2 计划迁到 `local/`** | 是 |
+| `local/app/` | 桌面端应用（UI / 视图 / 算法 / 工具）。包 `yj_studio`，src 布局 | 是 |
+| `local/` | 本地运行：桌面端 app（`local/app/`）+ 启动脚本（`run_viewer.py`、`scripts/`） | 是 |
 | `server/` | 服务器端：FastAPI 应用、SAM3 引擎/作业/追踪、部署脚本、服务端测试 | 是 |
-| `local/` | 本地运行：启动脚本、远程连接探测等本地辅助 | 是 |
-| `shared/` | **（Phase 2 引入）** 桌面端与服务器共用的核心包（先收纳 `targets` 数据模型） | 是 |
+| `shared/` | 桌面端与服务器共用的核心包 `yj_studio_core`（含 `targets` 数据模型） | 是 |
 | `config/` | **统一配置**：`config/*.yaml`（运行配置）+ `config/env/`（environment / requirements） | 例子进 git，live 配置忽略 |
 | `data/` | 数据（地震体、油藏 numpy、结果）。大文件 | 否（gitignore） |
 | `weights/` | 模型权重（`sam3.pt` 等） | 否（gitignore） |
@@ -47,7 +47,7 @@ config/
 
 ## 架构约束（重要）
 
-- **根目录定位用标记，不用层级数**：`apps/yj_studio/src/yj_studio/config/paths.py` 的 `_find_workspace_root()` 向上找 `.git`（或同时含 `libs/` 与 `config/`）的目录。Phase 2 移动包后仍正确。**新增任何需要根路径的代码都应复用它，不要再写 `parents[N]`。**（当前仓库仍有约 30 处自算 `ROOT`/`parents[]`，Phase 2 统一收敛。）
+- **根目录定位用标记，不用层级数**：`local/app/src/yj_studio/config/paths.py` 的 `_find_workspace_root()` 向上找 `.git`（或同时含 `libs/` 与 `config/`）的目录。**新增任何需要根路径的代码都应复用它，不要再写 `parents[N]`。**（仓库仍有约 30 处自算 `ROOT`/`parents[]`；因 `apps/yj_studio`→`local/app` 深度一致它们仍正确，后续可择机收敛，非必须。）
 - **服务器对桌面包的唯一依赖是 `yj_studio.targets`**。这是 Phase 2 把它抽成 `shared/` 的依据——抽出后 server 与桌面端都依赖 `shared/`，解除 server→apps 的耦合。
 - **`server/` 历史上是 git 未跟踪的**，靠手动拷贝部署，导致服务器代码会悄悄落后本地。Phase 1 已把它纳入 git。部署方式见 `docs/`（tar+scp+备份+重启）。
 
@@ -61,19 +61,13 @@ config/
 - [x] 本文件 STRUCTURE.md。
 - [x] 重测：桌面端仅余 2 个 layer_tree WIP 失败；服务端 FastAPI-free 19/19。
 
-### Phase 2 — 待执行（需确认后做，改动面大）
-目标：`apps/yj_studio` → `local/`，抽出 `shared/`，彻底解耦。建议顺序（每步 `git mv` + 重测）：
+### Phase 2 — 已完成（2026-06-12）
+- [x] 抽 `shared/src/yj_studio_core/`，把 `targets` 移入（`yj_studio_core.targets`）；新增 `shared/pyproject.toml`（可 `pip install -e`）。
+- [x] 全部 14 处 `yj_studio.targets` 引用改为 `yj_studio_core.targets`；server `targets.py` 垫片改为指向 `shared/src` + `yj_studio_core.targets`。
+- [x] `apps/yj_studio` → `local/app`（`git mv`），删除空的 `apps/`。
+- [x] 更新路径：`run_yj_studio.py`（PROJECT_SRC + SHARED_SRC）、`pyproject.toml` pytest `pythonpath`、`server/scripts/{start_server,install_env,run_tests}.sh`、`.gitignore`。
+- [x] PYTHONPATH/安装：桌面经 `run_yj_studio` 注入 `shared/src`+`local/app/src`；服务端 `start_server.sh` PYTHONPATH 含 `shared/src`+`local/app/src`；`install_env.sh` 改为 `pip install -e shared` + `pip install -e local/app`。
+- [x] 重测：桌面端 174/176（仅 2 个 layer_tree WIP）、服务端 FastAPI-free 19/19、导入冒烟（yj_studio + yj_studio_core + 15 算法）通过。
+- [x] 重新部署服务器并外网验证。
 
-1. **抽 `shared/` 共享包**
-   - 新建 `shared/src/yj_studio_core/`，把 `apps/yj_studio/src/yj_studio/targets/` 移入为 `yj_studio_core/targets/`（或保留名 `yj_studio.targets` 但置于 shared，桌面端与 server 都加 `shared/src` 到 path）。
-   - 改 server `from yj_studio.targets import ...` → 新包名；改桌面端对 `targets` 的引用。
-   - 更新 3 处 PYTHONPATH（`run_yj_studio.py`、`server/scripts/start_server.sh`、pytest 配置）加入 `shared/src`。
-2. **桌面端 `apps/yj_studio` → `local/app`（或 `local/yj_studio`）**
-   - `git mv apps/yj_studio local/app`；更新 `run_yj_studio.py` 的 `PROJECT_SRC`、`pyproject.toml` 的 `where`/`testpaths`/`pythonpath`、所有相对根路径计算（收敛到 `_find_workspace_root()`）。
-   - 全局搜 `apps/yj_studio` 字符串（脚本、文档、部署）逐一替换。
-3. **收敛根路径**：把约 30 处自算 `ROOT`/`parents[N]` 改为统一的 `_find_workspace_root()`（或各包内等价 helper）。
-4. **部署脚本与 conda**：更新 `start_server.sh` 的 PYTHONPATH、`install_env.sh` 的 `pip install -e` 目标路径。
-5. **全量重测**（桌面 + 服务端 FastAPI-free）→ **重新部署服务器** → 外网探测 `/health`、`/sam3/gpus` 确认全绿。
-6. 评估 `legacy/` 是否删除或外移；`tools/` 是否细分。
-
-> Phase 2 会同时打断 import / PYTHONPATH / 部署 / conda / 测试，必须分步小跑、每步重测，最后才重新部署服务器。
+> 备注：`apps/yj_studio`→`local/app` 深度一致（都 2 段），所以包内 `parents[N]` 计算自动仍正确；约 30 处自算根路径**未**强制收敛，可后续择机统一到 `_find_workspace_root()`。`legacy/` 清理、`tools/` 细分留作后续可选项。

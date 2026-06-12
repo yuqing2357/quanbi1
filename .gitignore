@@ -6,8 +6,11 @@ pytest-tmp/
 .tmp/
 .pytest-tmp/
 build/
-apps/yj_studio/tests/_artifacts/
-apps/yj_studio/tests/_scratch/
+local/app/tests/_artifacts/
+local/app/tests/_scratch/
+local/app/pytest-tmp/
+local/app/pytest-cache-files-*/
+local/app/runtime/
 tools/_sam3_smoke_out/
 .venv/
 dist/

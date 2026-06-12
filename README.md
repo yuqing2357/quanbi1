@@ -20,7 +20,7 @@ YJ_Studio_Portable/
 
 ## What To Edit
 
-- Desktop app behavior: `apps/yj_studio/`
+- Desktop app behavior: `local/app/`
 - Remote API/service behavior: `server/`
 - Local helper scripts: `local/`
 - Large data files: `data/`

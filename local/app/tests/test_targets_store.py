@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from yj_studio.targets import GeoTarget, TargetSet, TargetStatus, TargetStore, export_confirmed_to_coco, split_frames
+from yj_studio_core.targets import GeoTarget, TargetSet, TargetStatus, TargetStore, export_confirmed_to_coco, split_frames
 
 
 def test_target_store_keeps_arrays_out_of_targets_json(tmp_path: Path) -> None:

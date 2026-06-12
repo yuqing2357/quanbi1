@@ -19,7 +19,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from yj_studio.scene.layers import MaskLayer
-from yj_studio.targets import mask_summary, target_type_color
+from yj_studio_core.targets import mask_summary, target_type_color
 
 
 def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:

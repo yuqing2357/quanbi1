@@ -50,7 +50,7 @@ from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import VolumeLayer
 from yj_studio.scene.undo_commands import AddLayerCommand
 from yj_studio.tools.tool_manager import ToolManager
-from yj_studio.targets import BUILTIN_TARGET_TYPES
+from yj_studio_core.targets import BUILTIN_TARGET_TYPES
 from yj_studio.ui.text import ai_state_label, section_axis_label
 
 logger = logging.getLogger(__name__)

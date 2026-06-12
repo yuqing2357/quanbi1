@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
-from yj_studio.targets import GeoTarget, TargetSet
+from yj_studio_core.targets import GeoTarget, TargetSet
 
 
 class RemoteTargetStore:

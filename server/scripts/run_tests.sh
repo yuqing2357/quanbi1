@@ -19,6 +19,6 @@ python -m pip check
 python tools/check_sam3_setup.py
 QT_QPA_PLATFORM=offscreen python -m pytest \
   server/tests/test_sam3_jobs_api.py \
-  apps/yj_studio/tests/test_layer_store.py \
-  apps/yj_studio/tests/test_algorithms_serialization.py \
-  apps/yj_studio/tests/test_volume_slice_renderer.py
+  local/app/tests/test_layer_store.py \
+  local/app/tests/test_algorithms_serialization.py \
+  local/app/tests/test_volume_slice_renderer.py

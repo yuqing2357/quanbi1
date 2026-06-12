@@ -18,6 +18,7 @@ fi
 
 conda activate "$ENV_NAME"
 python -m pip install -r "$ROOT/config/env/requirements-server.txt"
-python -m pip install -e "$ROOT/apps/yj_studio"
+python -m pip install -e "$ROOT/shared"
+python -m pip install -e "$ROOT/local/app"
 
 echo "Server environment ready: $ENV_NAME"

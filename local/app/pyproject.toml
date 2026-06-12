@@ -27,7 +27,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "../../shared/src"]
 addopts = "-q -p no:cacheprovider -p no:pytestqt -p no:pytestqt.plugin -p no:qt"
 
 [tool.black]
