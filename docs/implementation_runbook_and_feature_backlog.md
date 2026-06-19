@@ -6,8 +6,8 @@
 - 仍需实现的**完整目录**（算法链 A1–A5 + 训练闭环 + 平台功能 G1–G8 + 里程碑）看：[`next_steps_geophysics_and_training.md`](next_steps_geophysics_and_training.md)
 
 > 已用实际代码核实的关键事实（写代码前先记住）：
-> - 算法在 [`AlgorithmRunner`](../apps/yj_studio/src/yj_studio/algorithms/runner.py) 里跑。`runs_in_subprocess = False` 的算法走 `InProcessAlgorithmTask`（**QThread，不卡 UI**）并能拿到 `ctx.services`；`= True` 的走子进程、**拿不到 services** 且输入输出要能 `to_dict/from_dict` 序列化。
-> - 已注册的服务（[main_window.py:94](../apps/yj_studio/src/yj_studio/ui/main_window.py:94)）：`ctx.services["volume_store"]`、`ctx.services["ai_service"]`。取整卷用 `volume_store.get_volume(volume_id)`（memmap），取切片用 `get_slice(volume_id, axis, index)`。
+> - 算法在 [`AlgorithmRunner`](../local/app/src/yj_studio/algorithms/runner.py) 里跑。`runs_in_subprocess = False` 的算法走 `InProcessAlgorithmTask`（**QThread，不卡 UI**）并能拿到 `ctx.services`；`= True` 的走子进程、**拿不到 services** 且输入输出要能 `to_dict/from_dict` 序列化。
+> - 已注册的服务（[main_window.py:94](../local/app/src/yj_studio/ui/main_window.py:94)）：`ctx.services["volume_store"]`、`ctx.services["ai_service"]`。取整卷用 `volume_store.get_volume(volume_id)`（memmap），取切片用 `get_slice(volume_id, axis, index)`。
 > - `AlgorithmDock` 默认 `auto_attach_outputs=False`：它监听 `task.finished(layers, summary)`，再通过 undo command 把 `output_layers` 加进 `LayerStore`。算法只管返回，不要自己塞 store。
 > - **`TrapLayer` 目前没有任何渲染器**（2D/3D 都没有），算法跑完结果不可见——A1 必须连带补渲染（见步骤 4）。
 
@@ -68,8 +68,8 @@
 A1 的闭合多边形在 **map 平面（inline×xline）**上、Z=`spill_level` 常数。这决定了它在不同视图的形态，按此接渲染：
 - **Z 切片 / 平面图视图**：画**完整闭合多边形**（`boundary[:, :2]`）+ 质心标 `score`。这是最自然、最该优先做的显示。
 - **inline / xline 剖面**：多边形与该剖面只相交于少数点/短段——可不画或只画交点标记，别期望看到完整圈。
-- **3D 场景**（[`scene_controller.py:71/100/135`](../apps/yj_studio/src/yj_studio/view/scene_controller.py:71)）：把 `TrapLayer` 加进 `isinstance(...)` 元组，用 `boundary (M,3)` 画一条**水平闭合 polyline**（Z=spill_level），参照 PolygonLayer 的 3D 画法。
-- 落点：2D 走 [`view_2d_section.py`](../apps/yj_studio/src/yj_studio/view/view_2d_section.py) 的图层派发分支（仿 PolygonLayer），3D 走 scene_controller。配色用 `score`（低分灰→高分红）。
+- **3D 场景**（[`scene_controller.py:71/100/135`](../local/app/src/yj_studio/view/scene_controller.py:71)）：把 `TrapLayer` 加进 `isinstance(...)` 元组，用 `boundary (M,3)` 画一条**水平闭合 polyline**（Z=spill_level），参照 PolygonLayer 的 3D 画法。
+- 落点：2D 走 [`view_2d_section.py`](../local/app/src/yj_studio/view/view_2d_section.py) 的图层派发分支（仿 PolygonLayer），3D 走 scene_controller。配色用 `score`（低分灰→高分红）。
 
 ### ⑥ 测试契约（断言点）
 直接测 `detect_closures`（不经 Qt/runner）：输入合成 `z` → 断言返回的 `ClosureResult` **数量**与 **字段值**（relief>0、boundary 首尾闭合、area≥阈值、触边样例 `edge_limited=True`）。用例清单见步骤 5。
@@ -79,10 +79,10 @@ A1 的闭合多边形在 **map 平面（inline×xline）**上、Z=`spill_level` 
 ## 步骤 0 · 准备（5 分钟）
 1. 新建分支：`git checkout -b feat/closure-contour`。
 2. 确认依赖（已实测可用，无需安装）：`numpy`、`scipy.ndimage`、`skimage.measure`。
-3. 读一遍既有范例 [`builtin/thickness.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/thickness.py)——A1 完全照它的结构（ClassVar 元信息 + `run(ctx)` + 返回 `AlgorithmResult.success`）。
+3. 读一遍既有范例 [`builtin/thickness.py`](../local/app/src/yj_studio/algorithms/builtin/thickness.py)——A1 完全照它的结构（ClassVar 元信息 + `run(ctx)` + 返回 `AlgorithmResult.success`）。
 
 ## 步骤 1 · 写算法本体
-新建 `apps/yj_studio/src/yj_studio/algorithms/builtin/closure_contour.py`，代码骨架见 geophysics 文档 A1（已给完整 `run()`）。在此基础上补这些**易漏细节**：
+新建 `local/app/src/yj_studio/algorithms/builtin/closure_contour.py`，代码骨架见 geophysics 文档 A1（已给完整 `run()`）。在此基础上补这些**易漏细节**：
 
 - **`runs_in_subprocess`**：显式设 `runs_in_subprocess = False`（无需 services，但要 QThread 不卡 UI；TrapLayer 输出也省去序列化）。
 - **nan 安全**：`z` 里 nan 要先 `np.where(valid, z, np.inf)` 再做 `minimum_filter`，否则极小点会落在 nan 边缘。`levels` 用 `np.nanmin/np.nanmax`。
@@ -93,7 +93,7 @@ A1 的闭合多边形在 **map 平面（inline×xline）**上、Z=`spill_level` 
 - **空结果**：无满足阈值的闭合时 `return AlgorithmResult.failure("没有满足阈值的闭合")`，不要返回空 success（UI 才会给出可读提示）。
 
 ## 步骤 2 · 注册到算法目录
-1. 升级旧占位：把 [`builtin/stubs/closure_contour.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/closure_contour.py) 删除（或清空其 `@register_algorithm`），避免**同 id 重复注册**。
+1. 升级旧占位：把 [`builtin/stubs/closure_contour.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/closure_contour.py) 删除（或清空其 `@register_algorithm`），避免**同 id 重复注册**。
 2. 确认 `builtin/__init__.py` 会 import 新模块（注册靠 import 的 side-effect）。若它是显式列举 import，加上 `from . import closure_contour`；若是按目录自动发现，确认新文件在扫描路径内。
 3. 跑一次 `python -c "from yj_studio.algorithms import registry; print('horizon.closure_contour' in registry...)"`（按 registry 实际 API 调整）确认已注册且无重复 id 报错。
 
@@ -104,14 +104,14 @@ A1 的闭合多边形在 **map 平面（inline×xline）**上、Z=`spill_level` 
 照 `PolygonLayer` 的现成接法加 TrapLayer 分支，**严格按上面 ⑤ 渲染契约**（闭合是 map 平面多边形、Z 常数，剖面里只见交点、平面/3D 才见完整圈）：
 
 - **优先：Z 切片 / 平面视图**画完整闭合多边形（`boundary[:, :2]`）+ 质心标 `score`。这是最该先做、最直观的显示。
-- **inline/xline 剖面**（[`view_2d_section.py:335`](../apps/yj_studio/src/yj_studio/view/view_2d_section.py:335) 附近，仿 `PolygonLayer and layer.closed` 那段）：多边形与该剖面只相交于少数点/短段，可只画交点标记或先不画——**别期望在剖面上看到完整圈**（这是新手最易踩的"看不到结果"）。
-- **3D 场景**（[`scene_controller.py:71/100/135`](../apps/yj_studio/src/yj_studio/view/scene_controller.py:71)）：把 `TrapLayer` 加进那几处 `isinstance(layer, (...))` 元组，用 `boundary (M,3)` 画水平闭合 polyline（参照 PolygonLayer 的 3D 绘制）。
+- **inline/xline 剖面**（[`view_2d_section.py:335`](../local/app/src/yj_studio/view/view_2d_section.py:335) 附近，仿 `PolygonLayer and layer.closed` 那段）：多边形与该剖面只相交于少数点/短段，可只画交点标记或先不画——**别期望在剖面上看到完整圈**（这是新手最易踩的"看不到结果"）。
+- **3D 场景**（[`scene_controller.py:71/100/135`](../local/app/src/yj_studio/view/scene_controller.py:71)）：把 `TrapLayer` 加进那几处 `isinstance(layer, (...))` 元组，用 `boundary (M,3)` 画水平闭合 polyline（参照 PolygonLayer 的 3D 绘制）。
 - **manual_geometry_renderer.py**：若 2D 走的是这个渲染器，把 TrapLayer 也纳入其联合类型。
 - **配色**：用 `score` 映射颜色（低分灰、高分红），或复用 `targets/style.py` 的配色思路。
 
 > 验收点：层位上跑 A1 → **平面图/3D** 能看到完整闭合圈、质心有 score；图层树里可勾选/隐藏。
 
-## 步骤 5 · 单元测试（`apps/yj_studio/tests/test_closure_contour.py`，纯 CPU、无 Qt）
+## 步骤 5 · 单元测试（`local/app/tests/test_closure_contour.py`，纯 CPU、无 Qt）
 把核心抽成纯函数 `detect_closures(z, valid, params) -> list[ClosureResult]` 后直接测它（不经 runner，最快）：
 1. **单高斯洼地**：`z = r²`（中心最浅）→ 恰 1 个闭合，relief>0，boundary 首尾点距 < 1 格。
 2. **双高被深鞍隔开**：两个高斯坑 + 高鞍 → 2 个闭合；把鞍部抬浅到连通 → 两高点都进入 `spilled`，闭合数减少。
@@ -119,7 +119,7 @@ A1 的闭合多边形在 **map 平面（inline×xline）**上、Z=`spill_level` 
 4. **阈值过滤**：`min_relief_samples`/`min_area_cells` 调高 → 小闭合被剔除。
 5. **nan 鲁棒**：在 `valid=False` 区填 nan，断言不崩、不把 nan 边当高点。
 
-跑：`cd apps/yj_studio; $env:PYTHONPATH="src"; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py -q`。
+跑：`cd local/app; $env:PYTHONPATH="src"; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py -q`。
 
 ## 步骤 6 · UI 手测路径
 1. 本地模式启动 `python run_yj_studio.py`，「文件→打开体数据」加载有层位的工程，或加载一个 HorizonLayer。
@@ -160,7 +160,7 @@ A1 跑通后，按这个顺序继续（详细 Params/`run()`/测试/DoD 全在 [
 ## 当前验证命令（2026-06-12）
 
 ```text
-cd apps/yj_studio
+cd local/app
 $env:PYTHONPATH="src"; $env:PYTHONDONTWRITEBYTECODE="1"
 E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py tests/test_trap_detect.py tests/test_trap_report.py tests/test_connectivity.py tests/test_sandbody_extract.py tests/test_trap_evaluate.py tests/test_algorithms_registry.py tests/test_schema_form.py -q --basetemp pytest_tmp_phase_a3
 E:\miniconda\envs\py312\python.exe -m pytest tests/test_mask_volume_renderer.py tests/test_trap_report.py -q

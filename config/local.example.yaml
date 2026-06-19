@@ -5,8 +5,8 @@ request_timeout_s: 180
 probe_server_on_start: true
 require_server: false
 
-cache_root: local/cache
-log_root: local/logs
+cache_root: runtime/local/cache
+log_root: runtime/local/logs
 
 volume_backend: remote
 sam3_backend: remote

@@ -39,6 +39,10 @@ Start manually:
 bash server/scripts/start_server.sh
 ```
 
+The server remains in the current terminal. Runtime status, request logs, SAM3
+job state changes, and exception tracebacks are printed live. Stop it with
+`Ctrl+C`.
+
 Healthcheck:
 
 ```bash
@@ -65,8 +69,8 @@ powershell -ExecutionPolicy Bypass -File local\scripts\test_remote_connection.ps
 Data stays outside `server/` and `local/`:
 
 ```text
-data/reservoir/numpy_3x/lithology_binary_3x_uint8.npy
-data/reservoir/numpy_3x/porosity_3x_float16.npy
+data/reservoir/npy_625x625x2_v3/lithology_binary_uint8.npy
+data/reservoir/npy_625x625x2_v3/porosity_float16.npy
 data/seismic/YJ-ALL-SEISMIC.npy
 weights/sam3.pt
 ```

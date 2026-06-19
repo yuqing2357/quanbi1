@@ -5,8 +5,10 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "apps" / "yj_studio" / "src"
+SRC_ROOT = PROJECT_ROOT / "local" / "app" / "src"
 DATA_ROOT = PROJECT_ROOT / "data"
+OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
+DIAGNOSTICS_ROOT = OUTPUTS_ROOT / "diagnostics"
 SEISMIC_ROOT = DATA_ROOT / "seismic"
 RESERVOIR_ROOT = DATA_ROOT / "reservoir"
 RESERVOIR_GRDECL_ROOT = RESERVOIR_ROOT / "grdecl"

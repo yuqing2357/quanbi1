@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from .service import AIServiceState
+from .state import AIServiceState
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,10 +64,13 @@ class RemoteSAM3Client(QObject):
         return self._state == AIServiceState.READY
 
     def start(self) -> None:
+        if not self.server_url:
+            self._set_state(AIServiceState.ERROR, "未配置远程 SAM3 服务器（YJ_STUDIO_SERVER_URL）")
+            return
         self._set_state(AIServiceState.LOADING, "正在连接远程 SAM3 服务")
         try:
             health = self._get_json("/health", timeout_s=min(self.timeout_s, 10.0))
-        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (OSError, RuntimeError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             self._set_state(AIServiceState.ERROR, f"远程服务器不可用：{exc}")
             return
         status = health.get("status", "unknown") if isinstance(health, dict) else "unknown"
@@ -188,7 +191,7 @@ class RemoteSAM3Client(QObject):
 
     def fetch_mask(self, job_id: str, candidate_index: int) -> np.ndarray:
         with urlopen(
-            f"{self.server_url}/sam3/jobs/{job_id}/mask/{int(candidate_index)}",
+            self._url(f"/sam3/jobs/{job_id}/mask/{int(candidate_index)}"),
             timeout=self.timeout_s,
         ) as response:
             data = response.read()
@@ -202,14 +205,19 @@ class RemoteSAM3Client(QObject):
         self._message = message
         self.state_changed.emit(state, message)
 
+    def _url(self, path: str) -> str:
+        if not self.server_url:
+            raise RuntimeError("未配置远程 SAM3 服务器（YJ_STUDIO_SERVER_URL）")
+        return f"{self.server_url}{path}"
+
     def _get_json(self, path: str, *, timeout_s: float) -> Any:
-        with urlopen(f"{self.server_url}{path}", timeout=timeout_s) as response:
+        with urlopen(self._url(path), timeout=timeout_s) as response:
             return json.loads(response.read().decode("utf-8"))
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         request = Request(
-            f"{self.server_url}{path}",
+            self._url(path),
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",

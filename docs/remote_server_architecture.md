@@ -9,7 +9,7 @@
 - `local/`: 本地开发、调试、连接测试、桌面端启动辅助。
 - `runtime/`: 自动生成的运行时缓存、日志、任务状态。
 
-`apps/` 和 `libs/` 是共享源码层，不属于某一台机器的运行状态。
+`local/app/`、`shared/` 和 `libs/` 是共享源码层，不属于某一台机器的运行状态。
 
 ## 边界
 
@@ -19,7 +19,7 @@
 
 ```text
 data/seismic/
-data/reservoir/numpy_3x/
+data/reservoir/npy_625x625x2_v3/
 data/reservoir/grdecl/
 data/results/
 ```
@@ -35,7 +35,7 @@ server/src/yj_studio_server/
 server/config/
 server/scripts/
 server/systemd/
-server/logs/
+runtime/server/logs/
 ```
 
 服务从 `server/config/server.yaml` 读取数据路径，但不把数据复制进 `server/`。
@@ -48,8 +48,8 @@ server/logs/
 local/config/
 local/scripts/
 local/tests/
-local/cache/
-local/logs/
+runtime/local/cache/
+runtime/local/logs/
 ```
 
 本地不直接承担大规模转换、SAM3 推理或全量体数据处理。
@@ -108,7 +108,7 @@ cp /root/quanbi/server/config/server.example.yaml /root/quanbi/server/config/ser
 
 - 只改远程服务：同步 `server/`。
 - 只改本地调试：同步 `local/`。
-- 改桌面端/共享逻辑：同步 `apps/`。
+- 改桌面端逻辑：同步 `local/app/`；改共享核心：同步 `shared/`。
 - 改 SAM3 源码：同步 `libs/`。
 - 更新大数据：同步 `data/`。
 

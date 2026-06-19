@@ -12,6 +12,7 @@ from yj_studio.data.remote_target_store import RemoteTargetStore
 class _FakeResponse:
     def __init__(self, payload: dict[str, Any]):
         self._payload = payload
+        self.headers: dict[str, str] = {}
 
     def __enter__(self) -> "_FakeResponse":
         return self
@@ -21,6 +22,21 @@ class _FakeResponse:
 
     def read(self) -> bytes:
         return json.dumps(self._payload).encode("utf-8")
+
+
+class _FakeBytesResponse:
+    def __init__(self, payload: bytes, headers: dict[str, str]):
+        self._payload = payload
+        self.headers = headers
+
+    def __enter__(self) -> "_FakeBytesResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
 
 
 def test_remote_target_store_put_mask_uploads_npy(monkeypatch) -> None:
@@ -85,3 +101,39 @@ def test_remote_target_store_create_cell_target_uploads_npy(monkeypatch) -> None
     )
     assert captured["cells"].dtype == np.int32
     assert np.array_equal(captured["cells"], cells.astype(np.int32))
+
+
+def test_remote_target_store_fetch_mask3d_reads_metadata_headers(monkeypatch) -> None:
+    mask = np.zeros((2, 3, 4), dtype=np.uint8)
+    mask[0, 1, 1] = 1
+    mask[1, 2, 3] = 1
+    buffer = BytesIO()
+    np.save(buffer, mask, allow_pickle=False)
+
+    def fake_urlopen(url, timeout=None):  # noqa: ANN001
+        assert url == "http://server:8765/sam3/targets/T1/mask3d?project=demo&volume_id=model_lithology"
+        assert timeout == 13
+        return _FakeBytesResponse(
+            buffer.getvalue(),
+            {
+                "X-Mask3D-Index-Lo": "10",
+                "X-Mask3D-Index-Hi": "11",
+                "X-Mask3D-Voxel-Count": "2",
+                "X-Mask3D-Volume-M3": "115.740740740741",
+                "X-Mask3D-Voxel-Spacing": "4.166666666666667,4.166666666666667,3.3333333333333335",
+                "X-Mask3D-Voxel-Spacing-Source": "config",
+            },
+        )
+
+    monkeypatch.setattr("yj_studio.data.remote_target_store.urlopen", fake_urlopen)
+    store = RemoteTargetStore("http://server:8765", project_id="demo", timeout_s=13)
+
+    result = store.fetch_mask3d_with_metadata("T1", volume_id="model_lithology")
+
+    assert np.array_equal(result.mask, mask)
+    assert result.index_lo == 10
+    assert result.index_hi == 11
+    assert result.voxel_count == 2
+    assert result.volume_m3 == 115.740740740741
+    assert result.voxel_spacing == (12.5 / 3.0, 12.5 / 3.0, 10.0 / 3.0)
+    assert result.voxel_spacing_source == "config"

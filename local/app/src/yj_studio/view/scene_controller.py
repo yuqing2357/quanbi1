@@ -12,9 +12,6 @@ from yj_studio.scene.layers import (
     MaskLayer,
     MeasurementLayer,
     PolygonLayer,
-    ReservoirGridLayer,
-    ReservoirPropertyLayer,
-    ReservoirSelectionLayer,
     TrapLayer,
     VolumeLayer,
     WellLayer,
@@ -26,8 +23,6 @@ from .renderers.horizon_renderer import HorizonRenderer
 from .renderers.mask_renderer import MaskRenderer
 from .renderers.manual_geometry_renderer import ManualGeometryRenderer
 from .renderers.lith_body_renderer import LithBodyRenderer
-from .renderers.reservoir_grid_renderer import ReservoirGridRenderer
-from .renderers.reservoir_selection_renderer import ReservoirSelectionRenderer
 from .renderers.volume_slice_renderer import VolumeSliceRenderer
 from .renderers.well_log_renderer import WellLogRenderer
 from .renderers.well_renderer import WellRenderer
@@ -42,8 +37,6 @@ class SceneController:
         layer_store: LayerStore,
         volume_store: VolumeStore,
         view_3d,
-        *,
-        reservoir_registry=None,
     ) -> None:
         self._layer_store = layer_store
         self._volume_renderer = VolumeSliceRenderer(view_3d, volume_store)
@@ -54,21 +47,6 @@ class SceneController:
         self._manual_geometry_renderer = ManualGeometryRenderer(view_3d)
         self._well_renderer = WellRenderer(view_3d)
         self._well_log_renderer = WellLogRenderer(view_3d)
-        self._reservoir_grid_renderer = (
-            ReservoirGridRenderer(view_3d, reservoir_registry)
-            if reservoir_registry is not None
-            else None
-        )
-        self._reservoir_selection_renderer = (
-            ReservoirSelectionRenderer(
-                view_3d,
-                reservoir_registry,
-                self._reservoir_grid_renderer,
-            )
-            if self._reservoir_grid_renderer is not None and reservoir_registry is not None
-            else None
-        )
-        self._reservoir_property_parent_ids: dict[str, str] = {}
         self._active_volume_layer_id: str | None = None
         self._active_z_count: int | None = None
         self._selected_layer_ids: set[str] = set()
@@ -93,13 +71,6 @@ class SceneController:
             self._mask_renderer.render(layer, highlighted=self._highlighted(layer), z_count=self._active_z_count)
         elif isinstance(layer, (ArbitrarySectionLayer, PolygonLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, TrapLayer)) and layer.visible:
             self._manual_geometry_renderer.render(layer, highlighted=self._highlighted(layer), z_count=self._active_z_count)
-        elif isinstance(layer, ReservoirGridLayer):
-            self._render_reservoir_grid(layer)
-        elif isinstance(layer, ReservoirPropertyLayer):
-            self._reservoir_property_parent_ids[layer.id] = layer.grid_layer_id
-            self._render_reservoir_parent_for_property(layer)
-        elif isinstance(layer, ReservoirSelectionLayer):
-            self._render_reservoir_selection(layer)
         elif isinstance(layer, WellLayer) and layer.visible:
             self._well_renderer.render(layer, highlighted=self._highlighted(layer), z_count=self._active_z_count)
         elif isinstance(layer, WellLogLayer) and layer.visible:
@@ -130,16 +101,6 @@ class SceneController:
         if isinstance(layer, (ArbitrarySectionLayer, PolygonLayer, HorizonStickLayer, FaultStickLayer, MeasurementLayer, TrapLayer)):
             self._manual_geometry_renderer.render(layer, highlighted=self._highlighted(layer), z_count=self._active_z_count)
             return
-        if isinstance(layer, ReservoirGridLayer):
-            self._render_reservoir_grid(layer)
-            return
-        if isinstance(layer, ReservoirPropertyLayer):
-            self._reservoir_property_parent_ids[layer.id] = layer.grid_layer_id
-            self._render_reservoir_parent_for_property(layer)
-            return
-        if isinstance(layer, ReservoirSelectionLayer):
-            self._render_reservoir_selection(layer)
-            return
         if isinstance(layer, WellLayer):
             self._well_renderer.render(layer, highlighted=self._highlighted(layer), z_count=self._active_z_count)
             return
@@ -157,18 +118,6 @@ class SceneController:
         self._lith_body_renderer.clear(layer_id)
         self._mask_renderer.clear(layer_id)
         self._manual_geometry_renderer.clear(layer_id)
-        if self._reservoir_grid_renderer is not None:
-            self._reservoir_grid_renderer.clear(layer_id)
-        if self._reservoir_selection_renderer is not None:
-            self._reservoir_selection_renderer.clear(layer_id)
-        parent_id = self._reservoir_property_parent_ids.pop(layer_id, None)
-        if parent_id:
-            try:
-                parent = self._layer_store.get(parent_id)
-            except KeyError:
-                parent = None
-            if isinstance(parent, ReservoirGridLayer):
-                self._render_reservoir_grid(parent)
         self._well_renderer.clear(layer_id)
         self._well_log_renderer.clear(layer_id)
 
@@ -186,8 +135,6 @@ class SceneController:
                     ArbitrarySectionLayer,
                     PolygonLayer,
                     TrapLayer,
-                    ReservoirGridLayer,
-                    ReservoirSelectionLayer,
                     HorizonStickLayer,
                     FaultStickLayer,
                     MeasurementLayer,
@@ -205,41 +152,3 @@ class SceneController:
         self._active_volume_layer_id = layer_id
         self._active_z_count = layer.shape[2] if layer.shape is not None else None
         self._volume_renderer.set_layer(layer)
-
-    def _render_reservoir_grid(self, layer: ReservoirGridLayer) -> None:
-        if self._reservoir_grid_renderer is None:
-            return
-        self._reservoir_grid_renderer.render(
-            layer,
-            list(self._layer_store.iter_by_type(ReservoirPropertyLayer)),
-            highlighted=self._highlighted(layer),
-            z_count=self._active_z_count,
-        )
-
-    def _render_reservoir_parent_for_property(self, layer: ReservoirPropertyLayer) -> None:
-        if self._reservoir_grid_renderer is None:
-            return
-        parent = None
-        if layer.grid_layer_id:
-            try:
-                candidate = self._layer_store.get(layer.grid_layer_id)
-            except KeyError:
-                candidate = None
-            if isinstance(candidate, ReservoirGridLayer):
-                parent = candidate
-        if parent is None:
-            for candidate in self._layer_store.iter_by_type(ReservoirGridLayer):
-                if candidate.grid_id == layer.grid_id:
-                    parent = candidate
-                    break
-        if parent is not None:
-            self._render_reservoir_grid(parent)
-
-    def _render_reservoir_selection(self, layer: ReservoirSelectionLayer) -> None:
-        if self._reservoir_selection_renderer is None:
-            return
-        self._reservoir_selection_renderer.render(
-            layer,
-            highlighted=self._highlighted(layer),
-            z_count=self._active_z_count,
-        )

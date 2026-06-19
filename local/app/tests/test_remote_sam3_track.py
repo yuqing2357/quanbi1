@@ -5,7 +5,7 @@ from typing import Any
 
 from yj_studio.ai.remote_client import RemoteSAM3Client
 from yj_studio.algorithms.runner import RemoteSAM3TrackTask
-from yj_studio.ai.service import AIServiceState
+from yj_studio.ai.state import AIServiceState
 
 
 class _FakeResponse:

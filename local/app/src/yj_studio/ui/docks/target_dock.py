@@ -23,10 +23,20 @@ from PyQt6.QtWidgets import (
 
 from yj_studio.ai.adapters import build_mask_layer, sam3_mask_to_layer
 from yj_studio.data import RemoteTargetStore
+from yj_studio.data.remote_target_store import Mask3DResult
 from yj_studio.scene.layer_store import LayerStore
-from yj_studio.scene.layers import MaskLayer, ReservoirGridLayer, ReservoirPropertyLayer, ReservoirSelectionLayer
+from yj_studio.scene.layers import MaskLayer
 from yj_studio.scene.undo_commands import AddLayerCommand
-from yj_studio_core.targets import BUILTIN_TARGET_TYPES, GeoTarget, TargetFrame, TargetSet, TargetStatus, review_queue
+from yj_studio_core.targets import (
+    BUILTIN_TARGET_TYPES,
+    DEFAULT_VOXEL_SPACING,
+    GeoTarget,
+    TargetFrame,
+    TargetSet,
+    TargetStatus,
+    mask_volume_stats,
+    review_queue,
+)
 
 
 class TargetDock(QDockWidget):
@@ -45,6 +55,7 @@ class TargetDock(QDockWidget):
         self._target_store = target_store
         self._undo_stack = undo_stack
         self._targets: dict[str, GeoTarget] = {}
+        self._volume_stats: dict[str, dict[str, object]] = {}
         self._pending_suggestion: dict[str, object] | None = None
 
         root = QWidget(self)
@@ -77,8 +88,8 @@ class TargetDock(QDockWidget):
         layout.addLayout(suggestion_row)
         self._clear_suggestion()
 
-        self._table = QTableWidget(0, 6, root)
-        self._table.setHorizontalHeaderLabels(["ID", "类型", "状态", "帧", "面积", "Score"])
+        self._table = QTableWidget(0, 7, root)
+        self._table.setHorizontalHeaderLabels(["ID", "类型", "状态", "帧", "面积", "体积", "Score"])
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -127,21 +138,6 @@ class TargetDock(QDockWidget):
             load_row.addWidget(button)
         layout.addLayout(load_row)
 
-        extract_row = QHBoxLayout()
-        self._extract_type = QComboBox(root)
-        self._extract_type.setEditable(True)
-        self._extract_type.addItems(list(BUILTIN_TARGET_TYPES))
-        self._extract_scope = QComboBox(root)
-        self._extract_scope.addItems(["page", "volume"])
-        self._extract_mode = QComboBox(root)
-        self._extract_mode.addItems(["prompt", "track", "infer_volume"])
-        self._extract_button = QPushButton("提取", root)
-        extract_row.addWidget(self._extract_type)
-        extract_row.addWidget(self._extract_scope)
-        extract_row.addWidget(self._extract_mode)
-        extract_row.addWidget(self._extract_button)
-        layout.addLayout(extract_row)
-
         self._apply_button.clicked.connect(self._apply_selected)
         self._confirm_button.clicked.connect(self._confirm_selected)
         self._delete_button.clicked.connect(self._delete_selected)
@@ -151,7 +147,6 @@ class TargetDock(QDockWidget):
         self._load_cells_button.clicked.connect(self._load_selected_cells)
         self._train_button.clicked.connect(self._submit_train_export)
         self._models_button.clicked.connect(self._show_models)
-        self._extract_button.clicked.connect(self._extract_from_selected)
 
         self.setWidget(root)
         self._set_remote_enabled(target_store is not None)
@@ -174,6 +169,7 @@ class TargetDock(QDockWidget):
                 summary.get("status", ""),
                 summary.get("frame_range", ""),
                 summary.get("area_px", 0),
+                _volume_text(self._targets.get(str(summary.get("id", ""))), self._volume_stats),
                 "" if summary.get("score") is None else f"{float(summary['score']):.3f}",
             ]
             for col, value in enumerate(values):
@@ -198,7 +194,6 @@ class TargetDock(QDockWidget):
             self._load_cells_button,
             self._train_button,
             self._models_button,
-            self._extract_button,
             self._suggestion_confirm_button,
             self._suggestion_ignore_button,
         ):
@@ -380,51 +375,25 @@ class TargetDock(QDockWidget):
         if target is None or self._target_store is None:
             return
         try:
-            cells = np.asarray(self._target_store.fetch_cells(target.id, volume_id=target.volume_id), dtype=np.int32)
-            if cells.ndim == 1 and cells.size == 0:
-                cells = cells.reshape(0, 3)
-            if cells.shape[0] == 0:
-                self._load_selected_mask3d(target)
-                return
-            grid_layer_id, grid_id = self._best_grid_ref()
-            frame = _first_frame(target)
-            layer = ReservoirSelectionLayer(
-                name=f"{target.id} 选择体",
-                grid_layer_id=grid_layer_id,
-                grid_id=grid_id,
-                cell_ids=cells,
-                source_axis=_ijk_axis(frame.axis if frame else None),
-                source_index_lo=frame.index if frame else None,
-                source_index_hi=frame.index if frame else None,
-                score=target.score,
-                color=(1.0, 0.75, 0.1, 0.72),
-                opacity=0.72,
-                metadata={
-                    "target_id": target.id,
-                    "target_type": target.type,
-                    "remote_target": True,
-                    "external_cells_ref": f"/sam3/targets/{target.id}/cells",
-                },
-                provenance={"source": "sam3.target.cells"},
-            )
-            self._add_layer(layer)
+            self._load_selected_mask3d(target)
         except Exception as exc:  # noqa: BLE001
-            try:
-                self._load_selected_mask3d(target)
-            except Exception as mask_exc:  # noqa: BLE001
-                QMessageBox.warning(self, "目标", f"{exc}\n{mask_exc}")
+            QMessageBox.warning(self, "目标", str(exc))
 
     def _load_selected_mask3d(self, target: GeoTarget) -> None:
         if self._target_store is None:
             return
-        mask = np.asarray(self._target_store.fetch_mask3d(target.id, volume_id=target.volume_id), dtype=np.uint8)
+        result = self._target_store.fetch_mask3d_with_metadata(target.id, volume_id=target.volume_id)
+        mask = np.asarray(result.mask, dtype=np.uint8)
         if mask.ndim != 3 or not np.any(mask):
             QMessageBox.information(self, "目标", "该目标还没有可显示的 3D mask。")
             return
         frame = _first_frame(target)
         target_axis = frame.axis if frame else _dominant_axis(target)
         axis = _desktop_axis(target_axis)
-        index_lo = _mask3d_index_lo(target, target_axis)
+        index_lo = result.index_lo if result.index_lo is not None else _mask3d_index_lo(target, target_axis)
+        stats = _mask3d_metadata(target, mask, result)
+        self._volume_stats[target.id] = stats
+        target.metadata.update(stats)
         layer = MaskLayer(
             name=f"{target.id} 目标体",
             mask=mask,
@@ -442,10 +411,12 @@ class TargetDock(QDockWidget):
                 "mask3d_index_lo": index_lo,
                 "source_axis": target_axis,
                 "external_mask3d_ref": f"/sam3/targets/{target.id}/mask3d",
+                **stats,
             },
             provenance={"source": "sam3.target.mask3d"},
         )
         self._add_layer(layer)
+        self._update_volume_cell(target.id)
 
     def _submit_train_export(self) -> None:
         if self._target_store is None:
@@ -478,41 +449,6 @@ class TargetDock(QDockWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "审校", str(exc))
 
-    def _extract_from_selected(self) -> None:
-        target = self._selected_target()
-        if target is None or self._target_store is None:
-            return
-        frame = _first_frame(target)
-        if frame is None:
-            return
-        try:
-            payload: dict[str, object] = {
-                "volume_id": target.volume_id,
-                "axis": _desktop_axis(frame.axis),
-                "index": frame.index,
-            }
-            if self._extract_scope.currentText() == "volume":
-                indices = [f.index for f in target.frames.values() if f.axis == frame.axis]
-                if indices:
-                    payload["start_index"] = min(indices)
-                    payload["end_index"] = max(indices)
-            response = self._target_store.extract_all(
-                target_type=self._extract_type.currentText().strip() or "unknown",
-                scope=self._extract_scope.currentText(),
-                mode=self._extract_mode.currentText(),
-                **payload,
-            )
-            QMessageBox.information(self, "提取", f"已提交：{response.get('job_id', '')}")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "提取", str(exc))
-
-    def _best_grid_ref(self) -> tuple[str, str]:
-        for layer in self._layer_store.iter_by_type(ReservoirGridLayer):
-            return layer.id, layer.grid_id
-        for layer in self._layer_store.iter_by_type(ReservoirPropertyLayer):
-            return layer.grid_layer_id, layer.grid_id
-        return "", ""
-
     def _add_layer(self, layer) -> None:
         if self._undo_stack is not None:
             command = AddLayerCommand(self._layer_store, layer)
@@ -522,6 +458,14 @@ class TargetDock(QDockWidget):
             return
         layer_id = self._layer_store.add(layer)
         self._layer_store.select([layer_id])
+
+    def _update_volume_cell(self, target_id: str) -> None:
+        text = _volume_text(self._targets.get(target_id), self._volume_stats)
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item is not None and str(item.data(Qt.ItemDataRole.UserRole)) == target_id:
+                self._table.setItem(row, 5, QTableWidgetItem(text))
+                return
 
 
 def _first_frame(target: GeoTarget) -> TargetFrame | None:
@@ -533,10 +477,6 @@ def _first_frame(target: GeoTarget) -> TargetFrame | None:
 
 def _desktop_axis(axis: str) -> str:
     return {"crossline": "xline", "timeslice": "z"}.get(axis, axis)
-
-
-def _ijk_axis(axis: str | None) -> str | None:
-    return {"inline": "i", "crossline": "j", "timeslice": "k"}.get(str(axis), None)
 
 
 def _dominant_axis(target: GeoTarget) -> str:
@@ -557,6 +497,46 @@ def _target_mask_color(target_type: str) -> tuple[float, float, float, float]:
     from yj_studio_core.targets import target_type_color
 
     return target_type_color(target_type or "unknown", alpha=0.46)
+
+
+def _mask3d_metadata(target: GeoTarget, mask: np.ndarray, result: Mask3DResult) -> dict[str, object]:
+    spacing = result.voxel_spacing or DEFAULT_VOXEL_SPACING
+    stats = mask_volume_stats(mask, spacing)
+    voxel_count = int(result.voxel_count) if result.voxel_count is not None else int(stats["voxel_count"])
+    volume_m3 = float(result.volume_m3) if result.volume_m3 is not None else float(stats["volume_m3"])
+    voxel_spacing = tuple(float(v) for v in (result.voxel_spacing or stats["voxel_spacing"]))
+    return {
+        "mask3d_shape": [int(v) for v in mask.shape],
+        "voxel_count": voxel_count,
+        "voxel_spacing": list(voxel_spacing),
+        "voxel_spacing_source": result.voxel_spacing_source or "default",
+        "voxel_volume_m3": float(voxel_spacing[0] * voxel_spacing[1] * voxel_spacing[2]),
+        "volume_m3": volume_m3,
+        "volume_source": "mask3d",
+        "target_id": target.id,
+    }
+
+
+def _volume_text(target: GeoTarget | None, cache: dict[str, dict[str, object]]) -> str:
+    metadata: dict[str, object] = {}
+    if target is not None:
+        metadata.update(target.metadata)
+        metadata.update(cache.get(target.id, {}))
+    value = metadata.get("volume_m3")
+    if value is None:
+        return ""
+    try:
+        return _format_volume(float(value))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _format_volume(value_m3: float) -> str:
+    if abs(value_m3) >= 1_000_000.0:
+        return f"{value_m3 / 1_000_000.0:.3f} Mm3"
+    if abs(value_m3) >= 1_000.0:
+        return f"{value_m3:,.0f} m3"
+    return f"{value_m3:.3g} m3"
 
 
 def _normalise_suggestion(value: object) -> dict[str, object] | None:

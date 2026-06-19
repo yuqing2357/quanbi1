@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
 import uuid
+import logging
+import sys
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -9,9 +14,12 @@ from typing import Any, Literal
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
+from yj_studio_core.volume_grid import grid_reference_from_mapping
 
 from .cache import enforce_slice_cache_budget
 from .config import ServerConfig, load_config
+from .sam3.gpu_pool import GpuWorkerPool
+from .volume_cache import VolumeCache
 from .sam3 import JobQueue, JobState, JobStore, SAM3Engine
 from .sam3.image import slice_to_rgb_image
 from .sam3.models import ModelRegistry
@@ -26,18 +34,46 @@ from .targets import (
     TargetStore,
     export_confirmed_to_coco,
     frame_key,
+    mask_volume_stats,
     normalise_target_type,
+    resolve_voxel_spacing,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(config: ServerConfig | None = None) -> FastAPI:
     cfg = config or load_config()
-    app = FastAPI(title="YJ Studio Server", version="0.1.0")
+    _configure_application_logging(cfg.log_level)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Eager-load volumes into RAM and the SAM3 model onto the GPU at
+        # startup, in background threads, so /health stays responsive while
+        # the heavy initialisation streams in. See
+        # docs/current_project_status_and_roadmap.md (startup warmup).
+        _start_background_warmup(app, cfg)
+        try:
+            yield
+        finally:
+            app.state.queue.shutdown()
+            pool = getattr(app.state, "pool", None)
+            if pool is not None:
+                pool.shutdown()
+
+    app = FastAPI(title="YJ Studio Server", version="0.1.0", lifespan=lifespan)
     app.state.config = cfg
     app.state.jobs = JobStore(persist_dir=cfg.runtime_root / "jobs")
     app.state.queue = JobQueue(worker_count=int(cfg.sam3.get("worker_count", 1)))
     app.state.sam3 = _make_sam3_engine(cfg)
     app.state.models = _make_model_registry(cfg)
+    app.state.pool = _make_gpu_pool(cfg)
+    app.state.volumes = VolumeCache(
+        cfg.data_root,
+        cfg.volumes,
+        preload_to_ram=bool(dict(cfg.preload).get("volumes_to_ram", True)),
+        stage_dir=dict(cfg.preload).get("stage_dir") or None,
+    )
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -49,6 +85,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             "data_root_exists": cfg.data_root.exists(),
             "project_id": cfg.project_id,
             "slice_cache_max_gb": cfg.slice_cache_max_gb,
+            "sam3": app.state.sam3.status_payload(),
+            "multi_gpu": getattr(app.state, "pool", None) is not None,
+            "volumes_cache": app.state.volumes.status(),
         }
 
     @app.get("/volumes")
@@ -62,38 +101,38 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         index: int = Query(...),
     ) -> Response:
         spec, path = _volume_spec_and_path(cfg, volume_id)
+        arr, mode = app.state.volumes.get(volume_id)
+        data, shape = _slice_array(arr, axis, index)
+        headers = {
+            "X-Volume-Id": volume_id,
+            "X-Slice-Axis": axis,
+            "X-Slice-Index": str(index),
+            "X-Volume-Shape": ",".join(str(int(v)) for v in shape),
+            "X-Slice-Dtype": str(data.dtype),
+            "X-Slice-Source": mode,
+        }
+        if mode in ("ram", "shm"):
+            # Volume is resident in memory (process RAM or a /dev/shm RAM disk):
+            # slice and stream the bytes directly, no disk round-trip. This is
+            # the fast path the startup preload / shm staging buys.
+            buffer = BytesIO()
+            np.save(buffer, np.ascontiguousarray(data), allow_pickle=False)
+            return Response(content=buffer.getvalue(), media_type="application/x-npy", headers=headers)
+
+        # mmap fallback over the on-disk (HDD) copy: keep the on-disk slice
+        # cache + 100GB LRU budget so repeated slices avoid re-reading the file.
         cache_path = _slice_cache_path(cfg, volume_id, axis, index, path)
         if cache_path.exists():
-            return FileResponse(
-                cache_path,
-                media_type="application/x-npy",
-                headers={
-                    "X-Volume-Id": volume_id,
-                    "X-Slice-Axis": axis,
-                    "X-Slice-Index": str(index),
-                    "X-Slice-Cache": "hit",
-                },
-            )
-        data, shape = _load_slice(path, axis, index)
-
+            headers["X-Slice-Cache"] = "hit"
+            return FileResponse(cache_path, media_type="application/x-npy", headers=headers)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = cache_path.with_suffix(".npy.partial")
         with tmp_path.open("wb") as handle:
             np.save(handle, data, allow_pickle=False)
         tmp_path.replace(cache_path)
         _enforce_slice_cache_budget(cfg)
-        return FileResponse(
-            cache_path,
-            media_type="application/x-npy",
-            headers={
-                "X-Volume-Id": volume_id,
-                "X-Slice-Axis": axis,
-                "X-Slice-Index": str(index),
-                "X-Volume-Shape": ",".join(str(int(v)) for v in shape),
-                "X-Slice-Dtype": str(data.dtype),
-                "X-Slice-Cache": "miss",
-            },
-        )
+        headers["X-Slice-Cache"] = "miss"
+        return FileResponse(cache_path, media_type="application/x-npy", headers=headers)
 
     @app.post("/sam3/jobs")
     def submit_sam3_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -161,7 +200,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.get("/sam3/gpus")
     def sam3_gpus() -> dict[str, Any]:
-        return _gpu_payload(cfg)
+        payload = _gpu_payload(cfg)
+        pool = getattr(app.state, "pool", None)
+        payload["multi_gpu"] = pool is not None
+        if pool is not None:
+            try:
+                payload["pool_workers"] = pool.gpu_info()
+            except Exception as exc:  # noqa: BLE001 - diagnostics endpoint
+                payload["pool_error"] = f"{type(exc).__name__}: {exc}"
+        return payload
 
     @app.post("/sam3/extract")
     def sam3_extract(payload: dict[str, Any]) -> dict[str, Any]:
@@ -430,11 +477,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         with store.mutate() as target_set:
             target_id = target_set.new_id()
+            target_volume_id = volume_id or target_set.volume_id
             target = GeoTarget(
                 id=target_id,
                 type=normalise_target_type(target_type),
                 name=str(name).strip() if name else None,
-                volume_id=volume_id or target_set.volume_id,
+                volume_id=target_volume_id,
                 source=str(source or "sam3_reservoir"),
                 metadata={
                     "reservoir_axis": str(axis),
@@ -444,6 +492,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
                     "grid_layer_id": grid_layer_id,
                     "cell_count": int(cells.shape[0]),
                 },
+            )
+            _annotate_target_grid(
+                target_set,
+                target,
+                _target_grid_reference(cfg, target_volume_id),
             )
             frame = store.frame_from_cells(
                 target_id=target_id,
@@ -482,10 +535,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             path, index_lo, index_hi = store.write_target_mask3d_cache(target)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        spec = cfg.volumes.get(str(target.volume_id or volume_id or ""), {})
+        spacing, spacing_source = resolve_voxel_spacing(spec)
+        mask3d = np.load(path, mmap_mode="r")
+        stats = mask_volume_stats(mask3d, spacing)
         headers = {"X-Target-Id": target_id}
         if index_lo is not None and index_hi is not None:
             headers["X-Mask3D-Index-Lo"] = str(index_lo)
             headers["X-Mask3D-Index-Hi"] = str(index_hi)
+        headers["X-Mask3D-Shape"] = ",".join(str(int(v)) for v in mask3d.shape)
+        headers["X-Mask3D-Voxel-Count"] = str(int(stats["voxel_count"]))
+        headers["X-Mask3D-Volume-M3"] = f"{float(stats['volume_m3']):.12g}"
+        headers["X-Mask3D-Voxel-Spacing"] = ",".join(f"{float(v):.12g}" for v in spacing)
+        headers["X-Mask3D-Voxel-Spacing-Source"] = spacing_source
         return FileResponse(path, media_type="application/x-npy", headers=headers)
 
     @app.post("/sam3/train/jobs")
@@ -516,9 +578,15 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}") from exc
         checkpoint = _checkpoint_for_model(payload, model_id)
         if checkpoint:
+            resolved = _resolve_under_project(cfg.project_root, checkpoint)
             engine = app.state.sam3
             if hasattr(engine, "reload_checkpoint"):
-                engine.reload_checkpoint(_resolve_under_project(cfg.project_root, checkpoint))
+                engine.reload_checkpoint(resolved)
+            # Propagate to the GPU worker processes (each reloads before its
+            # next inference task — no server restart needed).
+            pool = getattr(app.state, "pool", None)
+            if pool is not None:
+                pool.reload_checkpoint(str(resolved))
         return payload
 
     return app
@@ -526,6 +594,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
 def _volume_payload(volume_id: str, spec: dict[str, Any], data_root: Path) -> dict[str, Any]:
     path = data_root / str(spec.get("path", ""))
+    grid_reference = _volume_grid_reference(spec, path, data_root)
     payload: dict[str, Any] = {
         "id": volume_id,
         "label": spec.get("label", volume_id),
@@ -535,11 +604,54 @@ def _volume_payload(volume_id: str, spec: dict[str, Any], data_root: Path) -> di
         "cmap": spec.get("cmap"),
         "clim": spec.get("clim"),
         "mask_volume": spec.get("mask_volume"),
+        "grid_reference": grid_reference,
     }
+    spacing, spacing_source = resolve_voxel_spacing(spec)
+    payload["voxel_spacing"] = list(spacing)
+    payload["voxel_spacing_source"] = spacing_source
     if path.exists() and path.suffix == ".npy":
         arr = np.load(path, mmap_mode="r")
         payload.update({"shape": list(arr.shape), "dtype": str(arr.dtype)})
     return payload
+
+
+def _volume_grid_reference(
+    spec: dict[str, Any],
+    volume_path: Path,
+    data_root: Path,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    configured = spec.get("metadata_path")
+    metadata_path = data_root / str(configured) if configured else volume_path.with_name("metadata.json")
+    if metadata_path.exists():
+        loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            metadata.update(loaded)
+    metadata.update(spec)
+    reference = grid_reference_from_mapping(metadata)
+    reference["metadata_path"] = str(metadata_path) if metadata_path.exists() else None
+    return reference
+
+
+def _target_grid_reference(cfg: ServerConfig, volume_id: str | None) -> dict[str, Any] | None:
+    if not volume_id:
+        return None
+    spec = cfg.volumes.get(str(volume_id))
+    if spec is None:
+        return None
+    path = cfg.data_root / str(spec.get("path", ""))
+    return _volume_grid_reference(spec, path, cfg.data_root)
+
+
+def _annotate_target_grid(
+    target_set: TargetSet,
+    target: GeoTarget,
+    grid_reference: dict[str, Any] | None,
+) -> None:
+    if grid_reference is None:
+        return
+    target_set.metadata["volume_grid"] = dict(grid_reference)
+    target.metadata["volume_grid"] = dict(grid_reference)
 
 
 def _slice_cache_path(
@@ -576,23 +688,139 @@ def _validate_sam3_request(cfg: ServerConfig, payload: dict[str, Any], *, kind: 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _make_sam3_engine(cfg: ServerConfig) -> SAM3Engine:
+def _start_background_warmup(app: FastAPI, cfg: ServerConfig) -> None:
+    """Kick off startup warmup in daemon threads (non-blocking).
+
+    The server starts serving immediately; ``/health`` reports progress via
+    ``volumes_cache`` and ``sam3.image_loaded``. Inference requests that arrive
+    before the model finishes loading simply wait for it to become ready.
+    """
+    preload = dict(cfg.preload or {})
+    if preload.get("volumes_to_ram", True):
+        only = preload.get("warmup_volumes") or None
+        threading.Thread(
+            target=_safe_preload_volumes,
+            args=(app, only),
+            name="volume-preload",
+            daemon=True,
+        ).start()
+    if preload.get("warmup_model", True):
+        threading.Thread(
+            target=_safe_warmup_model,
+            args=(app,),
+            name="sam3-warmup",
+            daemon=True,
+        ).start()
+
+
+def _safe_warmup_pool(app: FastAPI) -> None:
+    pool = getattr(app.state, "pool", None)
+    if pool is None:
+        return
+    try:
+        logger.info("startup: warming up %d GPU workers", len(pool.gpu_ids))
+        infos = pool.warmup()
+        logger.info("startup: GPU workers ready: %s", infos)
+    except Exception:  # noqa: BLE001 - keep the server up even if a worker fails
+        logger.exception("startup: GPU worker warmup crashed")
+
+
+def _safe_preload_volumes(app: FastAPI, only: list[str] | None) -> None:
+    try:
+        logger.info("startup: preloading volumes into memory (only=%s)", only or "all")
+        app.state.volumes.preload_all(only=only)
+        logger.info("startup: volume preload complete: %s", app.state.volumes.status())
+    except Exception:  # noqa: BLE001 - background thread must not crash the server
+        logger.exception("startup: volume preload thread crashed")
+
+
+def _safe_warmup_model(app: FastAPI) -> None:
+    # With a multi-GPU pool, warm the per-card workers instead of the main
+    # process engine (the main process delegates all inference to workers and
+    # never binds CUDA itself).
+    if getattr(app.state, "pool", None) is not None:
+        _safe_warmup_pool(app)
+        return
+    engine = app.state.sam3
+    try:
+        if hasattr(engine, "warmup"):
+            logger.info("startup: warming up SAM3 model on %s", getattr(engine, "device", "?"))
+            status = engine.warmup()
+            logger.info("startup: SAM3 warmup complete: %s", status)
+        elif hasattr(engine, "_ensure_processor"):
+            engine._ensure_processor()
+    except Exception:  # noqa: BLE001 - keep the server up even if warmup fails
+        logger.exception("startup: SAM3 warmup thread crashed")
+
+
+def _engine_cfg(cfg: ServerConfig) -> dict[str, Any]:
     sam3_cfg = dict(cfg.sam3)
-    checkpoint = _resolve_under_project(
-        cfg.project_root,
-        sam3_cfg.get("checkpoint", "weights/sam3.pt"),
-    )
-    source_root = _resolve_under_project(
-        cfg.project_root,
-        sam3_cfg.get("source_root", "libs"),
-    )
+    return {
+        "checkpoint": str(_resolve_under_project(cfg.project_root, sam3_cfg.get("checkpoint", "weights/sam3.pt"))),
+        "source_root": str(_resolve_under_project(cfg.project_root, sam3_cfg.get("source_root", "libs"))),
+        "device": str(sam3_cfg.get("device", "cuda")),
+        "resolution": int(sam3_cfg.get("resolution", 1008)),
+        "load_video": bool(sam3_cfg.get("load_video", True)),
+        # File the GPU workers poll to hot-swap checkpoints without a restart.
+        "reload_signal_path": str(cfg.runtime_root / "sam3_active_checkpoint.json"),
+    }
+
+
+def _make_sam3_engine(cfg: ServerConfig) -> SAM3Engine:
+    spec = _engine_cfg(cfg)
     return SAM3Engine(
-        checkpoint,
-        device=str(sam3_cfg.get("device", "cuda")),
-        resolution=int(sam3_cfg.get("resolution", 1008)),
-        source_root=source_root,
-        load_video=bool(sam3_cfg.get("load_video", True)),
+        spec["checkpoint"],
+        device=spec["device"],
+        resolution=spec["resolution"],
+        source_root=spec["source_root"],
+        load_video=spec["load_video"],
     )
+
+
+def _segment_on_engine(app: FastAPI, rgb: np.ndarray, **kwargs: Any) -> list[dict[str, Any]]:
+    """Run SAM3 segmentation on a GPU worker if the pool is active, else inline."""
+    pool = getattr(app.state, "pool", None)
+    if pool is not None:
+        return pool.segment(rgb, **kwargs)
+    return app.state.sam3.segment(rgb, **kwargs)
+
+
+def _make_gpu_pool(cfg: ServerConfig) -> GpuWorkerPool | None:
+    """Build the multi-GPU worker pool when ``sam3.multi_gpu`` is enabled.
+
+    Returns ``None`` (single-engine fallback) when disabled or if the pool
+    cannot be constructed, so a misconfiguration never blocks startup.
+    """
+    sam3_cfg = dict(cfg.sam3)
+    if not bool(sam3_cfg.get("multi_gpu", False)):
+        return None
+    gpu_ids = [int(g) for g in sam3_cfg.get("gpu_ids", []) if g is not None]
+    if not gpu_ids:
+        logger.warning("sam3.multi_gpu is true but gpu_ids is empty; using single-engine fallback")
+        return None
+    try:
+        pool = GpuWorkerPool(gpu_ids, _engine_cfg(cfg))
+        logger.info("multi-GPU pool created for gpu_ids=%s (workers spawn + warm on startup)", gpu_ids)
+        return pool
+    except Exception:  # noqa: BLE001 - never block startup on pool construction
+        logger.exception("failed to create multi-GPU pool; falling back to single engine")
+        return None
+
+
+def _configure_application_logging(level: str) -> None:
+    numeric_level = getattr(logging, str(level or "info").upper(), logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        root.addHandler(handler)
+    root.setLevel(numeric_level)
+    logging.getLogger("yj_studio_server").setLevel(numeric_level)
 
 
 def _make_model_registry(cfg: ServerConfig) -> ModelRegistry:
@@ -813,8 +1041,9 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         volume_axis = _volume_axis(axis)
         target_axis = _target_axis(axis)
 
-        spec, path = _volume_spec_and_path(cfg, volume_id)
-        data, shape = _load_slice(path, volume_axis, index)
+        spec, _path = _volume_spec_and_path(cfg, volume_id)
+        arr, _mode = app.state.volumes.get(volume_id)
+        data, shape = _slice_array(arr, volume_axis, index)
         # Keep the same orientation as the desktop SAM3 path: image rows are samples/depth.
         slice2d = np.asarray(data, dtype=np.float32).T
         clim = _parse_clim(spec.get("clim"))
@@ -824,7 +1053,8 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         if not isinstance(prompts, dict):
             prompts = {}
         jobs.update(job_id, progress=0.25, message="running SAM3")
-        detections = app.state.sam3.segment(
+        detections = _segment_on_engine(
+            app,
             rgb,
             text=str(prompts.get("text", payload.get("text", ""))),
             boxes=_list_of_float_lists(prompts.get("boxes", [])),
@@ -842,6 +1072,7 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         project = _project_id(cfg, payload)
         store = _target_store(cfg, project=project, volume_id=volume_id)
         target_type = _payload_target_type(payload)
+        grid_reference = _target_grid_reference(cfg, volume_id)
         candidates: list[dict[str, Any]] = []
         targets: list[dict[str, Any]] = []
         mask_paths: list[str] = []
@@ -865,6 +1096,7 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
                     volume_id=volume_id,
                     image_ref=f"{volume_id}:{axis}:{index}",
                 )
+                _annotate_target_grid(target_set, target, grid_reference)
                 if payload.get("target_status") is not None:
                     target.status = TargetStatus(str(payload["target_status"]))
                 frame = next(iter(target.frames.values()))
@@ -893,6 +1125,7 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
             "axis": axis,
             "index": index,
             "volume_shape": [int(v) for v in shape],
+            "grid_reference": grid_reference,
             "candidates": candidates,
             "targets": targets,
             "target_set_url": f"/sam3/targets?project={project}&volume_id={volume_id}",
@@ -906,6 +1139,7 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
             mask_paths=mask_paths,
         )
     except Exception as exc:  # noqa: BLE001 - job boundary returns status instead of crashing uvicorn
+        logger.exception("SAM3 segment job failed: job_id=%s", job_id)
         jobs.update(
             job_id,
             state=JobState.error,
@@ -942,6 +1176,17 @@ def _parse_track_range(payload: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def _box_to_norm_xywh(box: list[float], width: int, height: int) -> list[float]:
+    """Normalised TOP-LEFT ``[xmin, ymin, w, h]`` in [0, 1] for SAM3 video.
+
+    The SAM3 *video* predictor's ``add_prompt`` expects boxes as TOP-LEFT
+    ``[xmin, ymin, w, h]`` and internally converts to centre form via
+    ``box_xywh_to_cxcywh`` (cx = xmin + w/2). This is the OPPOSITE of the
+    *image* processor's ``add_geometric_prompt``, which wants centre
+    ``[cx, cy, w, h]``. Emitting centre coords here would make the model treat
+    the centre as the top-left and shift the seed box by half its size, so the
+    prompt lands off-target — segmentation looks fine but tracking collects
+    nothing ("追踪完成，0 个目标"). Keep this top-left to match the contract.
+    """
     x0, y0, x1, y1 = (float(v) for v in box[:4])
     x0 = max(0.0, min(x0, width - 1.0))
     x1 = max(0.0, min(x1, width - 1.0))
@@ -949,11 +1194,11 @@ def _box_to_norm_xywh(box: list[float], width: int, height: int) -> list[float]:
     y1 = max(0.0, min(y1, height - 1.0))
     lo_x, hi_x = sorted((x0, x1))
     lo_y, hi_y = sorted((y0, y1))
-    cx = (lo_x + hi_x) / 2.0 / float(width)
-    cy = (lo_y + hi_y) / 2.0 / float(height)
+    nx = lo_x / float(width)
+    ny = lo_y / float(height)
     bw = max(1.0, hi_x - lo_x) / float(width)
     bh = max(1.0, hi_y - lo_y) / float(height)
-    return [cx, cy, bw, bh]
+    return [nx, ny, bw, bh]
 
 
 def _job_cancelled(jobs: JobStore, job_id: str) -> bool:
@@ -999,11 +1244,12 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         confidence = float(payload.get("confidence", payload.get("confidence_threshold", 0.4)))
         keep_top_k = int(payload.get("keep_top_k", 3))
 
-        spec, path = _volume_spec_and_path(cfg, volume_id)
+        spec, _path = _volume_spec_and_path(cfg, volume_id)
         clim = _parse_clim(spec.get("clim"))
+        arr, _mode = app.state.volumes.get(volume_id)
 
         # Window resolved against the real axis length.
-        seed_data, shape = _load_slice(path, volume_axis, seed)
+        seed_data, shape = _slice_array(arr, volume_axis, seed)
         axis_len = int(shape[axis_index])
         seed = max(0, min(seed, axis_len - 1))
         idx_lo = max(0, seed - back)
@@ -1022,7 +1268,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         if not boxes:
             if not text:
                 raise ValueError("track job requires prompts.boxes or prompts.text")
-            detections = engine.segment(seed_rgb, text=text, confidence=confidence)
+            detections = _segment_on_engine(app, seed_rgb, text=text, confidence=confidence)
             detections.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
             boxes = [list(det["box"]) for det in detections[: max(1, keep_top_k)] if det.get("box")]
             if not boxes:
@@ -1038,7 +1284,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         for offset, idx in enumerate(indices):
             if _job_cancelled(jobs, job_id):
                 return
-            data, _shape = _load_slice(path, volume_axis, idx)
+            data, _shape = _slice_array(arr, volume_axis, idx)
             rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim)
             Image.fromarray(rgb).save(tempdir / f"{offset:05d}.jpg", quality=92)
             jobs.update(
@@ -1057,17 +1303,49 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
                 message=f"tracked {done} object-frames",
             )
 
-        collected = collect_object_frames(
-            engine,
-            tempdir,
-            seeds=seeds,
-            seed_local=seed_local,
-            fwd_budget=fwd_budget,
-            back_budget=back_budget,
-            indices=indices,
-            cancelled=lambda: _job_cancelled(jobs, job_id),
-            progress=_on_progress,
-        )
+        pool = getattr(app.state, "pool", None)
+        if pool is not None:
+            # Whole-track propagation runs on one GPU worker (propagation is
+            # inherently sequential); this frees the main process and lets
+            # concurrent jobs spread across the other cards. The worker reports
+            # progress via signal_dir/progress and honours signal_dir/cancel.
+            import time
+
+            signal_dir = tempdir / "_signal"
+            signal_dir.mkdir(exist_ok=True)
+            progress_file = signal_dir / "progress"
+            cancel_file = signal_dir / "cancel"
+            future = pool.submit_track(
+                tempdir,
+                seeds=seeds,
+                seed_local=seed_local,
+                fwd_budget=fwd_budget,
+                back_budget=back_budget,
+                indices=indices,
+                signal_dir=signal_dir,
+            )
+            while not future.done():
+                if _job_cancelled(jobs, job_id) and not cancel_file.exists():
+                    cancel_file.write_text("1", encoding="utf-8")
+                try:
+                    if progress_file.exists():
+                        _on_progress(int(progress_file.read_text(encoding="utf-8") or "0"))
+                except Exception:  # noqa: BLE001 - progress polling is best-effort
+                    pass
+                time.sleep(0.5)
+            collected = future.result()
+        else:
+            collected = collect_object_frames(
+                engine,
+                tempdir,
+                seeds=seeds,
+                seed_local=seed_local,
+                fwd_budget=fwd_budget,
+                back_budget=back_budget,
+                indices=indices,
+                cancelled=lambda: _job_cancelled(jobs, job_id),
+                progress=_on_progress,
+            )
         if _job_cancelled(jobs, job_id):
             return
 
@@ -1109,6 +1387,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             volume_id=volume_id,
             image_axis_label=axis,
             gap_metadata=gap_metadata,
+            target_metadata={"volume_grid": _target_grid_reference(cfg, volume_id)},
             link_resolver=_resolve_link,
         )
         suggestions = _target_suggestions(object_suggestions, summary.get("obj_to_target_id", {}))
@@ -1128,6 +1407,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         }
         jobs.update(job_id, state=JobState.done, progress=1.0, message="done", result=result)
     except Exception as exc:  # noqa: BLE001 - job boundary returns status instead of crashing uvicorn
+        logger.exception("SAM3 track job failed: job_id=%s", job_id)
         jobs.update(
             job_id,
             state=JobState.error,
@@ -1154,37 +1434,15 @@ def _run_sam3_batch_job(app: FastAPI, job_id: str) -> None:
         if not frames:
             raise ValueError("Batch job requires frames or range")
         jobs.update(job_id, state=JobState.running, progress=0.02, message="batch queued")
-        child_job_ids: list[str] = []
-        target_ids: list[str] = []
-        errors: list[dict[str, Any]] = []
-        for pos, frame_payload in enumerate(frames):
-            if jobs.get(job_id) and jobs.get(job_id).state == JobState.cancelled:
-                return
-            request = dict(payload)
-            request.update(frame_payload)
-            request["kind"] = "segment"
-            child = jobs.create("segment", request)
-            child_job_ids.append(child.id)
-            _run_sam3_job(app, child.id)
-            child_done = jobs.get(child.id)
-            if child_done and child_done.result:
-                target_ids.extend(
-                    str(target.get("id"))
-                    for target in child_done.result.get("targets", [])
-                    if target.get("id")
-                )
-            elif child_done and child_done.error:
-                errors.append({"job_id": child.id, "error": child_done.error})
-            jobs.update(
-                job_id,
-                progress=0.02 + 0.96 * float(pos + 1) / float(len(frames)),
-                message=f"processed {pos + 1}/{len(frames)} frames",
-            )
+        pool = getattr(app.state, "pool", None)
+        if pool is not None:
+            target_ids, errors = _run_batch_parallel(app, job_id, payload, frames, pool)
+        else:
+            target_ids, errors = _run_batch_serial(app, job_id, payload, frames)
         result = {
             "job_id": job_id,
             "kind": str(payload.get("result_kind") or job.kind or "batch"),
             "project": _project_id(cfg, payload),
-            "child_job_ids": child_job_ids,
             "target_ids": target_ids,
             "errors": errors,
         }
@@ -1194,9 +1452,10 @@ def _run_sam3_batch_job(app: FastAPI, job_id: str) -> None:
             progress=1.0,
             message="done" if not errors else "completed with errors",
             result=result,
-            error=None if not errors else f"{len(errors)} child jobs failed",
+            error=None if not errors else f"{len(errors)} frames failed",
         )
     except Exception as exc:  # noqa: BLE001 - job boundary
+        logger.exception("SAM3 batch job failed: job_id=%s", job_id)
         jobs.update(
             job_id,
             state=JobState.error,
@@ -1204,6 +1463,172 @@ def _run_sam3_batch_job(app: FastAPI, job_id: str) -> None:
             message="failed",
             error=f"{type(exc).__name__}: {exc}",
         )
+
+
+def _run_batch_serial(
+    app: FastAPI,
+    job_id: str,
+    payload: dict[str, Any],
+    frames: list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Single-engine fallback: run each frame's segment job in sequence."""
+    jobs: JobStore = app.state.jobs
+    target_ids: list[str] = []
+    errors: list[dict[str, Any]] = []
+    for pos, frame_payload in enumerate(frames):
+        if _job_cancelled(jobs, job_id):
+            break
+        request = dict(payload)
+        request.update(frame_payload)
+        request["kind"] = "segment"
+        child = jobs.create("segment", request)
+        _run_sam3_job(app, child.id)
+        child_done = jobs.get(child.id)
+        if child_done and child_done.result:
+            target_ids.extend(
+                str(target.get("id"))
+                for target in child_done.result.get("targets", [])
+                if target.get("id")
+            )
+        elif child_done and child_done.error:
+            errors.append({"job_id": child.id, "error": child_done.error})
+        jobs.update(
+            job_id,
+            progress=0.02 + 0.96 * float(pos + 1) / float(len(frames)),
+            message=f"processed {pos + 1}/{len(frames)} frames",
+        )
+    return target_ids, errors
+
+
+def _run_batch_parallel(
+    app: FastAPI,
+    job_id: str,
+    payload: dict[str, Any],
+    frames: list[dict[str, Any]],
+    pool: GpuWorkerPool,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Multi-GPU path: render frames in the main process, fan SAM3 inference out
+    to the GPU workers, and persist results in the main process under the
+    per-project lock (the in-process lock cannot span worker processes)."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+
+    jobs: JobStore = app.state.jobs
+    cfg: ServerConfig = app.state.config
+    project = _project_id(cfg, payload)
+    prompts = payload.get("prompts") if isinstance(payload.get("prompts"), dict) else {}
+    text = str(prompts.get("text", payload.get("text", "")))
+    boxes = _list_of_float_lists(prompts.get("boxes", []))
+    points = _list_of_float_lists(prompts.get("points", []))
+    radius = float(payload.get("point_box_radius_px", 8.0))
+    confidence = float(payload.get("confidence", payload.get("confidence_threshold", 0.4)))
+    keep_top_k = max(1, int(payload.get("keep_top_k", 3)))
+    target_type = _payload_target_type(payload)
+    target_status = payload.get("target_status")
+    grid_reference_cache: dict[str, dict[str, Any] | None] = {}
+
+    target_ids: list[str] = []
+    errors: list[dict[str, Any]] = []
+    arr_cache: dict[str, np.ndarray] = {}
+    clim_cache: dict[str, Any] = {}
+    total = max(1, len(frames))
+    done = 0
+
+    def _render_and_submit(frame_payload: dict[str, Any]):
+        volume_id = str(frame_payload.get("volume_id") or payload.get("volume_id") or "")
+        axis = str(frame_payload.get("axis", "inline"))
+        index = int(frame_payload.get("index", 0))
+        try:
+            volume_axis = _volume_axis(axis)
+            target_axis = _target_axis(axis)
+            if volume_id not in arr_cache:
+                spec, _ = _volume_spec_and_path(cfg, volume_id)
+                arr_cache[volume_id], _ = app.state.volumes.get(volume_id)
+                clim_cache[volume_id] = _parse_clim(spec.get("clim"))
+            data, _shape = _slice_array(arr_cache[volume_id], volume_axis, index)
+            rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim_cache[volume_id])
+        except Exception as exc:  # noqa: BLE001 - record and skip a bad frame
+            errors.append({"volume_id": volume_id, "axis": axis, "index": index, "error": f"{type(exc).__name__}: {exc}"})
+            return None
+        future = pool.submit_segment(
+            rgb,
+            text=text,
+            boxes=boxes,
+            points=points,
+            point_box_radius_px=radius,
+            confidence=confidence,
+        )
+        return future, (volume_id, axis, index, target_axis)
+
+    def _persist(future, meta: tuple[str, str, int, str]) -> None:
+        nonlocal done
+        volume_id, axis, index, target_axis = meta
+        done += 1
+        try:
+            detections = future.result()
+        except Exception as exc:  # noqa: BLE001 - one frame's failure must not sink the batch
+            errors.append({"volume_id": volume_id, "axis": axis, "index": index, "error": f"{type(exc).__name__}: {exc}"})
+            return
+        detections.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        detections = detections[:keep_top_k]
+        store = _target_store(cfg, project=project, volume_id=volume_id)
+        grid_reference = grid_reference_cache.setdefault(
+            volume_id,
+            _target_grid_reference(cfg, volume_id),
+        )
+        with store.mutate() as target_set:
+            if not target_set.volume_id:
+                target_set.volume_id = volume_id
+            for det in detections:
+                target = store.add_single_frame_target(
+                    target_set,
+                    axis=target_axis,
+                    index=index,
+                    mask=np.asarray(det.get("mask"), dtype=bool),
+                    target_type=target_type,
+                    score=float(det.get("score", 0.0)),
+                    source="sam3_interactive",
+                    volume_id=volume_id,
+                    image_ref=f"{volume_id}:{axis}:{index}",
+                )
+                _annotate_target_grid(target_set, target, grid_reference)
+                if target_status is not None:
+                    target.status = TargetStatus(str(target_status))
+                target_ids.append(target.id)
+        jobs.update(
+            job_id,
+            progress=0.02 + 0.96 * float(done) / float(total),
+            message=f"processed {done}/{total} frames",
+        )
+
+    # Bounded sliding window: never render more than ~2x the worker count ahead,
+    # so a huge batch doesn't materialise all RGB frames in main-process memory.
+    max_inflight = max(1, 2 * len(pool.gpu_ids))
+    frame_iter = iter(frames)
+    inflight: dict[Any, tuple[str, str, int, str]] = {}
+
+    def _fill() -> None:
+        while len(inflight) < max_inflight:
+            frame_payload = next(frame_iter, None)
+            if frame_payload is None:
+                break
+            submitted = _render_and_submit(frame_payload)
+            if submitted is not None:
+                future, meta = submitted
+                inflight[future] = meta
+
+    _fill()
+    while inflight:
+        if _job_cancelled(jobs, job_id):
+            for future in inflight:
+                future.cancel()
+            break
+        completed, _pending = wait(list(inflight), timeout=1.0, return_when=FIRST_COMPLETED)
+        for future in completed:
+            meta = inflight.pop(future)
+            _persist(future, meta)
+        if not _job_cancelled(jobs, job_id):
+            _fill()
+    return target_ids, errors
 
 
 def _batch_frame_payloads(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1323,6 +1748,7 @@ def _run_train_job(app: FastAPI, job_id: str) -> None:
         }
         jobs.update(job_id, state=JobState.done, progress=1.0, message="done", result=result)
     except Exception as exc:  # noqa: BLE001 - job boundary
+        logger.exception("SAM3 train job failed: job_id=%s", job_id)
         jobs.update(
             job_id,
             state=JobState.error,
@@ -1342,17 +1768,14 @@ def _volume_spec_and_path(cfg: ServerConfig, volume_id: str) -> tuple[dict[str, 
     return spec, path
 
 
-def _load_slice(
-    path: Path,
+def _slice_array(
+    arr: np.ndarray,
     axis: Literal["inline", "xline", "z"] | str,
     index: int,
 ) -> tuple[np.ndarray, tuple[int, int, int]]:
-    try:
-        arr = np.load(path, mmap_mode="r")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to open volume: {exc}") from exc
+    """Extract one orthogonal slice from a resident (RAM or mmap) volume array."""
     if arr.ndim != 3:
-        raise HTTPException(status_code=400, detail=f"Volume must be 3D, got shape {arr.shape}")
+        raise HTTPException(status_code=400, detail=f"Volume must be 3D, got shape {tuple(arr.shape)}")
 
     shape = tuple(int(v) for v in arr.shape)
     axis_index = {"inline": 0, "xline": 1, "z": 2}[str(axis)]

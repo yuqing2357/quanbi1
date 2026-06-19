@@ -8,10 +8,10 @@
 >
 > 现成接缝（全部已存在，直接挂）：
 > - 追踪核心：[`sam3/tracking.py`](../server/src/yj_studio_server/sam3/tracking.py) `collect_object_frames` / `persist_tracked_targets`
-> - 并发安全写：[`targets/store.py`](../apps/yj_studio/src/yj_studio/targets/store.py) `TargetStore.mutate()`
-> - 远程 SAM3 任务客户端：[`ai/remote_client.py`](../apps/yj_studio/src/yj_studio/ai/remote_client.py) `RemoteSAM3Client`（`submit_segment/poll/result/cancel`）
-> - 远程目标库客户端：[`data/remote_target_store.py`](../apps/yj_studio/src/yj_studio/data/remote_target_store.py) `RemoteTargetStore`
-> - 目标管理面板：[`ui/docks/target_dock.py`](../apps/yj_studio/src/yj_studio/ui/docks/target_dock.py) `TargetDock.refresh()`
+> - 并发安全写：[`targets/store.py`](../shared/src/yj_studio_core/targets/store.py) `TargetStore.mutate()`
+> - 远程 SAM3 任务客户端：[`ai/remote_client.py`](../local/app/src/yj_studio/ai/remote_client.py) `RemoteSAM3Client`（`submit_segment/poll/result/cancel`）
+> - 远程目标库客户端：[`data/remote_target_store.py`](../local/app/src/yj_studio/data/remote_target_store.py) `RemoteTargetStore`
+> - 目标管理面板：[`ui/docks/target_dock.py`](../local/app/src/yj_studio/ui/docks/target_dock.py) `TargetDock.refresh()`
 
 ---
 
@@ -23,7 +23,7 @@
 - `RemoteSAM3TrackTask` 已实现提交/轮询/取消；
 - `AIDock` 已新增目标类型、种子前/后帧数、「追踪」按钮；
 - `MainWindow` 已在追踪完成后自动刷新 `TargetDock`；
-- 新增测试 `apps/yj_studio/tests/test_remote_sam3_track.py`，本机通过。
+- 新增测试 `local/app/tests/test_remote_sam3_track.py`，本机通过。
 
 新增完成：
 
@@ -32,11 +32,11 @@
 - 步骤 8.1 mask 回写接口已完成：服务器 PUT `.npy` mask + 客户端 `RemoteTargetStore.put_mask()` + `GeoTarget.edits`。
 - 步骤 8.2 的导出格式部分已完成：COCO/PNG 导出包含 `schema_version` 与 train/val/test split，edited 目标可进入导出。
 - 步骤 9 基础健壮性已完成：job 终态持久化、切片缓存 LRU、`TargetSet.schema_version` 与未知字段兼容、SAM3 入队前输入校验、`metadata_is_lightweight` 修正。
-- 储层路径 B 的基础接口已完成：`POST /sam3/targets/cells` 接收 `.npy` cell IJK，`RemoteTargetStore.create_cell_target()` 上传二进制 cell，`SAM3Workbench(target_store=...)` 可在生成 `ReservoirSelectionLayer` 时同步写 `GeoTarget`。
+- 2026-06-17 规整后：储层路径 B、`SAM3Workbench` 与 grid ROI 入口已删除，不再作为后续实现目标；SAM3 结果只通过普通 2D 剖面 AI 面板和服务器 `/sam3/jobs` 落到 `GeoTarget`。
 - 步骤 7.1 的基础 2D 叠加已完成：目标类型配色、`MaskLayer` 空间摘要、2D 剖面 mask 轮廓与 `Tn` 编号。
 - 步骤 8.2 的训练后端基础已完成：`training.command` 可配置外部训练脚本，服务端采集 `metrics.json`/checkpoint 并登记模型；activate 会 reload checkpoint。
 
-仍未完成：储层工作台路径 B 的主窗口入口接线/恢复（当前没有实际构造 `SAM3Workbench` 的入口）、步骤 6 真多卡、步骤 7.1 的轨迹/面积曲线子面板、真实 SAM3 微调脚本/评估/回流；步骤 9 后续只剩随真多卡/训练补更完整的集成测试。
+仍未完成：步骤 6 真多卡、步骤 7.1 的轨迹/面积曲线子面板、真实 SAM3 微调脚本/评估/回流；第 5 步还需按《项目规整计划》补齐 3D mask 体图层规范化与体积统计。
 
 ---
 
@@ -171,7 +171,7 @@ with store.mutate() as target_set:
 
 `result["suggestions"] = suggestions`，随 job 返回；`TargetDock` 读后用黄条提示（4.4）。
 
-### 4.4 UI：建议提示（[target_dock.py](../apps/yj_studio/src/yj_studio/ui/docks/target_dock.py)）
+### 4.4 UI：建议提示（[target_dock.py](../local/app/src/yj_studio/ui/docks/target_dock.py)）
 - `refresh()` 后若 job result 带 `suggestions`，在表格上方加一行可点的提示：「检测到 T2/T5 可能应合并 — [合并] [忽略]」。点击调用既有 `self._target_store.merge_targets([...])` / `split_target(...)`。
 
 ### 4.5 测试（`server/tests/test_reassociate.py`，FastAPI-free）
@@ -188,7 +188,7 @@ with store.mutate() as target_set:
 
 目标：用户在**地震体剖面**上框 1~N 个目标 → 点「追踪」→ 服务器多目标 track → 目标库出现 T1/T2…，本机 GPU=0。这是把 §2.1 的服务端能力真正交到用户手上。
 
-### 5.1 客户端：`RemoteSAM3Client.submit_track`（[ai/remote_client.py](../apps/yj_studio/src/yj_studio/ai/remote_client.py)）
+### 5.1 客户端：`RemoteSAM3Client.submit_track`（[ai/remote_client.py](../local/app/src/yj_studio/ai/remote_client.py)）
 
 仿现有 `submit_segment`，新增：
 
@@ -219,7 +219,7 @@ def submit_track(
 
 > 服务端 `_parse_track_range` 已支持 `index={"seed","back","fwd"}` 和 `prompts.boxes`，契约对齐，无需改服务端。
 
-### 5.2 客户端：`RemoteSAM3TrackTask`（[algorithms/runner.py](../apps/yj_studio/src/yj_studio/algorithms/runner.py)）
+### 5.2 客户端：`RemoteSAM3TrackTask`（[algorithms/runner.py](../local/app/src/yj_studio/algorithms/runner.py)）
 
 仿 `RemoteSAM3Task` 的四信号 + QTimer 轮询，但**完成时不建 MaskLayer**，而是把 result（含 `target_ids`）交回去触发目标库刷新：
 
@@ -265,7 +265,7 @@ class RemoteSAM3TrackTask(QObject):
     # cancel()/_fail() 同 RemoteSAM3Task
 ```
 
-### 5.3 UI 入口：AI 面板加「追踪」（[ui/docks/ai_dock.py](../apps/yj_studio/src/yj_studio/ui/docks/ai_dock.py)）
+### 5.3 UI 入口：AI 面板加「追踪」（[ui/docks/ai_dock.py](../local/app/src/yj_studio/ui/docks/ai_dock.py)）
 
 AI 面板已收集 `axis / slice_index / boxes / points / text / confidence / keep_top_k`。新增：
 - 两个 `QSpinBox`：`向前帧数 fwd`、`向后帧数 back`（默认各 20）。
@@ -294,22 +294,17 @@ def _on_track_clicked(self):
 
 新增信号 `track_finished = pyqtSignal(dict)`，在 `_on_track_finished(result, summary)` 里 `self.track_finished.emit(result)` + 显示 summary。
 
-> 框坐标系一致性：AI 面板的框已经是「剖面 RGB 像素坐标」（与 `sam3_segment` 同源），服务端 `_run_track_job` 的 `_box_to_norm_xywh` 也按种子帧 RGB 的 W/H 归一化——两端同序，无需额外转换。
+> 框坐标系一致性：AI 面板的框已经是「剖面 RGB 像素坐标」，服务端 `_run_track_job` 的 `_box_to_norm_xywh` 也按种子帧 RGB 的 W/H 归一化——两端同序，无需额外转换。
 
-### 5.4 串起目标库刷新（[ui/main_window.py](../apps/yj_studio/src/yj_studio/ui/main_window.py)）
+### 5.4 串起目标库刷新（[ui/main_window.py](../local/app/src/yj_studio/ui/main_window.py)）
 
 ```python
 self.ai_dock.track_finished.connect(lambda result: self._target_dock.refresh())
 ```
 追踪完成 → 目标库自动出现新的 T1/T2…；用户在 TargetDock 选中即可加载 2D/3D。
 
-### 5.5 储层工作台（路径 B，次要）
-储层角点剖面渲染依赖 matplotlib，**暂留本地**。把工作台 `_save_selection` / `_propagate_*` 的输出从「emit `ReservoirSelectionLayer`」改为「写 `GeoTarget`（cell 进 `TargetFrame.cell_ids_ref`，经 `RemoteTargetStore`）」：
-- 服务端已新增 `POST /sam3/targets/cells`：body 为 `.npy` 的 `(N,3)` cell IJK；服务器分配目标 ID 并写 `cells/<target_id>/...npy`。
-- 客户端已新增 `RemoteTargetStore.create_cell_target()`：以二进制 `.npy` 上传，避免大 JSON。
-- `SAM3Workbench` 已新增可选 `target_store`：若传入远程目标库，单帧保存/沿轴追踪/视频追踪都会同步写 `GeoTarget`，并把 `target_id`/`external_cells_ref` 写入本地 layer metadata。
-- 仍待接线：当前主程序没有实际构造 `SAM3Workbench` 的入口；恢复该入口时，构造函数传入 `target_store=MainWindow.target_store`，并连接 `target_committed` → `TargetDock.refresh()`。
-- `ReservoirSelectionLayer` 改为「从 GeoTarget 渲染 cell」的视图层（`target_dock._load_selected_cells` 已是此形态）。
+### 5.5 储层工作台（路径 B，已删除）
+2026-06-17 规整后，储层工作台、grid ROI 和「打开储层剖面」入口已删除；本节只保留为历史背景，不再作为待接线事项。后续目标加载只从服务器目标 API / `RemoteTargetStore` 消费 `GeoTarget`、mask 与 mask3d，不恢复 `SAM3Workbench` 或 `ReservoirSelectionLayer` 写目标的路径。
 
 ### 5.6 测试
 - 客户端：mock `urlopen`，断言 `submit_track` POST body 结构 = §2.1 契约。
@@ -376,15 +371,15 @@ worker 心跳上报 `torch.cuda.mem_get_info()`；主进程聚合。
 
 ## 步骤 7 ·（§5）展示
 
-### 7.1 2D 叠加编号/轮廓/类别色（[view/renderers/mask_renderer.py](../apps/yj_studio/src/yj_studio/view/renderers/mask_renderer.py) + 2D section overlay）
+### 7.1 2D 叠加编号/轮廓/类别色（[view/renderers/mask_renderer.py](../local/app/src/yj_studio/view/renderers/mask_renderer.py) + 2D section overlay）
 - ✅ 类别配色表：已新增 `targets/style.py`，提供 `target_type_color()`。
 - ✅ 轮廓与编号：`view_2d_section.py` 对带 `target_id` 的 `MaskLayer` 画 `contour(level=0.5)` 与 `Tn` 标签。
 - ✅ `MaskLayer` metadata：`build_mask_layer()` 已自动写入 `area_px/bbox/centroid`，并按 `target_type` 应用颜色。
 - 待做：dock 子面板画 `area_px` / `centroid` 随 index 的折线（matplotlib），数据来自 `GeoTarget.frames`。
 
-### 7.2 3D 体按真实 index 重建（修 #4，[targets/store.py](../apps/yj_studio/src/yj_studio/targets/store.py) `write_mask3d_cache`）
+### 7.2 3D mask 体图层规范化 + 体积统计（修 #4，[targets/store.py](../shared/src/yj_studio_core/targets/store.py) `write_mask3d_cache`）
 
-现状 `np.stack(masks, axis=0)` 按 trajectory 顺序堆叠，忽略真实 index 间隔。改为按真实 index 定位：
+规整计划第 5 步要求：mask 堆叠为 `(D,H,W)` 体图层；深度按真实 `index` 定位，缺帧保持 0；体积统计为 `有效体素数 * dx * dy * dz`，采样间隔从配置读取，岩性体 `numpy_3x` 按相对地震体 3x 上采样后的有效间隔修正。
 
 ```python
 def write_mask3d_cache(self, target: GeoTarget) -> Path:   # 改成收 target，拿得到 index
@@ -403,6 +398,8 @@ def write_mask3d_cache(self, target: GeoTarget) -> Path:   # 改成收 target，
     np.save(path, vol)
     return path
 ```
+
+DoD：目标加载为 3D mask 体图层时 shape 为 `(D,H,W)`；非连续帧深度位置正确；属性面板或目标详情能显示按采样间隔计算的体积。
 `/sam3/targets/{id}/mask3d` 路由对应改为传 target（已能拿到）。返回 header 带 `lo` 便于本机定位。
 
 **DoD**：非连续帧的 3D 体在深度方向位置正确（缺帧留空）。

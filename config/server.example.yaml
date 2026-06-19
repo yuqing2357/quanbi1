@@ -11,6 +11,24 @@ runtime_root: /root/quanbi/runtime/server
 results_root: /root/quanbi/data/results
 slice_cache_max_gb: 100
 
+# Startup warmup (runs in background threads; /health stays responsive).
+preload:
+  # volumes_to_ram=true copies whole volumes into process RAM at startup (fast
+  # slices, but a slow cold copy each restart and needs ~61GB free RAM).
+  # volumes_to_ram=false mmaps instead: instant startup, slices served from the
+  # OS page cache (RAM speed once warm); recommended when data is on a slow disk.
+  volumes_to_ram: false
+  # Optional RAM-backed staging dir. If set and a volume's file exists under it
+  # (mirroring its data_root-relative path), the server mmaps it from RAM ("shm"
+  # mode) — instant startup AND RAM-speed slices that survive server restarts.
+  # Stage with: python server/scripts/stage_data_to_shm.py  (one-time copy).
+  # Leave empty/comment out to always use the on-disk copy.
+  stage_dir: /dev/shm/yj_studio
+  # Only used when volumes_to_ram=true: restrict the RAM copy to these ids.
+  warmup_volumes: []
+  # Eager-load the SAM3 model onto the GPU at startup (kills first-request lag).
+  warmup_model: true
+
 auth:
   enabled: false
   token_env: YJ_STUDIO_SERVER_TOKEN
@@ -24,6 +42,12 @@ sam3:
   results_subdir: sam3
   gpu_ids: [0, 1, 2, 3]
   worker_count: 4
+  # multi_gpu=true spawns one SAM3 worker process per gpu_id, each pinned to its
+  # card (CUDA_VISIBLE_DEVICES) with its own engine. segment/track jobs run on a
+  # free card; batch/infer_volume frames fan out across all cards. Workers only
+  # infer — the main process persists targets under its lock. false = single
+  # shared engine (legacy behaviour).
+  multi_gpu: true
   target_types:
     - trap
     - turbidite
@@ -54,17 +78,32 @@ volumes:
     path: seismic/YJ-ALL-SEISMIC.npy
     cmap: Petrel
     clim: null
+    # Physical spacing in metres for one voxel along axis0/axis1/sample.
+    voxel_spacing_m:
+      axis0: 12.5
+      axis1: 12.5
+      sample: 10.0
 
   model_lithology:
     label: 岩性模型
-    path: reservoir/numpy_3x/lithology_binary_3x_uint8.npy
-    cmap: viridis
+    path: reservoir/npy_625x625x2_v3/lithology_binary_uint8.npy
+    metadata_path: reservoir/npy_625x625x2_v3/metadata.json
+    cmap: lithology_binary
     clim: [-0.5, 1.5]
     mask_volume: model_porosity
+    voxel_spacing_m:
+      axis0: 6.25
+      axis1: 6.25
+      sample: 2.0
 
   model_porosity:
     label: 孔隙度模型
-    path: reservoir/numpy_3x/porosity_3x_float16.npy
+    path: reservoir/npy_625x625x2_v3/porosity_float16.npy
+    metadata_path: reservoir/npy_625x625x2_v3/metadata.json
     cmap: viridis
     clim: [0.0, 0.30]
     mask_volume: model_porosity
+    voxel_spacing_m:
+      axis0: 6.25
+      axis1: 6.25
+      sample: 2.0

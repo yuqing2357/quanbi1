@@ -45,6 +45,8 @@ from yj_studio.ui.text import algorithm_category_label, parameter_role_label
 
 logger = logging.getLogger(__name__)
 
+HIDDEN_ALGORITHM_PREFIXES = ("ai.sam3.",)
+
 
 class AlgorithmDock(QDockWidget):
     def __init__(
@@ -123,7 +125,12 @@ class AlgorithmDock(QDockWidget):
     def _rebuild_tree(self) -> None:
         self._tree.clear()
         groups: dict[str, QTreeWidgetItem] = {}
-        for cls in sorted(self._registry.iter_algorithms(), key=lambda c: (c.category, c.label)):
+        visible = (
+            cls
+            for cls in self._registry.iter_algorithms()
+            if not _is_hidden_algorithm(cls)
+        )
+        for cls in sorted(visible, key=lambda c: (c.category, c.label)):
             parent = groups.get(cls.category)
             if parent is None:
                 parent = QTreeWidgetItem([algorithm_category_label(cls.category)])
@@ -232,3 +239,7 @@ class AlgorithmDock(QDockWidget):
         self._run_button.setEnabled(self._current_algorithm is not None)
         self._cancel_button.setEnabled(False)
         self._current_task = None
+
+
+def _is_hidden_algorithm(algorithm_cls: type[Algorithm]) -> bool:
+    return any(algorithm_cls.id.startswith(prefix) for prefix in HIDDEN_ALGORITHM_PREFIXES)

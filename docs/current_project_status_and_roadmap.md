@@ -2,6 +2,9 @@
 
 本文档记录当前 YJ Studio Portable 项目的真实状态、已经形成的架构边界，以及后续希望完成的目标。它的作用是给后续开发提供统一判断标准：哪些事情应该发生在服务器，哪些事情只能发生在本机，哪些历史内容需要逐步清理。
 
+> 状态更新：2026-06-20。当前储层运行体已切换到
+> `data/reservoir/npy_625x625x2_v3/`；旧 `numpy_3x*` 仅作为历史中间数据。
+
 ## 1. 总体目标
 
 项目最终要形成的工作方式是：
@@ -34,7 +37,8 @@
 
 ```text
 YJ_Studio_Portable/
-  apps/        主程序与桌面端 UI 代码
+  local/app/   桌面端 UI / 交互 / 可视化代码
+  shared/      纯核心数据模型与 IO 代码
   data/        地震体、储层模型、处理结果等大数据
   weights/     SAM3 等模型权重
   server/      服务器端 API、配置、启动脚本、部署说明
@@ -51,7 +55,8 @@ YJ_Studio_Portable/
 
 - `data/` 只放数据，不放服务代码。
 - `server/` 只放服务器端运行相关内容。
-- `local/` 只放本地启动、连接和调试相关内容。
+- `local/` 只放本地启动、连接、调试入口和桌面 UI 代码。
+- `shared/` 只放纯核心数据模型与 IO，不引入 Qt 或 FastAPI。
 - `runtime/` 放运行时产物，默认不提交。
 - `tools/` 暂时保留原路径，因为文档、脚本、注释里仍有引用。
 
@@ -75,10 +80,10 @@ size: 约 10.93 GB
 当前储层岩性模型已经从原始 GRDECL 方向转为 numpy 运行格式：
 
 ```text
-data/reservoir/numpy_3x/lithology_binary_3x_uint8.npy
-shape: (4452, 2796, 1443)
+data/reservoir/npy_625x625x2_v3/lithology_binary_uint8.npy
+shape: (2959, 2201, 2826)
 dtype: uint8
-size: 约 16.73 GB
+size: 约 18 GB
 ```
 
 当前岩性值设计：
@@ -95,10 +100,10 @@ size: 约 16.73 GB
 当前储层孔隙度模型：
 
 ```text
-data/reservoir/numpy_3x/porosity_3x_float16.npy
-shape: (4452, 2796, 1443)
+data/reservoir/npy_625x625x2_v3/porosity_float16.npy
+shape: (2959, 2201, 2826)
 dtype: float16
-size: 约 33.46 GB
+size: 约 35 GB
 ```
 
 孔隙度保留为 `float16`，比 `float32` 节省一半空间，同时比 `float8` 更稳妥，适合后续显示、阈值、识别和模型输入。
@@ -229,7 +234,8 @@ env_name: yjstudio-server
 
 ```text
 /root/quanbi/
-  apps/        桌面端和共享源码
+  local/app/   桌面端 UI / 交互 / 可视化代码
+  shared/      纯核心数据模型与 IO 代码
   data/        服务器实际读取的大体数据
   docs/        项目文档
   libs/        依赖源码或第三方库
@@ -248,15 +254,15 @@ env_name: yjstudio-server
   dtype: float32
   size: 约 10.93 GB
 
-/root/quanbi/data/reservoir/numpy_3x/lithology_binary_3x_uint8.npy
-  shape: (4452, 2796, 1443)
+/root/quanbi/data/reservoir/npy_625x625x2_v3/lithology_binary_uint8.npy
+  shape: (2959, 2201, 2826)
   dtype: uint8
-  size: 约 16.73 GB
+  size: 约 18 GB
 
-/root/quanbi/data/reservoir/numpy_3x/porosity_3x_float16.npy
-  shape: (4452, 2796, 1443)
+/root/quanbi/data/reservoir/npy_625x625x2_v3/porosity_float16.npy
+  shape: (2959, 2201, 2826)
   dtype: float16
-  size: 约 33.46 GB
+  size: 约 35 GB
 ```
 
 服务器端已同步的核心服务代码：
@@ -283,9 +289,9 @@ env_name: yjstudio-server
 
 其中：
 
-- `start_server.sh`：前台启动服务器 API。
-- `start_background.sh`：后台启动服务器 API。
-- `stop_server.sh`：停止后台服务。
+- `start_server.sh`：前台启动服务器 API；状态、请求日志、任务状态和异常堆栈实时输出到当前终端。
+- `start_background.sh`：兼容旧命令名，当前也会转入前台启动，不再 `nohup` 或重定向到日志文件。
+- `stop_server.sh`：清理旧版本遗留的后台服务。
 - `healthcheck.sh`：检查服务健康状态。
 - `validate_data.py`：检查服务器侧关键数据文件是否存在、shape 和 dtype 是否符合预期。
 - `run_tests.sh`：服务器侧轻量测试入口。
@@ -467,7 +473,7 @@ SAM3 视频传播
 本机历史残留需要单独清理，尤其是：
 
 ```text
-data/reservoir/numpy_3x/*.partial
+data/reservoir/numpy_3x/*.partial  # 历史 3x 中间产物
 ```
 
 这些 `.partial` 是历史转换中间产物，不应该作为当前远程查看流程的一部分继续增长。
@@ -610,11 +616,11 @@ runtime/server/logs/
 - `runtime/server/` 是可再生运行状态。
 - 不把临时缓存当作正式成果。
 
-### 阶段 6：部署和后台服务
+### 阶段 6：部署和前台调试服务
 
 目标：
 
-服务器 API 可以在用户明确启动后后台运行，用户不需要手动保持 SSH 窗口，但暂不设置开机自启。
+服务器 API 在用户明确启动后保持在当前终端窗口中运行。状态、请求日志、任务状态、异常堆栈实时输出到终端，方便直接观察和调试。暂不设置后台常驻、日志重定向或开机自启。
 
 已有基础：
 
@@ -627,11 +633,11 @@ server/systemd/yj-studio-server.service
 
 后续建议：
 
-- 用户确认后台脚本行为。
+- 以 `start_server.sh` 作为标准启动入口。
+- `start_background.sh` 仅兼容旧命令名，实际转入前台运行。
 - 暂不启用 systemd 开机自启。
-- 增加日志轮转。
 - 增加服务健康检查。
-- 增加失败自动重启。
+- 后续如确实需要长期守护，再单独设计 systemd / tmux / supervisor 路径。
 
 ### 阶段 7：清理本机大数据
 
@@ -651,7 +657,7 @@ server/systemd/yj-studio-server.service
 需要用户确认后才能删除：
 
 ```text
-data/reservoir/numpy_3x/*.partial
+data/reservoir/numpy_3x/*.partial  # 历史 3x 中间产物
 旧版 data/reservoir/numpy/*.npy
 旧的转换日志和中间缓存
 cache/remote_transfer/
@@ -728,7 +734,7 @@ data/results/sam3/
 
 ### 服务部署策略
 
-暂时不做 systemd 开机自启。服务器服务可以通过手动脚本或后台脚本启动，但是否启动、停止、重启、验证，都由用户控制。Codex 不主动执行这些操作。
+暂时不做 systemd 开机自启。服务器服务通过手动脚本在当前终端前台启动；是否启动、停止、重启、验证，都由用户控制。Codex 不主动执行这些操作。
 
 ### UI 状态策略
 

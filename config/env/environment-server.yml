@@ -7,4 +7,4 @@ dependencies:
   - setuptools
   - wheel
   - pip:
-      - -r server/requirements-server.txt
+      - -r config/env/requirements-server.txt

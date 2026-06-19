@@ -1,6 +1,6 @@
 # Server-side runtime dependencies.
 # Install from the project root:
-#   /root/anaconda3/envs/yjstudio-server/bin/python -m pip install -r server/requirements-server.txt
+#   /root/anaconda3/envs/yjstudio-server/bin/python -m pip install -r config/env/requirements-server.txt
 
 --extra-index-url https://download.pytorch.org/whl/cu124
 
@@ -31,6 +31,9 @@ segyio
 
 torch==2.6.0+cu124
 torchvision==0.21.0+cu124
+# Linux server cross-frame SAM3 tracking uses Triton kernels. Torch 2.6
+# expects Triton 3.2.x; keep Windows-specific triton-windows out of server envs.
+triton==3.2.0; platform_system == "Linux"
 timm
 transformers
 safetensors
@@ -40,6 +43,7 @@ einops
 ftfy
 iopath
 opencv-python-headless
+pycocotools
 regex
 tqdm
 rich

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 from io import BytesIO
@@ -60,6 +61,17 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
     volume_dir.mkdir(parents=True)
     volume_path = volume_dir / "tiny.npy"
     np.save(volume_path, np.arange(3 * 4 * 5, dtype=np.float32).reshape(3, 4, 5), allow_pickle=False)
+    metadata_path = volume_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "seismic_index_origin": {"axis0": 204, "axis1": 0, "sample": 88},
+                "scale_axis0_axis1_sample": [2, 2, 5],
+                "index_mapping": "seismic_axis = origin + output_index / scale",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     cfg = ServerConfig(
         project_root=tmp_path,
@@ -71,7 +83,9 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
             "tiny": {
                 "label": "Tiny",
                 "path": "seismic/tiny.npy",
+                "metadata_path": "seismic/metadata.json",
                 "clim": None,
+                "voxel_spacing_m": {"axis0": 12.5 / 3.0, "axis1": 12.5 / 3.0, "sample": 10.0 / 3.0},
             }
         },
         sam3={"checkpoint": "weights/sam3.pt", "results_subdir": "sam3"},
@@ -80,6 +94,16 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
     app.state.sam3 = _FakeSAM3Engine()
 
     with TestClient(app) as client:
+        volumes = client.get("/volumes")
+        assert volumes.status_code == 200
+        grid_reference = volumes.json()[0]["grid_reference"]
+        assert grid_reference["seismic_index_origin"] == {
+            "axis0": 204.0,
+            "axis1": 0.0,
+            "sample": 88.0,
+        }
+        assert grid_reference["scale_axis0_axis1_sample"] == [2.0, 2.0, 5.0]
+
         submitted = client.post(
             "/sam3/jobs",
             json={
@@ -111,10 +135,12 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
         assert result["axis"] == "inline"
         assert result["index"] == 1
         assert result["volume_shape"] == [3, 4, 5]
+        assert result["grid_reference"] == grid_reference
         assert len(result["candidates"]) == 1
         assert len(result["targets"]) == 1
         assert result["targets"][0]["id"] == "T1"
         assert result["targets"][0]["type"] == "sandbody"
+        assert result["targets"][0]["metadata"]["volume_grid"] == grid_reference
         assert result["candidates"][0]["shape"] == [5, 4]
         assert result["candidates"][0]["target_id"] == "T1"
         assert result["candidates"][0]["mask_url"] == f"/sam3/jobs/{job_id}/mask/0"
@@ -131,6 +157,7 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
         target_set = targets_response.json()
         assert list(target_set["targets"]) == ["T1"]
         assert target_set["summaries"][0]["id"] == "T1"
+        assert target_set["metadata"]["volume_grid"] == grid_reference
 
         target_mask_response = client.get("/sam3/targets/T1/mask/inline/1?project=default&volume_id=tiny")
         assert target_mask_response.status_code == 200
@@ -141,3 +168,10 @@ def test_sam3_segment_job_contract(tmp_path: Path) -> None:
         assert mask3d_response.status_code == 200
         mask3d = np.load(BytesIO(mask3d_response.content), allow_pickle=False)
         assert mask3d.shape == (1, 5, 4)
+        assert mask3d_response.headers["X-Mask3D-Index-Lo"] == "1"
+        assert mask3d_response.headers["X-Mask3D-Index-Hi"] == "1"
+        assert mask3d_response.headers["X-Mask3D-Shape"] == "1,5,4"
+        assert mask3d_response.headers["X-Mask3D-Voxel-Count"] == str(int(mask3d.sum()))
+        assert mask3d_response.headers["X-Mask3D-Volume-M3"] == f"{float(mask3d.sum()) * (12.5 / 3.0) * (12.5 / 3.0) * (10.0 / 3.0):.12g}"
+        assert mask3d_response.headers["X-Mask3D-Voxel-Spacing"] == "4.16666666667,4.16666666667,3.33333333333"
+        assert mask3d_response.headers["X-Mask3D-Voxel-Spacing-Source"] == "config"

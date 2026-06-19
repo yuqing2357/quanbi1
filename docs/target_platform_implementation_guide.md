@@ -1,5 +1,7 @@
 # 详细实现指南：SAM3 目标管理平台（可直接照此写代码）
 
+> **2026-06-17 规整后说明**：本文是 M1-M8 的历史落地指南，保留作设计背景，不再作为当前代码路径和执行入口的唯一依据。当前事实是：桌面端在 `local/app/`，共享目标模型在 `shared/src/yj_studio_core/targets/`，服务器在 `server/`；SAM3 分割/追踪唯一用户入口是「AI 面板 + 普通 2D 剖面 → 服务器 `/sam3/jobs` → GeoTarget」，本机不再保留 `AIService/SAM3Config` 本地模型加载 fallback，也不再暴露 `SAM3Workbench` 或通用算法面板里的 `ai.sam3.*`。
+
 本文件是 [`target_platform_implementation_roadmap.md`](target_platform_implementation_roadmap.md) 的**落地版**。路线图回答「做什么、为什么、什么顺序」；本文件回答「**每个文件怎么改、函数签名长什么样、API 收发什么 JSON、怎么测**」。
 
 深度优先级：P0 的 M1/M2/M3 给到代码骨架级；M4–M8 给到接口与步骤级。所有代码骨架都标注了归属文件路径，风格对齐项目现有约定（urllib 远程调用、`AlgorithmRunner` 四信号、FastAPI + pydantic、dataclass 图层）。
@@ -12,9 +14,9 @@
 
 本指南中的 M3-M8 已落地为第一版可运行骨架：
 
-- 共享目标模型：`apps/yj_studio/src/yj_studio/targets/`
-- 本地目标客户端：`apps/yj_studio/src/yj_studio/data/remote_target_store.py`
-- 本地目标管理 Dock：`apps/yj_studio/src/yj_studio/ui/docks/target_dock.py`
+- 共享目标模型：`shared/src/yj_studio_core/targets/`
+- 本地目标客户端：`local/app/src/yj_studio/data/remote_target_store.py`
+- 本地目标管理 Dock：`local/app/src/yj_studio/ui/docks/target_dock.py`
 - 服务器目标桥接：`server/src/yj_studio_server/targets.py`
 - 服务器模型 registry：`server/src/yj_studio_server/sam3/models.py`
 - 服务器 API 扩展：`server/src/yj_studio_server/app.py`
@@ -35,9 +37,9 @@
 
 写代码前必须认清项目已经留好的三个挂载点，**不要另起炉灶**：
 
-### 接缝 A：后端按环境变量切换（本机）
+### 接缝 A：体数据后端按环境变量切换（本机）
 
-[`ui/main_window.py:1286`](../apps/yj_studio/src/yj_studio/ui/main_window.py) 的 `_make_volume_store()`：
+[`ui/main_window.py`](../local/app/src/yj_studio/ui/main_window.py) 的 `_make_volume_store()`：
 
 ```python
 backend = os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local")
@@ -46,23 +48,22 @@ if backend == "remote" and server_url:
 return VolumeStore()
 ```
 
-→ **M1 照抄这个模式**做 `_make_sam3_backend()`：`remote` 时返回 `RemoteSAM3Client`，否则返回本机 `AIService`。
+→ **规整后约束**：体数据仍可按配置选择 remote/local；SAM3 不再照抄 local fallback，`_make_sam3_backend()` 始终返回 `RemoteSAM3Client`，未配置 `YJ_STUDIO_SERVER_URL` 时 AI 面板不可运行并提示配置问题。
 
 ### 接缝 B：服务注入算法上下文（本机）
 
-[`ui/main_window.py:86`](../apps/yj_studio/src/yj_studio/ui/main_window.py)：
+[`ui/main_window.py`](../local/app/src/yj_studio/ui/main_window.py)：
 
 ```python
 self.algorithm_runner.register_service("ai_service", self.ai_service)
 self.algorithm_runner.register_service("volume_store", self.volume_store)
 ```
 
-算法里通过 `ctx.services["ai_service"]` 取用（见 `sam3_segment.py:109`）。
-→ **M1 让 `ai_service` 既可能是本机 `AIService`、也可能是 `RemoteSAM3Client`，两者实现同一个接口（鸭子类型）**，算法代码几乎不用改。
+SAM3 分割通过 `RemoteSAM3SegmentAlgorithm` 描述类进入 `AlgorithmRunner`，实际由 `RemoteSAM3Task` 调用 `RemoteSAM3Client.submit_segment()` 提交 `/sam3/jobs`。`ai_service` 现在只应是远程 client。
 
 ### 接缝 C：任务统一四信号（本机）
 
-[`algorithms/runner.py`](../apps/yj_studio/src/yj_studio/algorithms/runner.py) 的 `AlgorithmTask`（子进程）/`InProcessAlgorithmTask`（线程）都暴露：
+[`algorithms/runner.py`](../local/app/src/yj_studio/algorithms/runner.py) 的 `AlgorithmTask`（子进程）/`InProcessAlgorithmTask`（线程）/`RemoteSAM3Task` 都暴露：
 
 ```python
 progress = pyqtSignal(float, str)
@@ -73,7 +74,7 @@ def start(self): ...
 def cancel(self): ...
 ```
 
-→ **M1 新增 `RemoteAlgorithmTask`**，对外暴露同样四信号，内部用 `QTimer` 轮询服务器 `/jobs/{id}`。UI（`ai_dock.py`）零改动。
+→ 当前已新增 `RemoteSAM3Task` / `RemoteSAM3TrackTask`，对外暴露同样四信号，内部用 `QTimer` 轮询服务器 `/sam3/jobs/{id}`。
 
 ### 接缝 D：服务器配置 + 接口（服务器）
 
@@ -88,8 +89,8 @@ def cancel(self): ...
 ### 1.1 目标与判据
 
 - 提交一次 SAM3 分割，**本机 GPU 占用为 0，服务器 GPU 上升**。
-- AI 面板（`ai_dock.py`）和工作台都能用，UI 不改逻辑。
-- 服务器不可用时能降级回本机（保留 `mode=local`）。
+- AI 面板（`ai_dock.py`）能用；旧工作台路径已删除。
+- 服务器不可用时 UI 提示错误，不降级到本机 SAM3。
 
 ### 1.2 服务器侧改造
 
@@ -140,7 +141,7 @@ class SAM3Engine:
         return _decode_state(state)   # 复用本机 decode_sam3_masks 的逻辑，搬一份到服务器
 ```
 
-> 复用现有代码：`_decode_state` 直接照搬本机 [`ai/adapters/mask_to_layer.py`](../apps/yj_studio/src/yj_studio/ai/adapters/mask_to_layer.py) 的 `decode_sam3_masks`（它已不依赖 Qt）。`_apply_box_prompt` 的归一化逻辑照搬 [`sam3_segment.py:210`](../apps/yj_studio/src/yj_studio/algorithms/builtin/ai/sam3_segment.py)。
+> 规整后注意：本机 `algorithms/builtin/ai/sam3_*` 已删除，不再从本机算法复制实现。服务器侧应复用 `server/src/yj_studio_server/sam3/engine.py`、`server/src/yj_studio_server/sam3/adapters.py` 以及本机/共享侧仍保留的远程结果适配逻辑；提示框归一化由服务器任务入口统一处理。
 
 #### 1.2.2 新增任务存储 `server/src/yj_studio_server/sam3/jobs.py`
 
@@ -290,12 +291,12 @@ results_subdir: results/sam3
 
 ### 1.3 本机侧改造
 
-#### 1.3.1 新增 `apps/yj_studio/src/yj_studio/ai/remote_client.py`
+#### 1.3.1 本机 `local/app/src/yj_studio/ai/remote_client.py`
 
-仿 `RemoteVolumeStore` 的 urllib 风格，**对外暴露和本机 `AIService` 相同的语义**（`is_ready()`、提交任务）。但 SAM3 提交走任务模型，所以核心是「提交 + 返回 job_id」：
+仿 `RemoteVolumeStore` 的 urllib 风格，对外暴露 AI 面板需要的远程语义（`state/is_ready/start/shutdown/submit_segment/submit_track/poll/result/fetch_mask/cancel`）。SAM3 提交走任务模型，核心是「提交 + 返回 job_id」：
 
 ```python
-# apps/yj_studio/src/yj_studio/ai/remote_client.py
+# local/app/src/yj_studio/ai/remote_client.py
 from __future__ import annotations
 import json
 from urllib.request import urlopen, Request
@@ -377,7 +378,7 @@ class RemoteSAM3Task(QObject):
              lambda *_: self.errored.emit(st.get("error",""), ""))()
 
     def _build_layers(self, result):
-        # 把 candidates 的 mask 拉回来，转置对齐（同 sam3_segment.py:186），build_mask_layer
+        # 把 candidates 的 mask 拉回来，通过 sam3_mask_to_layer 对齐，再 build_mask_layer
         ...
     def cancel(self):
         if self._job_id: self._client.cancel(self._job_id)
@@ -388,11 +389,8 @@ class RemoteSAM3Task(QObject):
 ```python
 # 仿 _make_volume_store()
 def _make_sam3_backend():
-    backend = os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local")
     url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
-    if backend == "remote" and url:
-        return RemoteSAM3Client(url, timeout_s=...)
-    return AIService(SAM3Config(), parent=self)
+    return RemoteSAM3Client(url, timeout_s=..., parent=self)
 ```
 
 `ai_dock.py` 的 `_on_run_clicked` 已经走 `runner.submit(...)`。让 `submit` 在检测到 `ai_service` 是 `RemoteSAM3Client` 时返回 `RemoteSAM3Task`（或在 dock 里分流）。**因为四信号一致，`_on_progress/_on_finished` 全部复用。**
@@ -422,18 +420,15 @@ def _make_sam3_backend():
 
 ### 2.1 现状问题定位
 
-[`view/view_sam3_workbench.py`](../apps/yj_studio/src/yj_studio/view/view_sam3_workbench.py) 把 ROI 当**裁切边界**：
-- 构造时绑定 `self._roi`，`render_roi_section(grid, axis, index, self._roi, ...)` 只渲染 ROI 子图；
-- `_propagation_range()` 用 ROI 的 `il,ih/jl,jh` 限定帧范围；
-- mask 反查只在 ROI 子图的 `cell_id_grid` 内。
+> 规整后注意：旧 `SAM3Workbench`、储层 grid ROI 渲染路径和 `render_roi_section` 调用链已删除；本章保留为历史设计背景，不再作为当前实现入口。当前坐标主线是「普通 2D 剖面 + AI 面板 → 服务器 `/sam3/jobs` → GeoTarget」，追踪结果由服务器写入全局 `GeoTarget.frames`。
 
-[`reservoir/sam3_render.py`](../apps/yj_studio/src/yj_studio/reservoir/sam3_render.py) 的 `SAM3Frame` = `image(H,W,3)` + `cell_id_grid(H,W,3)`，尺寸由 ROI 长宽比驱动。**ROI 一变，像素网格就变 → 跨帧像素不对齐 → 追踪漂移。**
+旧工作台曾把 ROI 当**裁切边界**：构造时绑定 ROI、只渲染 ROI 子图、传播范围受 ROI 限定，mask 反查也只在 ROI 子图的局部坐标内。该路径已随 grid/SAM3Workbench 删除，不应在后续规整中恢复。
 
 ### 2.2 改造方案
 
 **核心**：把「检测坐标系」与「显示窗口」解耦。
 
-1. **检测坐标系 = 完整剖面**。新增 `render_full_section(grid, axis, index, transform=...)`（或给 `render_roi_section` 传「全剖面 bbox」），让每帧的 `image`/`cell_id_grid` 尺寸**只由完整剖面决定，与缩放框无关** → 跨帧像素稳定对齐。
+1. **历史方案**：旧 grid 工作台曾计划把检测坐标系改为完整剖面，让每帧的 `image`/`cell_id_grid` 尺寸只由完整剖面决定。规整后不再实现或恢复这条 grid 渲染路径。
 2. **缩放框 = 仅显示**。`_on_box_drawn` 不再改变 ROI/裁切，改为 `self._axes.set_xlim/set_ylim`（matplotlib 视图缩放），用一个「重置缩放」按钮还原。
 3. **追踪基于全剖面**。`_propagate_along_axis` / `_propagate_with_video_predictor` 用全剖面帧；`_propagation_range` 用完整轴范围（受性能影响可加「最大帧数」上限，但坐标系是全局的）。
 4. ROI 概念可降级为「初始定位/感兴趣提示」，不再参与像素裁切。
@@ -451,13 +446,13 @@ def _make_sam3_backend():
 - 缩放框操作后，`_render` 出的 mask.shape 不随缩放改变（恒等于全剖面 shape）。
 - 同一目标在 segment 与 track 两条路径下 mask 落在同一全局坐标。
 
-> 注意 M2 会改 `render_roi_section` 的调用点和 workbench 较多方法。建议先加 `render_full_section` 与现有并存，灰度切换，跑通后再删 ROI 裁切路径。
+> 规整后注意：上述 M2 改造已被“删除旧工作台/grid ROI 路径”取代，不再新增 `render_full_section` 或恢复 workbench。
 
 ---
 
 ## 第 3 章：M3 — GeoTarget 数据模型 + 编号一致（P0，中枢）
 
-### 3.1 数据结构（新模块 `apps/yj_studio/src/yj_studio/targets/`）
+### 3.1 数据结构（共享模块 `shared/src/yj_studio_core/targets/`）
 
 ```python
 # targets/model.py  —— 本机与服务器共用同一套字段定义（pydantic 便于 JSON 往返）
@@ -511,7 +506,7 @@ data/results/sam3/<project>/
 
 ### 3.3 多目标 video predictor 改造（关键）
 
-现状 [`view_sam3_workbench.py:64`](../apps/yj_studio/src/yj_studio/view/view_sam3_workbench.py) 的 `_extract_video_mask` 只挑 `obj_id=1`。改为多对象：
+规整后不再通过本机 `view_sam3_workbench.py` 做 video predictor。多目标追踪应在服务器 `server/src/yj_studio_server/sam3/tracking.py` 与 `app._run_track_job` 中完成：每个候选对象分配稳定 `obj_id → target_id` 映射，最终写入共享 `GeoTarget`。
 
 ```python
 # 1) seed 多个对象：每个候选 GeoTarget 一个 obj_id，建立固定映射
@@ -622,9 +617,9 @@ def match(new_masks: dict[str, np.ndarray],         # 候选(临时 key)->mask
 | 后端切换 | `ui/main_window.py:1286` `_make_volume_store` | 仿写 `_make_sam3_backend` |
 | 服务注入 | `ui/main_window.py:86` | `ai_service` 可为 RemoteSAM3Client |
 | 任务信号 | `algorithms/runner.py` | 新增 `RemoteSAM3Task` |
-| 单剖面分割 | `algorithms/builtin/ai/sam3_segment.py` | decode/归一化逻辑搬服务器 |
-| 工作台追踪 | `view/view_sam3_workbench.py` | M2 解耦坐标、M3 多 obj_id |
-| 切片渲染 | `reservoir/sam3_render.py` | M2 加 `render_full_section` |
+| 单剖面分割 | `algorithms/remote_sam3.py` + `ai/remote_client.py` | 只保留远程描述与 `/sam3/jobs` 提交 |
+| 追踪 | `algorithms/runner.py` 的 `RemoteSAM3TrackTask` + 服务器 `sam3/tracking.py` | 服务器侧多 obj_id，结果写 GeoTarget |
+| 切片渲染 | 普通 2D 剖面 + 服务器 `/slice`/`/sam3/jobs` | 不恢复 grid ROI 渲染 |
 | mask 适配 | `ai/adapters/mask_to_layer.py` | 复用 decode；M3 产 GeoTarget |
 | 图像化 | `ai/adapters/volume_to_image.py` | 搬一份到服务器 |
 | 选择图层 | `scene/layers/reservoir_selection_layer.py` | M3/M4 由 GeoTarget 喂数据 |

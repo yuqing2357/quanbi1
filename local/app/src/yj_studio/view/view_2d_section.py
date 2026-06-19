@@ -41,6 +41,7 @@ from yj_studio.services.section_service import (
 from yj_studio.services.view_sync_service import ViewSyncService
 from yj_studio.ui.text import measurement_value_label, section_axis_label
 from yj_studio.view.highlight import highlight_color, is_layer_highlighted, selected_well_names
+from yj_studio_core.volume_grid import local_to_seismic_index, seismic_to_local_index
 
 
 class View2DSection(QWidget):
@@ -103,7 +104,21 @@ class View2DSection(QWidget):
         self.refresh()
         self.section_updated.emit(self.section_id, self.title, self.index)
         if publish:
-            self._sync_service.publish(f"slice.{self.axis}_position", self.index, self)
+            volume_layer = self._volume_layer()
+            self._sync_service.publish(
+                f"slice.{self.axis}_position",
+                {
+                    "index": self.index,
+                    "volume_layer_id": self._volume_layer_id,
+                    "volume_id": volume_layer.volume_id if volume_layer is not None else "",
+                    "seismic_index": local_to_seismic_index(
+                        volume_layer.metadata if volume_layer is not None else None,
+                        self.axis,
+                        self.index,
+                    ),
+                },
+                self,
+            )
 
     def refresh(self) -> None:
         self._axes.clear()
@@ -124,19 +139,38 @@ class View2DSection(QWidget):
         self.index = section.index
         self._current_extent = section.extent
         vmin, vmax = volume_layer.clim if volume_layer.clim is not None else (None, None)
+        display_mask = self._display_mask_section(
+            volume_layer,
+            section.axis,
+            section.index,
+            section.values.shape,
+        )
         # ``aspect="equal"`` locks one data unit on X to one data unit on Y so
         # the seismic slice keeps its shape when the user resizes the dock /
         # main window. The previous ``"auto"`` value let the image stretch to
         # fill whatever space the canvas had, which was visually noisy.
-        self._axes.imshow(
-            section.values,
-            cmap=_matplotlib_cmap_name(volume_layer.cmap),
-            vmin=vmin,
-            vmax=vmax,
-            origin="upper",
-            aspect="equal",
-            extent=section.extent,
-        )
+        if _is_lithology_volume(volume_layer):
+            self._axes.imshow(
+                _lithology_rgba(section.values, display_mask),
+                origin="upper",
+                aspect="equal",
+                extent=section.extent,
+                interpolation="nearest",
+                resample=False,
+            )
+        else:
+            values = _masked_values(section.values, display_mask)
+            self._axes.imshow(
+                values,
+                cmap=_volume_cmap(volume_layer),
+                vmin=vmin,
+                vmax=vmax,
+                origin="upper",
+                aspect="equal",
+                extent=section.extent,
+                interpolation=_volume_interpolation(volume_layer),
+                resample=not _is_reservoir_volume(volume_layer),
+            )
         self._draw_overlays()
         self._axes.set_title(self.title)
         self._axes.set_xlabel(section.x_label)
@@ -198,10 +232,11 @@ class View2DSection(QWidget):
             elif isinstance(layer, WellLogLayer):
                 self._draw_well_log(layer, highlighted=highlighted)
             elif isinstance(layer, MaskLayer):
-                if layer.axis == self.axis and layer.slice_index == self.index and layer.mask is not None:
+                plane = _mask_plane_for_section(layer, self.axis, self.index)
+                if plane is not None:
                     color = highlight_color(layer.color, highlighted)
                     self._axes.imshow(
-                        _mask_rgba(layer.mask, color, float(layer.opacity)),
+                        _mask_rgba(plane, color, float(layer.opacity)),
                         origin="upper",
                         aspect="equal",
                         extent=self._current_extent,
@@ -211,6 +246,7 @@ class View2DSection(QWidget):
                     _draw_target_mask_overlay(
                         self._axes,
                         layer,
+                        plane,
                         self._current_extent,
                         color,
                         highlighted=highlighted,
@@ -447,13 +483,41 @@ class View2DSection(QWidget):
     def _on_slice_synced(self, _topic: str, value: object, origin: object | None) -> None:
         if origin is self:
             return
-        self.set_index(int(value))
+        layer = self._volume_layer()
+        index = _slice_sync_index_for_layer(
+            value,
+            layer,
+            self.axis,
+            volume_layer_id=self._volume_layer_id,
+        )
+        if index is None:
+            return
+        self.set_index(index)
 
     def _volume_layer(self) -> VolumeLayer | None:
         layer = self._layer_store.get(self._volume_layer_id)
         if isinstance(layer, VolumeLayer):
             return layer
         return None
+
+    def _display_mask_section(
+        self,
+        layer: VolumeLayer,
+        axis: SectionAxis,
+        index: int,
+        shape: tuple[int, int],
+    ) -> np.ndarray | None:
+        mask_volume_id = _model_mask_volume_id(layer.volume_id)
+        if mask_volume_id is None or mask_volume_id not in self._volume_store.volume_ids:
+            return None
+        try:
+            mask_slice = self._volume_store.get_slice(mask_volume_id, axis, int(index))
+        except (KeyError, IndexError, ValueError):
+            return None
+        mask = np.isfinite(np.asarray(mask_slice, dtype=np.float32).T)
+        if mask.shape != shape:
+            return None
+        return mask
 
 
 def _ensure_horizon_arrays(layer: HorizonLayer) -> None:
@@ -480,6 +544,106 @@ def _ensure_fault_arrays(layer: FaultSurfaceLayer) -> None:
 
 def _matplotlib_cmap_name(cmap: str) -> str:
     return {"Petrel": "seismic", "petrel": "seismic"}.get(cmap, cmap)
+
+
+def _volume_cmap(layer: VolumeLayer):
+    cmap = colormaps[_matplotlib_cmap_name(layer.cmap)].copy()
+    cmap.set_bad("#000000")
+    return cmap
+
+
+def _is_reservoir_volume(layer: VolumeLayer) -> bool:
+    volume_id = str(getattr(layer, "volume_id", "")).lower()
+    name = str(getattr(layer, "name", "")).lower()
+    return (
+        volume_id.startswith("model_")
+        or "lithology" in volume_id
+        or "porosity" in volume_id
+        or "岩性" in name
+        or "孔隙度" in name
+    )
+
+
+def _is_lithology_volume(layer: VolumeLayer) -> bool:
+    volume_id = str(getattr(layer, "volume_id", "")).lower()
+    name = str(getattr(layer, "name", "")).lower()
+    return "lithology" in volume_id or "岩性" in name
+
+
+def _volume_interpolation(layer: VolumeLayer) -> str:
+    # Reservoir models are already resampled scientific grids. Letting
+    # matplotlib anti-alias a full 3x slice into a small viewport makes
+    # binary lithology and thin beds look smeared compared with Petrel.
+    return "nearest" if _is_reservoir_volume(layer) else "antialiased"
+
+
+def _model_mask_volume_id(volume_id: str) -> str | None:
+    if volume_id == "model_lithology":
+        return "model_porosity"
+    if volume_id == "model_porosity":
+        return volume_id
+    return None
+
+
+def _slice_sync_index_for_layer(
+    value: object,
+    layer: VolumeLayer | None,
+    axis: SectionAxis,
+    *,
+    volume_layer_id: str,
+) -> int | None:
+    if layer is None or layer.shape is None:
+        return None
+    if isinstance(value, dict):
+        payload_layer_id = value.get("volume_layer_id")
+        payload_volume_id = value.get("volume_id")
+        same_layer = not payload_layer_id or str(payload_layer_id) == str(volume_layer_id)
+        same_volume = not payload_volume_id or str(payload_volume_id) == str(layer.volume_id)
+        if same_layer and same_volume:
+            raw_index = value.get("index")
+        elif value.get("seismic_index") is not None:
+            raw_index = seismic_to_local_index(
+                layer.metadata,
+                axis,
+                value["seismic_index"],
+            )
+        else:
+            return None
+    else:
+        raw_index = value
+    try:
+        index = int(raw_index)
+    except (TypeError, ValueError):
+        return None
+    axis_limit = {"inline": layer.shape[0], "xline": layer.shape[1], "z": layer.shape[2]}[axis]
+    if not 0 <= index < axis_limit:
+        return None
+    return index
+
+
+def _masked_values(values: np.ndarray, display_mask: np.ndarray | None) -> np.ndarray:
+    if display_mask is None or display_mask.shape != values.shape:
+        return values
+    masked = np.asarray(values, dtype=np.float32).copy()
+    masked[~display_mask] = np.nan
+    return masked
+
+
+def _lithology_rgba(values: np.ndarray, display_mask: np.ndarray | None = None) -> np.ndarray:
+    data = np.asarray(values, dtype=np.float32)
+    visible = np.isfinite(data)
+    if display_mask is not None and display_mask.shape == data.shape:
+        visible &= np.asarray(display_mask, dtype=bool)
+
+    rgba = np.zeros((*data.shape, 4), dtype=np.uint8)
+    rgba[..., 3] = 255
+    class_values = np.zeros(data.shape, dtype=np.int16)
+    class_values[visible] = np.rint(data[visible]).astype(np.int16, copy=False)
+    zero = visible & (class_values == 0)
+    one = visible & (class_values >= 1)
+    rgba[zero] = (47, 47, 47, 255)
+    rgba[one] = (255, 221, 0, 255)
+    return rgba
 
 
 def _lith_color(value: float) -> tuple[float, float, float, float]:
@@ -524,6 +688,29 @@ def _sample_height(y: np.ndarray) -> float:
     return max(spacing * 0.9, 0.4)
 
 
+def _mask_plane_for_section(layer: MaskLayer, axis: str, index: int) -> np.ndarray | None:
+    """Return the 2D mask plane to overlay on (axis, index), or None.
+
+    A target ``MaskLayer`` carries either a single 2D frame mask or a stacked
+    3D ``mask3d`` volume (shape ``(D, H, W)`` along ``mask3d_index_lo .. +D``).
+    For the 3D case we slice out the plane matching the current section index so
+    the same renderer can draw it; passing the raw 3D array to ``_mask_rgba``
+    would raise "axes don't match array".
+    """
+    if layer.mask is None or layer.axis != axis:
+        return None
+    mask = np.asarray(layer.mask)
+    if mask.ndim == 2:
+        return mask if layer.slice_index == index else None
+    if mask.ndim == 3:
+        lo = int(layer.metadata.get("mask3d_index_lo", layer.slice_index or 0))
+        offset = int(index) - lo
+        if 0 <= offset < mask.shape[0]:
+            return mask[offset]
+        return None
+    return None
+
+
 def _mask_rgba(mask: np.ndarray, color: tuple[float, float, float, float], opacity: float) -> np.ndarray:
     values = np.asarray(mask, dtype=np.float32)
     rgba = np.zeros(values.shape + (4,), dtype=np.float32)
@@ -535,21 +722,22 @@ def _mask_rgba(mask: np.ndarray, color: tuple[float, float, float, float], opaci
 def _draw_target_mask_overlay(
     axes,
     layer: MaskLayer,
+    mask2d: np.ndarray | None,
     extent: tuple[float, float, float, float] | None,
     color: tuple[float, float, float, float],
     *,
     highlighted: bool = False,
 ) -> None:
     target_id = str(layer.metadata.get("target_id") or "")
-    if not target_id or extent is None or layer.mask is None:
+    if not target_id or extent is None or mask2d is None:
         return
-    image_mask = np.asarray(layer.mask, dtype=bool).T
+    image_mask = np.asarray(mask2d, dtype=bool).T
     if image_mask.ndim != 2 or min(image_mask.shape) < 2 or not image_mask.any():
         return
-    x0, x1, y0, y1 = (float(value) for value in extent)
+    x0, x1, y_bottom, y_top = (float(value) for value in extent)
     height, width = image_mask.shape
     xs = np.linspace(x0, x1, width)
-    ys = np.linspace(y0, y1, height)
+    ys = np.linspace(y_top, y_bottom, height)
     line_width = 2.2 if highlighted else 1.2
     try:
         axes.contour(
@@ -593,10 +781,10 @@ def _mask_centroid_data_coords(
     ys, xs = np.nonzero(np.asarray(image_mask, dtype=bool))
     if xs.size == 0:
         return None
-    x0, x1, y0, y1 = (float(value) for value in extent)
+    x0, x1, y_bottom, y_top = (float(value) for value in extent)
     height, width = image_mask.shape
     x = x0 + (float(xs.mean()) / max(width - 1, 1)) * (x1 - x0)
-    y = y0 + (float(ys.mean()) / max(height - 1, 1)) * (y1 - y0)
+    y = y_top + (float(ys.mean()) / max(height - 1, 1)) * (y_bottom - y_top)
     return x, y
 
 

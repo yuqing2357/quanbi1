@@ -1,15 +1,9 @@
-"""A set of cell IJK triples selected from a ``ReservoirGridLayer``.
+"""Legacy cell-IJK selection payload.
 
-Produced by:
-- SAM3 mask reverse-lookup on a workbench frame (one IJK plane).
-- SAM3 video propagation across a propagation axis (a 3D body).
-- (future) Manual cell-picking tools.
-
-The layer carries the cell-id list itself — it doesn't depend on the
-SAM3 mask staying alive — so selections survive after the workbench
-is closed. Renderers paint the listed cells with the layer's colour;
-ROI clipping and any other geometry concerns are inherited from the
-owning grid via the registry lookup.
+The GRDECL/corner-point grid renderer path has been removed from the
+runtime UI. This layer stays only as a lightweight compatibility object for
+old project data and remote targets that still reference cell IDs; new 3D
+target display should use ``MaskLayer`` with ``metadata["mask3d"]``.
 """
 
 from __future__ import annotations
@@ -28,8 +22,8 @@ from ._helpers import EMPTY_BOUNDS
 class ReservoirSelectionLayer(Layer):
     kind: ClassVar[str] = "reservoir_selection"
 
-    grid_layer_id: str = ""        # parent ReservoirGridLayer id
-    grid_id: str = ""              # ReservoirRegistry id for quick lookup
+    grid_layer_id: str = ""        # legacy parent grid layer id
+    grid_id: str = ""              # legacy grid registry id
     # The selected cells as a (N, 3) int32 array of (i, j, k) triples,
     # sorted lexicographically. Always the source of truth — renderers
     # iterate over these to build their meshes.

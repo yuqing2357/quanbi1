@@ -26,6 +26,26 @@ def test_colorize_slice_with_display_mask_returns_rgba_uint8() -> None:
     assert image[1, 0, :3].tolist() == [0, 0, 0]
 
 
+def test_colorize_lithology_uses_discrete_project_palette() -> None:
+    values = np.asarray([[np.nan, 0.0, 1.0]], dtype=np.float32)
+    image = colorize_slice(values, (-0.5, 1.5), "lithology_binary")
+
+    assert image.shape == (1, 3, 3)
+    assert image[0, 0].tolist() == [0, 0, 0]
+    assert image[0, 1].tolist() == [47, 47, 47]
+    assert image[0, 2].tolist() == [255, 221, 0]
+
+
+def test_colorize_lithology_display_mask_is_transparent_outside_reservoir() -> None:
+    values = np.asarray([[0.0, 1.0]], dtype=np.float32)
+    display_mask = np.asarray([[False, True]])
+    image = colorize_slice(values, (-0.5, 1.5), "lithology_binary", display_mask=display_mask)
+
+    assert image.shape == (1, 2, 4)
+    assert image[0, 0].tolist() == [0, 0, 0, 0]
+    assert image[0, 1].tolist() == [255, 221, 0, 255]
+
+
 def test_build_z_slice_image_points() -> None:
     raw_slice = np.arange(6, dtype=np.float32).reshape(2, 3)
     result = build_slice_image(raw_slice, (2, 3, 4), "z", 2, (0.0, 5.0), "gray")

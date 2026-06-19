@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 from urllib.parse import urlencode, quote
@@ -9,6 +10,17 @@ from urllib.request import Request, urlopen
 import numpy as np
 
 from yj_studio_core.targets import GeoTarget, TargetSet
+
+
+@dataclass(frozen=True, slots=True)
+class Mask3DResult:
+    mask: np.ndarray
+    index_lo: int | None = None
+    index_hi: int | None = None
+    voxel_count: int | None = None
+    volume_m3: float | None = None
+    voxel_spacing: tuple[float, float, float] | None = None
+    voxel_spacing_source: str | None = None
 
 
 class RemoteTargetStore:
@@ -73,7 +85,10 @@ class RemoteTargetStore:
         )
 
     def fetch_mask3d(self, target_id: str, *, volume_id: str | None = None) -> np.ndarray:
-        return self._get_npy(
+        return self.fetch_mask3d_with_metadata(target_id, volume_id=volume_id).mask
+
+    def fetch_mask3d_with_metadata(self, target_id: str, *, volume_id: str | None = None) -> Mask3DResult:
+        return self._get_npy_with_headers(
             f"/sam3/targets/{quote(target_id)}/mask3d",
             query={"project": self.project_id, "volume_id": volume_id},
         )
@@ -174,16 +189,6 @@ class RemoteTargetStore:
             query={"project": self.project_id},
         )
 
-    def submit_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = dict(payload)
-        body.setdefault("project", self.project_id)
-        return self._request_json("/sam3/jobs/batch", method="POST", payload=body)
-
-    def extract_all(self, *, target_type: str, scope: str, mode: str, **payload: Any) -> dict[str, Any]:
-        body = dict(payload)
-        body.update({"type": target_type, "scope": scope, "mode": mode, "project": self.project_id})
-        return self._request_json("/sam3/extract", method="POST", payload=body)
-
     def gpus(self) -> dict[str, Any]:
         payload = self._get_json("/sam3/gpus")
         return payload if isinstance(payload, dict) else {}
@@ -218,6 +223,21 @@ class RemoteTargetStore:
             data = response.read()
         return np.load(BytesIO(data), allow_pickle=False)
 
+    def _get_npy_with_headers(self, path: str, query: dict[str, Any] | None = None) -> Mask3DResult:
+        with urlopen(self._url(path, query), timeout=self.timeout_s) as response:
+            data = response.read()
+            headers = response.headers
+        mask = np.load(BytesIO(data), allow_pickle=False)
+        return Mask3DResult(
+            mask=mask,
+            index_lo=_header_int(headers, "X-Mask3D-Index-Lo"),
+            index_hi=_header_int(headers, "X-Mask3D-Index-Hi"),
+            voxel_count=_header_int(headers, "X-Mask3D-Voxel-Count"),
+            volume_m3=_header_float(headers, "X-Mask3D-Volume-M3"),
+            voxel_spacing=_header_spacing(headers, "X-Mask3D-Voxel-Spacing"),
+            voxel_spacing_source=_header_text(headers, "X-Mask3D-Voxel-Spacing-Source"),
+        )
+
     def _request_json(
         self,
         path: str,
@@ -245,3 +265,43 @@ class RemoteTargetStore:
         if not isinstance(decoded, dict):
             raise ValueError(f"Unexpected JSON response from {path}")
         return decoded
+
+
+def _header_text(headers: Any, key: str) -> str | None:
+    value = headers.get(key) if hasattr(headers, "get") else None
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def _header_int(headers: Any, key: str) -> int | None:
+    text = _header_text(headers, key)
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _header_float(headers: Any, key: str) -> float | None:
+    text = _header_text(headers, key)
+    if text is None:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _header_spacing(headers: Any, key: str) -> tuple[float, float, float] | None:
+    text = _header_text(headers, key)
+    if text is None:
+        return None
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 3:
+        return None
+    try:
+        values = tuple(float(part) for part in parts)
+    except ValueError:
+        return None
+    return values if all(value > 0.0 for value in values) else None

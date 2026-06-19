@@ -23,6 +23,7 @@ class ServerConfig:
     sam3: dict[str, Any] = field(default_factory=dict)
     training: dict[str, Any] = field(default_factory=dict)
     auth: dict[str, Any] = field(default_factory=dict)
+    preload: dict[str, Any] = field(default_factory=dict)
 
 
 def default_config_path(project_root: Path | None = None) -> Path:
@@ -65,6 +66,7 @@ def load_config(path: Path | None = None) -> ServerConfig:
         sam3=dict(payload.get("sam3", {})),
         training=dict(payload.get("training", {})),
         auth=dict(payload.get("auth", {})),
+        preload=dict(payload.get("preload", {})),
     )
 
 

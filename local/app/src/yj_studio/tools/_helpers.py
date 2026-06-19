@@ -313,7 +313,6 @@ def _tool_display_name(tool_name: str) -> str:
         "horizon_autotrack": "层位自动追踪",
         "ai_point_prompt": "AI 点提示",
         "ai_box_prompt": "AI 框提示",
-        "measure": "测量",
         "polygon": "多边形",
         "brush": "画笔",
         "eraser": "橡皮",

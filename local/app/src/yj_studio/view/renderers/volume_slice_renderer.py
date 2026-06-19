@@ -71,7 +71,7 @@ class VolumeSliceRenderer:
             axis,
             index,
             layer.clim,
-            layer.cmap,
+            _display_cmap(layer),
             roi=roi,
             display_mask=mask_slice,
         )
@@ -212,6 +212,9 @@ def colorize_slice(
     cmap: str,
     display_mask: np.ndarray | None = None,
 ) -> np.ndarray:
+    if _is_lithology_cmap(cmap):
+        return _colorize_lithology(values, display_mask=display_mask)
+
     finite = np.isfinite(values)
     visible = finite
     use_alpha = display_mask is not None
@@ -276,6 +279,42 @@ def _matplotlib_cmap_name(cmap: str) -> str:
     if colormaps is not None and name not in colormaps:
         return "gray"
     return name
+
+
+def _display_cmap(layer: VolumeLayer) -> str:
+    if layer.volume_id == "model_lithology":
+        return "lithology_binary"
+    return layer.cmap
+
+
+def _is_lithology_cmap(cmap: str) -> bool:
+    return str(cmap).strip().lower() in {"lithology", "lithology_binary", "yj_lithology"}
+
+
+def _colorize_lithology(
+    values: np.ndarray,
+    *,
+    display_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    data = np.asarray(values, dtype=np.float32)
+    visible = np.isfinite(data)
+    use_alpha = False
+    if display_mask is not None:
+        mask = np.asarray(display_mask, dtype=bool)
+        if mask.shape == data.shape:
+            visible &= mask
+            use_alpha = True
+
+    rgb = np.zeros((*data.shape, 3), dtype=np.uint8)
+    class_values = np.zeros(data.shape, dtype=np.int16)
+    class_values[visible] = np.rint(data[visible]).astype(np.int16, copy=False)
+    rgb[visible & (class_values == 0)] = (47, 47, 47)
+    rgb[visible & (class_values >= 1)] = (255, 221, 0)
+    if not use_alpha:
+        return rgb
+    alpha = np.zeros(data.shape, dtype=np.uint8)
+    alpha[visible] = 255
+    return np.dstack((rgb, alpha))
 
 
 def _quad(points: np.ndarray) -> pv.PolyData:

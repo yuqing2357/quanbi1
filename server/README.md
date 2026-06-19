@@ -10,7 +10,7 @@ shared source folders it depends on.
 - Server configuration examples.
 - Server startup, validation, and healthcheck scripts.
 - Server dependency notes.
-- Service logs and runtime state references.
+- Foreground terminal runtime and diagnostics.
 
 ## Non-Scope
 
@@ -22,7 +22,8 @@ shared source folders it depends on.
 
 ```text
 /root/quanbi/
-  apps/
+  local/app/
+  shared/
   libs/
   data/
   server/
@@ -81,14 +82,21 @@ cd /root/quanbi
 bash server/scripts/start_server.sh
 ```
 
-Run as a background service inside the project folder:
+The process stays attached to the current terminal. Uvicorn status, request
+logs, SAM3 job state changes, and exception tracebacks are printed there in
+real time. Press `Ctrl+C` in the same terminal to stop it.
+
+Legacy compatibility entry:
 
 ```bash
 cd /root/quanbi
 bash server/scripts/start_background.sh
 ```
 
-Stop the background service:
+This command now delegates to `start_server.sh` and also runs in the foreground.
+It no longer starts `nohup` or redirects output to `runtime/server/logs`.
+
+Clean up an old background process from earlier versions:
 
 ```bash
 cd /root/quanbi

@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
+import uuid
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from yj_studio_core.targets import GeoTarget, TargetSet, TargetStatus, TargetStore, export_confirmed_to_coco, split_frames
+from yj_studio_core.targets import (
+    GeoTarget,
+    TargetSet,
+    TargetStatus,
+    TargetStore,
+    export_confirmed_to_coco,
+    mask_volume_stats,
+    resolve_voxel_spacing,
+    split_frames,
+)
 
 
 def test_target_store_keeps_arrays_out_of_targets_json(tmp_path: Path) -> None:
@@ -193,8 +204,9 @@ def test_target_store_frame_from_cells_roundtrip(tmp_path: Path) -> None:
     assert np.array_equal(loaded, cells.astype(np.int32))
 
 
-def test_target_store_mask3d_uses_real_frame_indices(tmp_path: Path) -> None:
-    store = TargetStore(tmp_path / "sam3", project="default", volume_id="tiny")
+def test_target_store_mask3d_uses_real_frame_indices() -> None:
+    scratch = Path("tests/_scratch") / f"mask3d_{uuid.uuid4().hex}"
+    store = TargetStore(scratch / "sam3", project="default", volume_id="tiny")
     target_set = store.load()
     target = store.add_single_frame_target(
         target_set,
@@ -222,6 +234,39 @@ def test_target_store_mask3d_uses_real_frame_indices(tmp_path: Path) -> None:
     assert volume[0].sum() == 6
     assert volume[1].sum() == 0
     assert volume[2].sum() == 6
+    shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_mask_volume_stats_uses_configured_downsample_spacing() -> None:
+    spacing, source = resolve_voxel_spacing(
+        {"voxel_spacing": [1.0, 2.0, 4.0], "downsample_factor": [3.0, 3.0, 3.0]}
+    )
+    mask = np.zeros((2, 3, 4), dtype=np.uint8)
+    mask[0, 0, 0] = 1
+    mask[1, 2, 3] = 1
+
+    stats = mask_volume_stats(mask, spacing)
+
+    assert spacing == (3.0, 6.0, 12.0)
+    assert source == "config+downsample"
+    assert stats["voxel_count"] == 2
+    assert stats["voxel_volume"] == 216.0
+    assert stats["volume_m3"] == 432.0
+
+
+def test_resolve_voxel_spacing_accepts_reservoir_metadata_axis_keys() -> None:
+    spacing, source = resolve_voxel_spacing(
+        {
+            "voxel_spacing_m": {
+                "axis0": 12.5 / 3.0,
+                "axis1": 12.5 / 3.0,
+                "sample": 10.0 / 3.0,
+            }
+        }
+    )
+
+    assert spacing == (12.5 / 3.0, 12.5 / 3.0, 10.0 / 3.0)
+    assert source == "config"
 
 
 def test_target_store_mutate_skips_save_on_error(tmp_path: Path) -> None:

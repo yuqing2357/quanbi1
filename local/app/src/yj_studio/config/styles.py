@@ -37,7 +37,7 @@ PALETTE = [
 LITH_STYLE = {
     "coarse": {
         "class_names": {0: "泥岩", 1: "砂岩"},
-        "cmap": ["#8f8f8f", "#f2c84b"],
+        "cmap": ["#2f2f2f", "#ffdd00"],
         "clim": [-0.5, 1.5],
     },
     "fine": {
@@ -53,8 +53,8 @@ LITH_STYLE = {
 }
 
 LITH_COLORS = {
-    0: "#8f8f8f",
-    1: "#f2c84b",
+    0: "#2f2f2f",
+    1: "#ffdd00",
     3: "#2ca02c",
     4: "#9467bd",
     5: "#17becf",
@@ -87,7 +87,7 @@ MODEL_VOLUME_DISPLAY_STYLE = {
     "model_lithology": {
         "filename": "lithology_binary_3x_uint8.npy",
         "label": "岩性模型",
-        "cmap": "tab10",
+        "cmap": "lithology_binary",
     },
     "model_porosity": {
         "filename": "porosity_3x_float16.npy",

@@ -103,6 +103,11 @@ class RemoteVolumeStore:
     def spec(self, volume_id: str) -> VolumeSpec:
         return self._specs[volume_id]
 
+    def info(self, volume_id: str) -> dict[str, Any]:
+        if volume_id not in self._volume_info:
+            self.discover_specs()
+        return dict(self._volume_info[volume_id])
+
     def get_volume(self, volume_id: str) -> RemoteVolumeProxy:
         info = self._volume_info.get(volume_id)
         if info is None:

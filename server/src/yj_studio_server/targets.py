@@ -36,7 +36,9 @@ from yj_studio_core.targets import (  # noqa: E402
     TargetStore,
     export_confirmed_to_coco,
     frame_key,
+    mask_volume_stats,
     normalise_target_type,
+    resolve_voxel_spacing,
 )
 
 __all__ = [
@@ -47,5 +49,7 @@ __all__ = [
     "TargetStore",
     "export_confirmed_to_coco",
     "frame_key",
+    "mask_volume_stats",
     "normalise_target_type",
+    "resolve_voxel_spacing",
 ]

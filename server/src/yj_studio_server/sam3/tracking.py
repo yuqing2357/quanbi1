@@ -11,11 +11,14 @@ See docs/project_review_and_remediation.md §2.1.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Iterable
 
 import numpy as np
 
 from ..targets import GeoTarget, TargetSet, TargetStatus, TargetStore
+
+logger = logging.getLogger(__name__)
 
 
 def collect_object_frames(
@@ -38,6 +41,9 @@ def collect_object_frames(
     """
     engine.init_track_state(frames_dir)
     collected: dict[int, dict[int, np.ndarray]] = {int(s["obj_id"]): {} for s in seeds}
+    yielded_frames = 0
+    seen_obj_ids: set[int] = set()
+    empty_or_oob = 0
     for frame_idx_local, per_obj in engine.track_video(
         frames_dir,
         seeds=seeds,
@@ -47,15 +53,40 @@ def collect_object_frames(
     ):
         if cancelled is not None and cancelled():
             break
+        yielded_frames += 1
         if not 0 <= frame_idx_local < len(indices):
+            empty_or_oob += 1
             continue
         abs_index = indices[frame_idx_local]
         for obj_id, mask in per_obj.items():
+            seen_obj_ids.add(int(obj_id))
             mask_arr = np.asarray(mask, dtype=bool)
             if int(obj_id) in collected and mask_arr.any():
                 collected[int(obj_id)][abs_index] = mask_arr
         if progress is not None:
             progress(sum(len(frames) for frames in collected.values()))
+    # Diagnostic: a successful job that collects nothing (the "追踪完成，0 个目标"
+    # symptom) is almost always a seed mismatch — wrong obj_ids, an off-target
+    # seed box (all masks empty), or out-of-range frame indices. Log the shape
+    # so the cause is identifiable from server logs without code changes.
+    per_obj_counts = {oid: len(frames) for oid, frames in collected.items()}
+    if not any(per_obj_counts.values()):
+        logger.warning(
+            "track collected 0 frames: seed_obj_ids=%s seen_obj_ids=%s "
+            "yielded_frames=%d empty_or_oob=%d window=%d",
+            sorted(collected),
+            sorted(seen_obj_ids),
+            yielded_frames,
+            empty_or_oob,
+            len(indices),
+        )
+    else:
+        logger.info(
+            "track collected frames per obj=%s (yielded_frames=%d, seen_obj_ids=%s)",
+            per_obj_counts,
+            yielded_frames,
+            sorted(seen_obj_ids),
+        )
     return collected
 
 
@@ -70,6 +101,7 @@ def persist_tracked_targets(
     image_axis_label: str | None = None,
     source: str = "sam3_video",
     gap_metadata: dict[int, dict[str, Any]] | None = None,
+    target_metadata: dict[str, Any] | None = None,
     link_resolver: Callable[
         [int, dict[int, np.ndarray], TargetSet, set[str]], str | None
     ]
@@ -90,6 +122,8 @@ def persist_tracked_targets(
     with store.mutate() as target_set:
         if volume_id and not target_set.volume_id:
             target_set.volume_id = volume_id
+        if target_metadata:
+            target_set.metadata.update(target_metadata)
         linkable_target_ids = set(target_set.targets)
         for seed_obj in seeds:
             obj_id = int(seed_obj["obj_id"])
@@ -113,6 +147,8 @@ def persist_tracked_targets(
                     status=TargetStatus.ACTIVE,
                     source=source,
                 )
+            if target_metadata:
+                target.metadata.update(target_metadata)
             for abs_index in sorted(frames):
                 frame = store.frame_from_mask(
                     target_id=target_id,

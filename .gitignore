@@ -17,11 +17,19 @@ dist/
 *.egg-info/
 /weights/
 /data/
+/outputs/
+/reports/
 /cache/
 /runtime/
 /server/logs/
 /local/cache/
 /local/logs/
+pytest_tmp_*/
+pytest-tmp-*/
+**/pytest_tmp_*/
+**/_tmp_*/
+**/_scratch/
+.vscode/sftp.json
 portable_manifest.json
 
 # Live (machine-specific) configs stay out of git; *.example.yaml are tracked.

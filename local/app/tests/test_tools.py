@@ -14,9 +14,10 @@ from yj_studio.tools._helpers import display_world_point, event_left_button, sam
 
 def test_default_tool_catalog() -> None:
     tools = build_default_tools()
-    assert len(tools) == 18
+    assert len(tools) == 17
     assert tools[0].id == "navigation"
-    assert sum(1 for tool in tools if tool.enabled) == 11
+    assert "measure" not in {tool.id for tool in tools}
+    assert sum(1 for tool in tools if tool.enabled) == 10
     assert sum(1 for tool in tools if not tool.enabled) == 7
 
 

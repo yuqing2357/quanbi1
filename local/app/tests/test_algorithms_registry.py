@@ -7,8 +7,6 @@ from yj_studio.algorithms.registry import registry
 EXPECTED_IDS = {
     # builtin
     "horizon.thickness",
-    "measure.distance",
-    "measure.area",
     "volume.connectivity",
     "reservoir.sandbody_extract",
     "horizon.closure_contour",

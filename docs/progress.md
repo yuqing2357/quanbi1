@@ -1,4 +1,4 @@
-# YJ Studio 实施进度核对(对照 implementation_plan.md Phase 0–10)
+# YJ Studio 实施进度核对（历史基线见 archive/implementation_plan.md）
 
 > 基准时间:2026-05 当前工作区 `f:\圈闭软件`。
 > 旧项目 `D:\商书记项目\` 保持只读,仅作素材库。
@@ -21,7 +21,7 @@
 | 6 任意剖面 + 沿层/构造高点 | ✅ | arbitrary_section + horizon_service + view_horizon_map + ArbitrarySectionDialog |
 | 7 Project + Export | ⬜ | io/writers 空;无 .yjproj save/load;无截图/视频/geojson/mask 导出 |
 | 8 算法插件框架 | ✅ | 子进程 Runner + IPC + Layer payload 序列化 + ThicknessAlgorithm + Measure 包装 + 9 个二期 stub + SchemaForm + AlgorithmDock + AddLayerCommand 联动 |
-| 9 SAM3 集成 | ✅ | AIService(QThread 懒加载)+ SAM3SegmentAlgorithm/PropagateAlgorithm/RefineAlgorithm + AI Dock(prompt 收集)+ AIBoxPromptTool/AIPointPromptTool + MaskRenderer confidence 双通道 + adapter |
+| 9 SAM3 集成 | ✅ | 2026-06-17 规整后：SAM3 只走 AI Dock + RemoteSAM3Client + 服务器 `/sam3/jobs`；本机 AIService/本地 SAM3 算法已删除，通用算法面板不显示 `ai.sam3.*` |
 | 10 打包 | ⬜ | packaging/ 不存在 |
 
 ---
@@ -30,7 +30,7 @@
 
 ### Phase 0 — 脚手架 ✅
 
-- `apps/yj_studio/` 包 + `pyproject.toml`(锁定 PyQt6/pyvista/pyvistaqt/vtk/numpy/scipy/pydantic/pyzmq)
+- `local/app/` 包 + `pyproject.toml`(锁定 PyQt6/pyvista/pyvistaqt/vtk/numpy/scipy/pydantic/pyzmq)
 - `__main__.py` / `app.py`:`python -m yj_studio` 可启动,Microsoft YaHei 字体
 - `logging_config.py` 配置 logging
 - `libs/cigvis/` 与 `libs/well_section/` vendored
@@ -135,20 +135,18 @@
 
 **Phase 8 暂留尾巴**:厚度 3D 半透明体渲染(`ThicknessRenderer`)未做,当前 MeasurementLayer.geometry 用 manual_geometry_renderer 渲为散点。MeasurementDock 显示数字。**何时补**:Phase 9 完成后,或用户实操时反馈强需求时
 
-### Phase 9 — SAM3 集成 ✅
+### Phase 9 — SAM3 集成 ✅（2026-06-17 规整后口径）
 
 **AI 基础设施**
-- `ai/config.py`:`SAM3Config`(权重路径 `D:\desktop\san3\sam3\weights\sam3.pt`、device、resolution、`load_video_model`、`sam3_source_root`)
-- `ai/service.py`:`AIService` + 状态机 `IDLE/LOADING/READY/BUSY/ERROR`,`QThread` 加载,主线程不卡;暴露 `image_processor`、`video_predictor`;`box_prompt_added` / `point_prompt_added` 信号接收来自 prompt 工具的坐标
-- `ai/adapters/volume_to_image.py`:percentile 拉伸 → uint8 RGB(SAM3 期望格式)
-- `ai/adapters/mask_to_layer.py`:torch/numpy 兼容解码 + `build_mask_layer` + provenance
-- `ai/adapters/frames_export.py`:导出切片范围为 JPEG 临时目录(SAM3 video 期望格式),`FrameExport.cleanup()` 自动清理
+- 本机不再保留 `ai/config.py`、`ai/service.py` 或本地 SAM3 模型加载 fallback。
+- `ai/state.py`:`AIServiceState` 仅作为远程 client/UI 状态枚举。
+- `ai/remote_client.py`:`RemoteSAM3Client` 负责连接服务器、提交 `/sam3/jobs`、轮询、取回 mask/GeoTarget 结果。
+- `ai/adapters/volume_to_image.py`、`ai/adapters/mask_to_layer.py`、`ai/adapters/frames_export.py` 继续作为切片图像化、mask 图层适配和导出辅助。
 
-**算法(都 `runs_in_subprocess=False`,在主进程 QThread 跑)**
-- `algorithms/builtin/ai/sam3_segment.py`:`SAM3SegmentAlgorithm` — text + box + 点(包成 box)多 prompt,输出 N 个候选 MaskLayer(带 confidence)
-- `algorithms/builtin/ai/sam3_propagate.py`:`SAM3PropagateAlgorithm` — 种子 mask + SAM3 video,前后双向传播 → 3D MaskLayer
-- `algorithms/builtin/ai/sam3_refine.py`:`SAM3RefineAlgorithm` — 修改过的 mask 提 bbox + 恢复原 text prompt → 重新分割
-- 注册:`algorithms/builtin/__init__.py` import `ai/`,3 个算法在 Algorithm Dock 的 AI 分类自动出现
+**算法与入口**
+- 本机已删除旧本地 SAM3 算法文件（原 `algorithms/builtin/ai/sam3_*`）。
+- `algorithms/remote_sam3.py` 只保留 AI 面板用的远程描述类；通用 Algorithm Dock 不注册、不显示 `ai.sam3.*`。
+- 分割/追踪唯一入口为「AI 面板 + 普通 2D 剖面 → 服务器 `/sam3/jobs` → GeoTarget」。
 
 **算法基础设施扩展**
 - `algorithms/context.py`:`AlgorithmContext.services` 字段
@@ -156,20 +154,19 @@
 - `algorithms/algorithm.py`:默认 `runs_in_subprocess=True`,AI 算法显式 False
 
 **UI**
-- `ui/docks/ai_dock.py`:服务状态横幅 + Start/Unload 按钮 + 轴/切片选择(可同步 3D 视图当前切片)+ text prompt + prompt 列表(box/point)+ Pick Box/Pick Point/Clear + Run/Cancel + 进度条;输出走 UndoStack macro
-- `tools/ai_prompt_tools.py`:`AIPointPromptTool` / `AIBoxPromptTool`,2D 剖面视图上拾点/画框 → 通过 AIService 广播给 AI Dock
-- `tools/tool_manager.py`:`register_service` / `service(name)` 让工具拿 AIService
+- `ui/docks/ai_dock.py`:服务状态横幅 + Start/Unload 按钮 + 轴/切片选择(可同步 3D 视图当前切片)+ text prompt + prompt 列表(box/point)+ Pick Box/Pick Point/Clear + Run/Cancel + 进度条;输出走远程 `/sam3/jobs` 和目标刷新
+- `tools/ai_prompt_tools.py`:`AIPointPromptTool` / `AIBoxPromptTool`,2D 剖面视图上拾点/画框 → 通过 ToolManager 的远程 AI 后端服务广播给 AI Dock
+- `tools/tool_manager.py`:`register_service` / `service(name)` 让工具拿远程 AI 后端
 - `tools/catalog.py`:新工具加进 default 列表
 - `view/renderers/mask_renderer.py`:confidence 双通道(高置信不透明、低置信红色半透);同时修正 Z 翻转(`display_z`)与 horizons 对齐
 - `ui/main_window.py`:`ai_service` + dock,服务注入 algorithm_runner 和 tool_manager
 
-**测试**(都 mock SAM3,不需要 GPU/权重)
-- `test_ai_adapters.py`、`test_ai_service.py`、`test_sam3_segment_algorithm.py`、`test_sam3_refine_algorithm.py`、`test_sam3_propagate_algorithm.py`
+**测试**
+- `test_ai_adapters.py`、`test_remote_sam3_track.py`、`test_sam3_unified_exit.py` 等覆盖远程 client、AI 面板出口和算法面板隐藏；已删除本地 `test_ai_service.py` / `test_sam3_*_algorithm.py`
 
 **已知限制**
-- SAM3 没有原生 mask prompt,refine 算法靠从 mask 提取 bbox 重跑,近似但非语义等价
-- MaskRenderer 当前只渲染 2D mask;`SAM3PropagateAlgorithm` 输出的 3D MaskLayer 在 LayerTree 可见但 3D 视图暂不显示(TODO:写 VolumeMaskRenderer)
-- AI 模型只在用户点 AI Dock "Start AI" 时加载,首次约 60–90 s,会占用 ~3 GB GPU(image + video)
+- 真实 SAM3 模型、GPU 占用和长任务只在服务器环境验证。
+- 第 5 步继续规范化 3D mask 体图层与体积统计。
 
 ### Phase 10 — 打包 ⬜
 

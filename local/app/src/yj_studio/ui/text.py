@@ -10,8 +10,6 @@ LAYER_KIND_LABELS = {
     "well": "井",
     "well_log": "测井曲线",
     "lith_body": "岩性体",
-    "reservoir_grid": "储层模型",
-    "reservoir_property": "储层属性",
     "reservoir_selection": "储层选择",
     "mask": "掩膜",
     "polygon": "多边形",
@@ -34,7 +32,6 @@ ALGORITHM_CATEGORY_LABELS = {
     "volume": "体数据",
     "reservoir": "储层",
     "trap": "圈闭",
-    "measure": "测量",
     "ai": "AI",
 }
 

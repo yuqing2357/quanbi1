@@ -12,12 +12,12 @@
 > 已确认可用依赖（py312）：`numpy`、`scipy`、`scipy.ndimage`、`skimage.measure`、`shapely`。`cv2` 不可用，方案中不使用。
 >
 > 算法框架接缝（已存在，直接用）：
-> - 基类与契约：[`algorithms/algorithm.py`](../apps/yj_studio/src/yj_studio/algorithms/algorithm.py) `Algorithm.run(ctx)`；返回 [`result.py`](../apps/yj_studio/src/yj_studio/algorithms/result.py) `AlgorithmResult.success(output_layers=[...], summary=...)` / `.failure(msg)`。
-> - 上下文：[`context.py`](../apps/yj_studio/src/yj_studio/algorithms/context.py) `ctx.input_layers` / `ctx.params` / `ctx.report_progress(frac, msg)` / `ctx.check_cancel()`。
+> - 基类与契约：[`algorithms/algorithm.py`](../local/app/src/yj_studio/algorithms/algorithm.py) `Algorithm.run(ctx)`；返回 [`result.py`](../local/app/src/yj_studio/algorithms/result.py) `AlgorithmResult.success(output_layers=[...], summary=...)` / `.failure(msg)`。
+> - 上下文：[`context.py`](../local/app/src/yj_studio/algorithms/context.py) `ctx.input_layers` / `ctx.params` / `ctx.report_progress(frac, msg)` / `ctx.check_cancel()`。
 > - 注册：`@register_algorithm` 装饰器（side-effect 注册到 registry）。
-> - 既有完整范例：[`builtin/thickness.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/thickness.py)（读 HorizonLayer.sample → 出 MeasurementLayer）。
-> - 现有占位：[`builtin/stubs/`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs)，本 Phase 把它们从 `PhaseTwoStub` 升级为真实现并迁出 `stubs/`。
-> - 可用输出层：`TrapLayer`(boundary/score/attributes)、`PolygonLayer`、`LithBodyLayer`、`MeasurementLayer`、`MaskLayer`，见 [`scene/layers/`](../apps/yj_studio/src/yj_studio/scene/layers)。
+> - 既有完整范例：[`builtin/thickness.py`](../local/app/src/yj_studio/algorithms/builtin/thickness.py)（读 HorizonLayer.sample → 出 MeasurementLayer）。
+> - 现有占位：[`builtin/stubs/`](../local/app/src/yj_studio/algorithms/builtin/stubs)，本 Phase 把它们从 `PhaseTwoStub` 升级为真实现并迁出 `stubs/`。
+> - 可用输出层：`TrapLayer`(boundary/score/attributes)、`PolygonLayer`、`LithBodyLayer`、`MeasurementLayer`、`MaskLayer`，见 [`scene/layers/`](../local/app/src/yj_studio/scene/layers)。
 
 数据约定（来自 thickness.py 实证）：`HorizonLayer.sample` 是 `(ni, nx)` 的二维数组，值=Z 采样索引，**索引越小越浅**；`nan` 表示无数据。`HorizonLayer.mask` 可选有效域。
 
@@ -30,18 +30,18 @@
 ### A1 · 闭合等值线 `horizon.closure_contour`
 
 **状态（2026-06-12）**：代码与单元测试已完成。新增真实算法
-`apps/yj_studio/src/yj_studio/algorithms/builtin/closure_contour.py`，旧
+`local/app/src/yj_studio/algorithms/builtin/closure_contour.py`，旧
 `stubs/closure_contour.py` 已移除注册；`TrapLayer` 已接入 2D/3D manual
 geometry 渲染链。已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py tests/test_algorithms_registry.py -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py tests/test_algorithms_registry.py -q`。
 仍待用户在界面中用真实层位手动验收。
 
-把 [`stubs/closure_contour.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/closure_contour.py) 升级为真实现，迁到 `builtin/closure_contour.py`。
+把 [`stubs/closure_contour.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/closure_contour.py) 升级为真实现，迁到 `builtin/closure_contour.py`。
 
 **算法（涨水/溢出点法，纯 numpy + scipy.ndimage + skimage）**：自浅向深逐层抬升「水位」`level`，`region = valid & (z <= level)` 取比该深度浅的区域；对 region 做连通域标注。某连通域若 **不接触网格边界** 且 **只含一个构造高点**，它就是该高点当前的闭合域；继续加深直到它「接触边界」或「与另一个高点的域合并」——上一刻的域即该高点的**最大闭合**（溢出点对应水位）。
 
 ```python
-# apps/yj_studio/src/yj_studio/algorithms/builtin/closure_contour.py
+# local/app/src/yj_studio/algorithms/builtin/closure_contour.py
 from __future__ import annotations
 from typing import ClassVar
 import numpy as np
@@ -155,7 +155,7 @@ class ClosureContourAlgorithm(Algorithm):
         )
 ```
 
-**测试**（`apps/yj_studio/tests/test_closure_contour.py`，纯 CPU）：
+**测试**（`local/app/tests/test_closure_contour.py`，纯 CPU）：
 - 合成单高斯洼地（一个明显高点）→ 恰好 1 个 TrapLayer，relief>0，boundary 闭环（首尾接近）。
 - 两个被深鞍部隔开的高点 → 2 个闭合；把鞍部填浅到能连通 → 合并后两高点都 `spilled`，闭合数减少。
 - 单调斜坡（无闭合）→ `.failure("没有满足阈值的闭合")`。
@@ -168,13 +168,13 @@ class ClosureContourAlgorithm(Algorithm):
 ### A2 · 圈闭检测 `trap.detect_structural`
 
 **状态（2026-06-12）**：代码与单元测试已完成。新增真实算法
-`apps/yj_studio/src/yj_studio/algorithms/builtin/trap_detect.py`，复用 A1
+`local/app/src/yj_studio/algorithms/builtin/trap_detect.py`，复用 A1
 `detect_closures()`，输出带 `rank/candidate_score/relief/area` 的 `TrapLayer`；
 旧 `stubs/trap_detect.py` 已移除注册。已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py tests/test_trap_detect.py tests/test_algorithms_registry.py -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_closure_contour.py tests/test_trap_detect.py tests/test_algorithms_registry.py -q`。
 仍待用户在真实层位上 UI 手动验收。
 
-把 [`stubs/trap_detect.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/trap_detect.py) 升级。**v1 = 复用 A1 的 `detect_closures`** + 综合评分排序 + 阈值过滤；断层封堵的三面闭合留 v2。
+把 [`stubs/trap_detect.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/trap_detect.py) 升级。**v1 = 复用 A1 的 `detect_closures`** + 综合评分排序 + 阈值过滤；断层封堵的三面闭合留 v2。
 
 **Params（输入）**
 
@@ -208,16 +208,16 @@ class ClosureContourAlgorithm(Algorithm):
 ### A3 · 连通性 `volume.connectivity`（体级地基）
 
 **状态（2026-06-12）**：代码与单元测试已完成。新增真实算法
-`apps/yj_studio/src/yj_studio/algorithms/builtin/connectivity.py`，旧
+`local/app/src/yj_studio/algorithms/builtin/connectivity.py`，旧
 `stubs/connectivity.py` 已移除注册；算法 id 采用本文约定的
 `volume.connectivity`。核心函数 `detect_bodies()` 可被 A4 复用，输出
 `BodyResult(label_id, voxel_count, bbox, centroid, cells?)`；算法面板输出
 `LithBodyLayer` 的可见 bbox 体对象，避免把大体素列表内联进工程 JSON。
 已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_connectivity.py tests/test_algorithms_registry.py -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_connectivity.py tests/test_algorithms_registry.py -q`。
 仍待用户在真实体数据上手动验收阈值与连通性参数。
 
-把 [`stubs/connectivity.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/connectivity.py) 升级。输入 `VolumeLayer`（或 `MaskLayer`）+ 阈值，做 3D 连通域标注。
+把 [`stubs/connectivity.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/connectivity.py) 升级。输入 `VolumeLayer`（或 `MaskLayer`）+ 阈值，做 3D 连通域标注。
 
 **Params（输入）**
 
@@ -259,14 +259,14 @@ class ClosureContourAlgorithm(Algorithm):
 ### A4 · 砂体提取 `reservoir.sandbody_extract`
 
 **状态（2026-06-12）**：代码与单元测试已完成。新增真实算法
-`apps/yj_studio/src/yj_studio/algorithms/builtin/sandbody_extract.py`，旧
+`local/app/src/yj_studio/algorithms/builtin/sandbody_extract.py`，旧
 `stubs/sandbody_extract.py` 已移除注册。实现了孔隙度阈值路径与岩性码路径，
 复用 A3 `detect_bodies()`，输出 `LithBodyLayer`，并在 metadata 中记录
 `voxel_count / volume_m3 / mean_porosity / bbox / centroid`。已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_sandbody_extract.py tests/test_connectivity.py -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_sandbody_extract.py tests/test_connectivity.py -q`。
 仍待用户在真实孔隙度/岩性体上手动验收 cutoff 与最小体素数。
 
-把 [`stubs/sandbody_extract.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/sandbody_extract.py) 升级。本质 = **属性阈值 + A3 的 `detect_bodies`**，针对孔隙度/岩性体。
+把 [`stubs/sandbody_extract.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/sandbody_extract.py) 升级。本质 = **属性阈值 + A3 的 `detect_bodies`**，针对孔隙度/岩性体。
 
 **Params（输入）**
 
@@ -298,15 +298,15 @@ class ClosureContourAlgorithm(Algorithm):
 ### A5 · 圈闭评价 `trap.evaluate`（储量雏形）
 
 **状态（2026-06-12）**：代码与单元测试已完成。新增真实算法
-`apps/yj_studio/src/yj_studio/algorithms/builtin/trap_evaluate.py`，旧
+`local/app/src/yj_studio/algorithms/builtin/trap_evaluate.py`，旧
 `stubs/trap_evaluate.py` 已移除注册。实现 `rasterize_closure()` 与
 `volumetrics()`，输出 `MeasurementLayer`，包含
 `GRV / HCPV / STOIIP / area_km2 / mean_phi / gross_thickness_mean_m / cell_count`。
 孔隙度体为可选输入；未提供时使用参数 `default_porosity`。已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_trap_evaluate.py tests/test_algorithms_registry.py -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_trap_evaluate.py tests/test_algorithms_registry.py -q`。
 仍待用户基于真实测网面积、时深关系与孔隙度体做地质参数校核。
 
-把 [`stubs/trap_evaluate.py`](../apps/yj_studio/src/yj_studio/algorithms/builtin/stubs/trap_evaluate.py) 升级。输入 **TrapLayer + 顶/底层位 + 孔隙度体**，算容积法储量。
+把 [`stubs/trap_evaluate.py`](../local/app/src/yj_studio/algorithms/builtin/stubs/trap_evaluate.py) 升级。输入 **TrapLayer + 顶/底层位 + 孔隙度体**，算容积法储量。
 
 **Params（输入）**
 
@@ -341,7 +341,7 @@ class ClosureContourAlgorithm(Algorithm):
 1. 每个算法从 `builtin/stubs/` 迁到 `builtin/`（或保留文件位置但去掉 `PhaseTwoStub` 继承，改继承 `Algorithm`）。`builtin/__init__.py` / `stubs/__init__.py` 的导入相应调整。A1/A2/A3/A4/A5 已完成。
 2. 抽纯函数：`detect_closures()`(A1)、`detect_bodies()`(A3)、`rasterize_closure()`/`volumetrics()`(A5) 供复用与脱机单测。已完成。
 3. `test_tools.py` 之类的「算法数量」类断言若存在，需同步（本次新增的是真实算法，不改 tool 目录）。
-4. UI 无需改：算法面板 [`AlgorithmDock`](../apps/yj_studio/src/yj_studio/ui/docks/algorithm_dock.py) 自动列出注册算法；输出 TrapLayer/LithBodyLayer 已有渲染器即可显示（若 TrapLayer 还没 3D/2D 渲染器，补一个轮廓渲染，参照 PolygonLayer 渲染）。
+4. UI 无需改：算法面板 [`AlgorithmDock`](../local/app/src/yj_studio/ui/docks/algorithm_dock.py) 自动列出注册算法；输出 TrapLayer/LithBodyLayer 已有渲染器即可显示（若 TrapLayer 还没 3D/2D 渲染器，补一个轮廓渲染，参照 PolygonLayer 渲染）。
 
 ---
 
@@ -365,7 +365,7 @@ class ClosureContourAlgorithm(Algorithm):
 默认使用 `split_strategy="spatial"`，按 `axis + index` 的连续空间块划分
 train/val/test，避免相邻剖面随机泄漏；保留 `split_strategy="round_robin"`
 用于旧行为兼容。新增 `split_frames()` 纯函数，已通过：
-`cd apps/yj_studio; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_targets_store.py::test_split_frames_spatial_uses_contiguous_index_blocks tests/test_targets_store.py::test_export_confirmed_targets_uses_spatial_split -q`。
+`cd local/app; PYTHONPATH=src; E:\miniconda\envs\py312\python.exe -m pytest tests/test_targets_store.py::test_split_frames_spatial_uses_contiguous_index_blocks tests/test_targets_store.py::test_export_confirmed_targets_uses_spatial_split -q`。
 仍待：真实 SAM3 微调脚本在 val/test 上计算 mask IoU/mAP 并写入 `metrics.json`。
 
 - 导出时按 split 写 `val`/`test`；微调脚本在 `val` 上算 mask IoU/mAP 写进 `metrics.json`。
@@ -385,18 +385,13 @@ train/val/test，避免相邻剖面随机泄漏；保留 `split_strategy="round_
 
 ---
 
-## Phase C · 储层工作台主窗口入口接线（P1）
+## Phase C · 储层工作台主窗口入口接线（已由规整删除）
 
-状态（2026-06-12）：主窗口入口已接线。`MainWindow` 持有 `ReservoirRegistry`，视图菜单新增「打开储层剖面」；当当前会话已有 `ReservoirGridLayer`/`ReservoirPropertyLayer` 时，可打开 `ViewReservoirSection`，在储层剖面画 ROI 后构造 `SAM3Workbench(target_store=self.target_store, ...)`。工作台 `selection_committed` 会通过 undo 加入 `ReservoirSelectionLayer`，`target_committed` 会刷新 TargetDock。`SceneController` 也已接入 `ReservoirGridRenderer` / `ReservoirSelectionRenderer`，让储层 grid/property/selection 层进入 3D 渲染链。
+状态（2026-06-17）：`ViewReservoirSection`、`SAM3Workbench`、储层 grid ROI 和「打开储层剖面」入口已删除；本段不再作为待办项。后续 SAM3 只走普通 2D 剖面 AI 面板与服务器 `/sam3/jobs`，结果写入 `GeoTarget` 并由 TargetDock/3D mask 体图层消费。
 
-边界：此入口**不重新引入旧 GRDECL 自动加载主流程**。它只使用当前会话已注册的 live `ReservoirGrid`，符合当前“储层大数据走 numpy/远程，本机轻展示”的方向；旧 Petrel/GRDECL 加载仍保留在离线转换/兼容工具中。
+保留边界：井、层位、断层、储层模型浏览仍保留；不要为了 SAM3 分割恢复旧 grid 工作台。
 
-落点 [`ui/main_window.py`](../apps/yj_studio/src/yj_studio/ui/main_window.py)：
-- ✅ 在储层剖面上画 ROI 的回调里构造 `SAM3Workbench(grid=..., roi=..., axis=..., transform=..., ai_service=self.ai_service, target_store=self.target_store, ...)`，作为新视图加入中央视图区。
-- ✅ 连接 `selection_committed` → `AddLayerCommand(ReservoirSelectionLayer)`；`target_committed` → `TargetDock.refresh()`。
-- ✅ `RemoteSAM3TrackTask` 完成已联动 `_on_ai_track_finished`（refresh + show_track_result），工作台路径也汇入 TargetDock。
-
-**DoD**：储层模型上框 ROI → 工作台分割/传播 → GeoTarget 出现在 TargetDock，本地图层与远程目标同步。
+**DoD**：无。该路径已关闭。
 
 ---
 
@@ -433,7 +428,7 @@ D  真多卡       ← 仅当吞吐成瓶颈
 
 | # | 功能 | 说明 / 数据模型 / 集成点 | 优先级 | 量级 |
 |---|---|---|---|---|
-| G1.1 | **工程/会话存档 `.yjproj`** | 当前**完全没有**：关掉程序，加载的体、图层、层位、断层、目标、ROI、视图布局全丢。做 JSON manifest（引用 data/ 下 npy 与 server project_id）+ `save/open/save as/最近工程`。落点新建 `apps/yj_studio/src/yj_studio/project/session.py`，菜单「文件」加项；序列化复用各 Layer 的 `to_dict`。 | **P0** | 中 |
+| G1.1 | **工程/会话存档 `.yjproj`** | 当前**完全没有**：关掉程序，加载的体、图层、层位、断层、目标、ROI、视图布局全丢。做 JSON manifest（引用 data/ 下 npy 与 server project_id）+ `save/open/save as/最近工程`。落点新建 `local/app/src/yj_studio/project/session.py`，菜单「文件」加项；序列化复用各 Layer 的 `to_dict`。 | **P0** | 中 |
 | G1.2 | **SEG-Y 导入** | 现仅 legacy/cigvis 用 `cigsegy`。新 app 做 `data/segy_import.py`：`cigsegy.SegyNP` 读体→落 `data/.../*.npy`+metadata（含道头映射 inline/xline/CDP/X/Y）→注册 VolumeLayer。导入对话框选道头字节位置。 | **P0** | 中 |
 | G1.3 | **测井 LAS 导入** | `libs/cigvis/io/las.py:load_las` 已存在但未接入 app。`WellRepository` 加 `import_las(path)`：曲线→WellLogLayer，井口坐标+井斜；再支持井分层(tops)文本。 | P1 | 小-中 |
 | G1.4 | **层位/断层互操作格式** | 与 Petrel/OpendTect 往返：导入/导出 ZMAP+、CPS-3、IESX/Charisma 点集；面可导出 GeoTiff。落点 `data/horizon_io.py`、`data/fault_io.py`。让 A1/A2 的圈闭也能导出多边形。 | P1 | 中 |
@@ -449,7 +444,7 @@ D  真多卡       ← 仅当吞吐成瓶颈
 | G2.3 | **标注审计/版本** | GeoTarget.edits[] 已记录；做 diff 视图（谁/何时/改了哪帧），支持回退单次编辑。落点审校 dock 子面板。 | P2 | 小 |
 | G2.4 | **快捷键标注模式** | 键盘驱动：接受/打回/下一个、笔刷增减、类别热键。决定标注吞吐量。落点 `tools/` + 全局快捷键。 | P1 | 小-中 |
 | G2.5 | **类别/本体管理** | 目标类型/地质标签现偏硬编码。做可编辑 taxonomy（名称/颜色/父类），存工程。落点 `targets/taxonomy.py` + 设置面板。 | P1 | 小 |
-| G2.6 | **传播结果逐帧复核** | 沿传播轴逐帧步进、标坏帧、就地重新种子重跑该段。工作台已有帧步进雏形，补「标坏帧/重种子」。落点 `view_sam3_workbench.py`。 | P1 | 中 |
+| G2.6 | **传播结果逐帧复核** | 沿传播轴逐帧步进、标坏帧、就地重新种子重跑该段。旧 `view_sam3_workbench.py` 已删除；落点应改为 AI 面板/TargetDock 与服务器 track job 的复核流。 | P1 | 中 |
 
 ## G3 · 训练 / 模型（接 Phase B）
 

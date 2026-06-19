@@ -7,8 +7,9 @@ import numpy as np
 
 
 CRITICAL_FILES = {
-    "lithology_3x": "data/reservoir/numpy_3x/lithology_binary_3x_uint8.npy",
-    "porosity_3x": "data/reservoir/numpy_3x/porosity_3x_float16.npy",
+    "model_lithology": "data/reservoir/npy_625x625x2_v3/lithology_binary_uint8.npy",
+    "model_porosity": "data/reservoir/npy_625x625x2_v3/porosity_float16.npy",
+    "reservoir_metadata": "data/reservoir/npy_625x625x2_v3/metadata.json",
     "seismic": "data/seismic/YJ-ALL-SEISMIC.npy",
     "sam3_checkpoint": "weights/sam3.pt",
 }

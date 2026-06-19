@@ -1,45 +1,31 @@
 # Portable Project Layout
 
-The portable project keeps code, data, generated caches, and runtime output under
-one project root so the application can run from a copied folder without relying
-on workstation-specific drive letters.
+The portable workspace keeps code and optional runtime assets under one root,
+but separates them by ownership and lifetime:
 
 ```text
 YJ_Studio_Portable/
-  apps/
-  docs/
-  legacy/
-  libs/
-  server/
-  local/
-  tools/
-  weights/
-  runtime/
-  data/
-    seismic/
-      YJ-ALL-SEISMIC_depth_0_653.npy
-      YJ-ALL-SEISMIC.npy
-      YJ-ALL-SEISMIC.segy
-      processed/
-    reservoir/
-      grdecl/        # legacy offline source for regenerating numpy volumes
-        １２３４.GRDECL
-        １２３４_COORD.GRDECL
-        １２３４_ZCORN.GRDECL
-        １２３４_ACTNUM.GRDECL
-        .yj_cache/
-      numpy/         # 1x intermediate reservoir numpy
-      numpy_3x/      # runtime reservoir numpy volumes
-        lithology_binary_3x_uint8.npy
-        porosity_3x_float16.npy
-        metadata.json
-  cache/
-    triton/
+  local/       desktop runtime
+  server/      remote service runtime
+  shared/      common pure Python core
+  config/      config templates and environment definitions
+  data/        persistent scientific data
+  weights/     model assets
+  outputs/     retained reports, images, videos and exports
+  runtime/     disposable process state
+  cache/       disposable shared caches
+  libs/        vendored dependencies
+  tools/       offline utilities
+  docs/        documentation
 ```
 
-Runtime defaults are resolved from `WORKSPACE_ROOT / "data"` in
-`apps/yj_studio/src/yj_studio/config/paths.py`.
+The active reservoir volume is
+`data/reservoir/npy_625x625x2_v3/`. Its metadata defines the cropped seismic
+origin, scale and `6.25 x 6.25 x 2 m` spacing.
 
-`server/` is for remote service code and deployment files. `local/` is for
-local development and remote-connection helpers. Generated logs, cache, and job
-state should go under `runtime/` rather than inside source folders.
+Generated diagnostics belong under `outputs/diagnostics/`. Logs, job state,
+slice caches, PID files and temporary test files belong under `runtime/`.
+
+Large data paths are intentionally not renamed during ordinary code cleanup.
+Moving them requires a dedicated migration with configuration updates and
+checksum verification.

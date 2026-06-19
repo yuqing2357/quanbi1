@@ -13,10 +13,11 @@ Layout (top-down):
   ├ Progress bar + status text ─────────────────────┤
   └ Last result summary ────────────────────────────┘
 
-The dock owns no model state — it forwards Run clicks to
-``AlgorithmRunner.submit(SAM3SegmentAlgorithm, ...)``. Outputs come back as
-``MaskLayer`` instances and are added through the undo stack so a single
-Ctrl+Z removes the whole run.
+The dock owns no model state. It forwards Run clicks to the remote SAM3 job
+client through ``AlgorithmRunner.submit(RemoteSAM3SegmentAlgorithm, ...)``; the
+runner then submits ``/sam3/jobs`` and turns returned candidates into
+``MaskLayer`` instances. Ctrl+Z still removes the local visual masks, while
+the server-side GeoTargets stay in the target store.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from yj_studio.ai.service import AIService, AIServiceState
+from yj_studio.ai.state import AIServiceState
 from yj_studio.algorithms.runner import AlgorithmRunner, RemoteSAM3TrackTask
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import VolumeLayer
@@ -59,12 +60,13 @@ _AXES = ("inline", "xline", "z")
 
 
 class AIDock(QDockWidget):
+    job_finished = pyqtSignal(dict)
     track_finished = pyqtSignal(dict)
 
     def __init__(
         self,
         layer_store: LayerStore,
-        ai_service: AIService,
+        ai_service: Any,
         runner: AlgorithmRunner,
         tool_manager: ToolManager,
         undo_stack: QUndoStack | None = None,
@@ -116,7 +118,7 @@ class AIDock(QDockWidget):
         self._slice_spin.setRange(0, 9999)
         form.addRow("剖面索引", self._slice_spin)
 
-        sync_button = QPushButton("← 使用当前三维剖面", body)
+        sync_button = QPushButton("← 使用当前剖面", body)
         sync_button.clicked.connect(self._sync_from_volume)
         form.addRow("", sync_button)
         outer.addLayout(form)
@@ -201,6 +203,13 @@ class AIDock(QDockWidget):
     # ------------------------------------------------------------------ slots
 
     def _on_start_clicked(self) -> None:
+        if not _has_remote_segment_backend(self._ai_service):
+            QMessageBox.information(
+                self,
+                "SAM3",
+                "SAM3 分割/追踪已统一到远程服务器，请配置 YJ_STUDIO_SERVER_URL。",
+            )
+            return
         if not self._ai_service.config.checkpoint_exists():
             QMessageBox.warning(
                 self,
@@ -225,9 +234,11 @@ class AIDock(QDockWidget):
         self._status_label.setText(f"<span style='color:{colour};'>● {ai_state_label(state.value)}</span> {message}")
         self._start_button.setEnabled(state in {AIServiceState.IDLE, AIServiceState.ERROR})
         self._stop_button.setEnabled(state in {AIServiceState.READY, AIServiceState.ERROR})
-        self._run_button.setEnabled(state == AIServiceState.READY)
+        self._run_button.setEnabled(
+            state == AIServiceState.READY and _has_remote_segment_backend(self._ai_service)
+        )
         self._track_button.setEnabled(
-            state == AIServiceState.READY and callable(getattr(self._ai_service, "submit_track", None))
+            state == AIServiceState.READY and _has_remote_track_backend(self._ai_service)
         )
 
     def _on_box_prompt(
@@ -275,12 +286,14 @@ class AIDock(QDockWidget):
             QMessageBox.warning(self, "AI 工具", str(exc))
 
     def _sync_from_volume(self) -> None:
-        for layer in self._layer_store.iter_by_type(VolumeLayer):
-            indices = layer.slice_indices or {}
-            current_axis = str(self._axis_combo.currentData() or self._axis_combo.currentText())
-            if current_axis in indices:
-                self._slice_spin.setValue(int(indices[current_axis]))
-                return
+        current_axis = str(self._axis_combo.currentData() or self._axis_combo.currentText())
+        layer = _preferred_visible_volume_layer(self._layer_store)
+        if layer is None:
+            return
+        self._set_slice_spin_limit(layer, current_axis)
+        indices = layer.slice_indices or {}
+        if current_axis in indices:
+            self._slice_spin.setValue(int(indices[current_axis]))
 
     # ------------------------------------------------------------------ run
 
@@ -288,8 +301,11 @@ class AIDock(QDockWidget):
         volume_layer = self._active_volume_layer()
         if volume_layer is None:
             QMessageBox.information(
-                self, "SAM3", "请先加载体数据，再运行 SAM3。"
+                self, "SAM3", "请先选择一个可见体数据，并确认剖面索引在该体范围内。"
             )
+            return
+        if not _has_remote_segment_backend(self._ai_service):
+            QMessageBox.information(self, "SAM3", "SAM3 分割需要远程 SAM3 后端。")
             return
         params = {
             "axis": str(self._axis_combo.currentData() or self._axis_combo.currentText()),
@@ -310,7 +326,7 @@ class AIDock(QDockWidget):
             )
             return
 
-        from yj_studio.algorithms.builtin.ai.sam3_segment import SAM3SegmentAlgorithm
+        from yj_studio.algorithms.remote_sam3 import RemoteSAM3SegmentAlgorithm
 
         self._summary_label.setText("")
         self._progress_bar.setValue(0)
@@ -318,7 +334,7 @@ class AIDock(QDockWidget):
         self._cancel_button.setEnabled(True)
 
         task = self._runner.submit(
-            SAM3SegmentAlgorithm,
+            RemoteSAM3SegmentAlgorithm,
             params,
             {"volume": volume_layer},
         )
@@ -331,9 +347,9 @@ class AIDock(QDockWidget):
     def _on_track_clicked(self) -> None:
         volume_layer = self._active_volume_layer()
         if volume_layer is None:
-            QMessageBox.information(self, "SAM3 追踪", "请先加载体数据，再运行追踪。")
+            QMessageBox.information(self, "SAM3 追踪", "请先选择一个可见体数据，并确认剖面索引在该体范围内。")
             return
-        if not callable(getattr(self._ai_service, "submit_track", None)):
+        if not _has_remote_track_backend(self._ai_service):
             QMessageBox.information(self, "SAM3 追踪", "追踪需要远程 SAM3 后端。")
             return
         if not self._boxes:
@@ -388,13 +404,18 @@ class AIDock(QDockWidget):
             else:
                 for layer in output_layers:
                     self._layer_store.add(layer)
+        target_ids = _target_ids_from_layers(output_layers)
+        self.job_finished.emit({"kind": "segment", "target_ids": target_ids})
         self._summary_label.setText(summary or f"已生成 {len(output_layers)} 个掩膜。")
 
     def _on_track_finished(self, result: dict, summary: str) -> None:
         self._reset_run_buttons()
         self._progress_bar.setValue(100)
         self._summary_label.setText(summary or "追踪完成。")
-        self.track_finished.emit(dict(result))
+        payload = dict(result)
+        payload.setdefault("kind", "track")
+        self.job_finished.emit(payload)
+        self.track_finished.emit(payload)
 
     def _on_errored(self, message: str, traceback_text: str) -> None:
         self._reset_run_buttons()
@@ -406,16 +427,127 @@ class AIDock(QDockWidget):
         self._summary_label.setText("已取消")
 
     def _reset_run_buttons(self) -> None:
-        self._run_button.setEnabled(self._ai_service.state == AIServiceState.READY)
+        self._run_button.setEnabled(
+            self._ai_service.state == AIServiceState.READY
+            and _has_remote_segment_backend(self._ai_service)
+        )
         self._track_button.setEnabled(
             self._ai_service.state == AIServiceState.READY
-            and callable(getattr(self._ai_service, "submit_track", None))
+            and _has_remote_track_backend(self._ai_service)
         )
         self._cancel_button.setEnabled(False)
         self._current_task = None
 
     def _active_volume_layer(self) -> VolumeLayer | None:
-        for layer in self._layer_store.iter_by_type(VolumeLayer):
-            if layer.shape is not None:
-                return layer
+        axis = str(self._axis_combo.currentData() or self._axis_combo.currentText())
+        index = int(self._slice_spin.value())
+        layer = _select_volume_layer_for_ai(
+            self._layer_store,
+            axis,
+            index,
+        )
+        if layer is not None:
+            self._set_slice_spin_limit(layer, axis)
+        return layer
+
+    def _set_slice_spin_limit(self, layer: VolumeLayer, axis: str) -> None:
+        limit = _axis_limit(layer, axis)
+        if limit is None:
+            return
+        self._slice_spin.setMaximum(max(0, limit - 1))
+
+
+def _select_volume_layer_for_ai(
+    layer_store: LayerStore,
+    axis: str,
+    index: int,
+) -> VolumeLayer | None:
+    """Pick the volume that the AI dock should submit to SAM3.
+
+    Multiple volume layers can exist at once (seismic + 3x reservoir models).
+    The old behaviour picked the first layer in insertion order, which is
+    usually seismic; that let a reservoir index such as 2226 be submitted as
+    ``seismic/inline/2226`` and caused server-side 416 errors.
+    """
+
+    layers = [layer for layer in layer_store.iter_by_type(VolumeLayer) if layer.shape is not None]
+    if not layers:
         return None
+    selected = set(layer_store.selection)
+
+    passes = (
+        lambda layer: layer.id in selected and layer.visible and _index_in_bounds(layer, axis, index),
+        lambda layer: layer.visible and _layer_slice_matches(layer, axis, index),
+        lambda layer: layer.visible and _index_in_bounds(layer, axis, index),
+        lambda layer: layer.id in selected and _index_in_bounds(layer, axis, index),
+        lambda layer: _layer_slice_matches(layer, axis, index),
+        lambda layer: _index_in_bounds(layer, axis, index),
+    )
+    for predicate in passes:
+        for layer in layers:
+            if predicate(layer):
+                return layer
+    return None
+
+
+def _preferred_visible_volume_layer(layer_store: LayerStore) -> VolumeLayer | None:
+    layers = [layer for layer in layer_store.iter_by_type(VolumeLayer) if layer.shape is not None]
+    selected = set(layer_store.selection)
+    for layer in layers:
+        if layer.id in selected and layer.visible:
+            return layer
+    for layer in layers:
+        if layer.visible:
+            return layer
+    for layer in layers:
+        if layer.id in selected:
+            return layer
+    return layers[0] if layers else None
+
+
+def _axis_limit(layer: VolumeLayer, axis: str) -> int | None:
+    if layer.shape is None:
+        return None
+    axis_key = str(axis)
+    if axis_key == "inline":
+        return int(layer.shape[0])
+    if axis_key == "xline":
+        return int(layer.shape[1])
+    if axis_key == "z":
+        return int(layer.shape[2])
+    return None
+
+
+def _index_in_bounds(layer: VolumeLayer, axis: str, index: int) -> bool:
+    limit = _axis_limit(layer, axis)
+    return limit is not None and 0 <= int(index) < limit
+
+
+def _layer_slice_matches(layer: VolumeLayer, axis: str, index: int) -> bool:
+    if not _index_in_bounds(layer, axis, index):
+        return False
+    try:
+        return int(layer.slice_indices.get(axis, -1)) == int(index)
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_remote_segment_backend(service: Any) -> bool:
+    return (
+        callable(getattr(service, "submit_segment", None))
+        and callable(getattr(service, "fetch_mask", None))
+    )
+
+
+def _has_remote_track_backend(service: Any) -> bool:
+    return _has_remote_segment_backend(service) and callable(getattr(service, "submit_track", None))
+
+
+def _target_ids_from_layers(layers: list[Any]) -> list[str]:
+    ids: list[str] = []
+    for layer in layers:
+        metadata = getattr(layer, "metadata", {}) or {}
+        target_id = str(metadata.get("target_id", "") or "")
+        if target_id:
+            ids.append(target_id)
+    return ids

@@ -21,7 +21,7 @@ class ToolManager(QObject):
         self._services: dict[str, Any] = {}
 
     def register_service(self, name: str, service: Any) -> None:
-        """Expose a long-lived service (e.g. AIService) to interactive tools.
+        """Expose a long-lived backend service to interactive tools.
         Tools can pull it via ``view.tool_manager.service('ai_service')``.
         """
 

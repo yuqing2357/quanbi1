@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -9,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class JobState(str, Enum):
@@ -82,6 +85,7 @@ class JobStore:
         job = Job(id=uuid.uuid4().hex, kind=kind, params=dict(params))
         with self._lock:
             self._jobs[job.id] = job
+        logger.info("job queued: id=%s kind=%s", job.id, job.kind)
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -99,11 +103,13 @@ class JobStore:
             job = self._jobs.get(job_id)
             if job is None:
                 return None
+            previous_state = job.state
             for key, value in fields.items():
                 if key == "state" and not isinstance(value, JobState):
                     value = JobState(str(value))
                 setattr(job, key, value)
             self._persist_if_terminal(job)
+            _log_job_update(job, fields, previous_state)
             return job
 
     def cancel(self, job_id: str) -> Job | None:
@@ -117,6 +123,7 @@ class JobStore:
             job.progress = min(float(job.progress), 1.0)
             job.message = "cancelled"
             self._persist_if_terminal(job)
+            logger.info("job cancelled: id=%s kind=%s", job.id, job.kind)
             return job
 
     def _load_persisted_jobs(self) -> None:
@@ -187,3 +194,29 @@ class JobQueue:
     def _discard(self, future: Future) -> None:
         with self._lock:
             self._futures.discard(future)
+
+
+def _log_job_update(job: Job, fields: dict[str, Any], previous_state: JobState) -> None:
+    if "state" not in fields and job.state not in TERMINAL_STATES:
+        return
+    if job.state == previous_state and job.state not in TERMINAL_STATES:
+        return
+    if job.state == JobState.error:
+        logger.error(
+            "job state: id=%s kind=%s state=%s progress=%.2f message=%s error=%s",
+            job.id,
+            job.kind,
+            job.state.value,
+            float(job.progress),
+            job.message,
+            job.error,
+        )
+    else:
+        logger.info(
+            "job state: id=%s kind=%s state=%s progress=%.2f message=%s",
+            job.id,
+            job.kind,
+            job.state.value,
+            float(job.progress),
+            job.message,
+        )

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class SAM3Engine:
@@ -50,6 +53,16 @@ class SAM3Engine:
             "device": self.device,
             "resolution": self.resolution,
         }
+
+    def warmup(self) -> dict[str, Any]:
+        """Eagerly load the image (+ video) model onto the device.
+
+        Called once at server startup so the first inference request does not
+        pay the model-load + device-binding cost. Safe to call repeatedly;
+        ``_ensure_processor`` is idempotent.
+        """
+        self._ensure_processor()
+        return self.status_payload()
 
     def reload_checkpoint(self, checkpoint_path: str | Path) -> None:
         self.checkpoint_path = Path(checkpoint_path)
@@ -127,8 +140,9 @@ class SAM3Engine:
         """
         predictor = self._ensure_video_predictor()
         with self._autocast_ctx(), self._inference_ctx():
+            seed_frame_objects: dict[int, np.ndarray] = {}
             for seed in seeds:
-                predictor.add_prompt(
+                seeded = predictor.add_prompt(
                     inference_state=self._track_state,
                     frame_idx=int(seed_local),
                     text_str=str(seed.get("text") or "visual"),
@@ -138,6 +152,26 @@ class SAM3Engine:
                     box_labels=[1],
                     obj_id=int(seed["obj_id"]),
                 )
+                # add_prompt returns (frame_idx, output_dict) for the prompted
+                # frame. This output bypasses propagate's consecutive-detection
+                # "confirmation" gate, which otherwise drops a box/visual-prompted
+                # object on every frame (symptom: track done, 0 objects). The
+                # box path also ignores the obj_id we pass and assigns its own,
+                # so attribute the returned mask(s) back to this seed's obj_id.
+                detected = _seed_output_objects(seeded)
+                if detected is not None:
+                    seed_frame_objects[int(seed["obj_id"])] = detected
+            logger.info(
+                "track seed frame: %d/%d seed object(s) detected (ids=%s, seed_local=%d)",
+                len(seed_frame_objects),
+                len(seeds),
+                sorted(seed_frame_objects),
+                int(seed_local),
+            )
+            # Emit the directly-prompted seed frame first so a good seed always
+            # yields at least one tracked frame, regardless of propagation.
+            if seed_frame_objects:
+                yield int(seed_local), dict(seed_frame_objects)
             for reverse, budget in ((False, int(fwd_budget)), (True, int(back_budget))):
                 if budget <= 0:
                     continue
@@ -270,6 +304,28 @@ def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     return detections
+
+
+def _seed_output_objects(seeded: Any) -> np.ndarray | None:
+    """Return the seed object's mask from a video ``add_prompt`` return value.
+
+    The SAM3 video model's box/visual ``add_prompt`` returns
+    ``(frame_idx, output_dict)`` where ``output_dict`` carries
+    ``out_binary_masks`` / ``out_obj_ids`` (same shape as a propagate frame).
+    For single-object seeding we take the largest-area mask as the seed object;
+    returns ``None`` when the seed frame produced no object (off-target box or
+    a confidence miss — the box format/threshold then needs attention).
+    """
+    output = seeded
+    if isinstance(seeded, tuple):
+        # (frame_idx, output_dict) — or longer tuples on the points path.
+        output = next((item for item in seeded if isinstance(item, dict)), None)
+    if not isinstance(output, dict):
+        return None
+    objects = _extract_objects(output)
+    if not objects:
+        return None
+    return max(objects.values(), key=lambda mask: int(np.asarray(mask, dtype=bool).sum()))
 
 
 def _extract_objects(outputs: Any) -> dict[int, np.ndarray]:

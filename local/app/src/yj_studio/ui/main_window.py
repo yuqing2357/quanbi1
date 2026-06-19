@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QUndoStack
-from PyQt6.QtWidgets import QDialog, QFileDialog, QLabel, QMainWindow, QMessageBox
+from PyQt6.QtWidgets import QDialog, QDockWidget, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox
 
 from yj_studio import __version__
 from yj_studio.config.defaults import DEFAULT_Z_WINDOW_START
@@ -36,15 +36,10 @@ from yj_studio.scene.layers import (
     FaultSurfaceLayer,
     HorizonLayer,
     LithBodyLayer,
-    ReservoirGridLayer,
-    ReservoirPropertyLayer,
-    ReservoirSelectionLayer,
     VolumeLayer,
     WellLayer,
     WellLogLayer,
 )
-from yj_studio.scene.undo_commands import AddLayerCommand
-from yj_studio.reservoir import ReservoirRegistry, SeismicIndexTransform, default_roi
 from yj_studio.scene.manual_geometry import is_manual_geometry_layer, manual_geometry_points
 from yj_studio.services import (
     SectionAxis,
@@ -59,12 +54,11 @@ from yj_studio.ui.dialogs.arbitrary_section_dialog import ArbitrarySectionDialog
 from yj_studio.ui.docks.fault_dock import FaultDock
 from yj_studio.ui.docks.horizon_dock import HorizonDock
 from yj_studio.ui.docks.layer_tree_dock import LayerTreeDock
-from yj_studio.ai import AIService, RemoteSAM3Client, SAM3Config
+from yj_studio.ai import RemoteSAM3Client
 from yj_studio.algorithms import AlgorithmRunner, registry as algorithm_registry
 from yj_studio.algorithms import builtin as _algorithm_builtin  # noqa: F401 — registers algorithms
 from yj_studio.ui.docks.ai_dock import AIDock
 from yj_studio.ui.docks.algorithm_dock import AlgorithmDock
-from yj_studio.ui.docks.measurement_dock import MeasurementDock
 from yj_studio.ui.docks.property_dock import PropertyDock
 from yj_studio.ui.docks.section_navigator_dock import SectionNavigatorDock
 from yj_studio.ui.docks.slice_controls_dock import SliceControlsDock
@@ -75,11 +69,16 @@ from yj_studio.ui.docks.wells_dock import WellsDock
 from yj_studio.ui.text import well_display_mode_label
 from yj_studio.view.views_area import ViewsArea
 from yj_studio.view.view_horizon_map import ViewHorizonMap
-from yj_studio.view.view_reservoir_section import ViewReservoirSection
-from yj_studio.view.view_sam3_workbench import SAM3Workbench
 from yj_studio.view.view_well_section import ViewWellSection
+from yj_studio_core.volume_grid import local_to_seismic_index
 
 logger = logging.getLogger(__name__)
+
+DOCK_GROUP_LABELS = {
+    "data": "数据",
+    "annotation": "标注",
+    "result": "结果",
+}
 
 
 class MainWindow(QMainWindow):
@@ -89,7 +88,6 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.layer_store = LayerStore()
         self.volume_store = _make_volume_store()
-        self.reservoir_registry = ReservoirRegistry()
         self.view_sync = ViewSyncService()
         self.tool_manager = ToolManager()
         self.undo_stack = QUndoStack(self)
@@ -101,13 +99,8 @@ class MainWindow(QMainWindow):
         # ``ctx.services['ai_service']``; volume_store gives them slice access.
         self.algorithm_runner.register_service("ai_service", self.ai_service)
         self.algorithm_runner.register_service("volume_store", self.volume_store)
-        self.algorithm_runner.register_service("reservoir_registry", self.reservoir_registry)
         # Interactive AI prompt tools talk to the same service.
         self.tool_manager.register_service("ai_service", self.ai_service)
-        self.tool_manager.register_service("reservoir_registry", self.reservoir_registry)
-        # Reservoir model data is treated as regular numpy volumes.
-        # The old Petrel/GRDECL grid path remains only in offline
-        # conversion/debug tools that regenerate those volumes.
         self.layer_store.layer_changed.connect(self._on_main_layer_changed)
         self.layer_store.selection_changed.connect(self._on_main_selection_changed)
         self.volume_specs: dict[str, VolumeSpec] = {}
@@ -121,14 +114,19 @@ class MainWindow(QMainWindow):
         self._slice_controls: SliceControlsDock | None = None
         self._layer_tree: LayerTreeDock | None = None
         self._tool_palette: ToolPaletteDock | None = None
+        self._horizon_dock: HorizonDock | None = None
+        self._fault_dock: FaultDock | None = None
         self._section_navigator: SectionNavigatorDock | None = None
         self._wells_dock: WellsDock | None = None
         self._well_section_dock: WellSectionDock | None = None
-        self._measurement_dock: MeasurementDock | None = None
         self._property_dock: PropertyDock | None = None
         self._algorithm_dock: AlgorithmDock | None = None
         self._ai_dock: AIDock | None = None
         self._target_dock: TargetDock | None = None
+        self._dock_groups: dict[str, list[QDockWidget]] = {key: [] for key in DOCK_GROUP_LABELS}
+        self._panels_menu: QMenu | None = None
+        self._result_dock_anchor: QDockWidget | None = None
+        self._annotation_dock_anchor: QDockWidget | None = None
         self._views_area: ViewsArea | None = None
         self._view_3d = None
         self._well_display_mode = "none"
@@ -147,11 +145,12 @@ class MainWindow(QMainWindow):
         if enable_3d:
             self._build_slice_controls()
         self._build_section_navigator()
-        self._build_measurement_dock()
         self._build_well_section_dock()
         self._build_algorithm_dock()
         self._build_ai_dock()
         self._build_target_dock()
+        self._populate_panel_menu()
+        self._apply_default_dock_visibility()
         self._constrain_dock_sizes()
         # Tab bars for tabified docks are created lazily by Qt, so deferring
         # configuration until the event loop turns once is the most reliable
@@ -163,8 +162,10 @@ class MainWindow(QMainWindow):
         # Make sure the right-side tab group surfaces a sensible default tab
         # (otherwise Qt picks whichever dock was added last, which would
         # leave the user staring at the AI dock at every launch).
-        if self._property_dock is not None:
-            self._property_dock.raise_()
+        if self._layer_tree is not None:
+            self._layer_tree.raise_()
+        if self._ai_dock is not None:
+            self._ai_dock.raise_()
         if enable_3d:
             self._discover_default_volumes()
             if auto_load:
@@ -197,7 +198,6 @@ class MainWindow(QMainWindow):
                 self.layer_store,
                 self.volume_store,
                 self._view_3d,
-                reservoir_registry=self.reservoir_registry,
             )
             return
 
@@ -231,8 +231,7 @@ class MainWindow(QMainWindow):
         arbitrary_action = view_menu.addAction(self.tr("新建任意剖面..."))
         arbitrary_action.triggered.connect(self._open_arbitrary_section_dialog)
         view_menu.addSeparator()
-        reservoir_action = view_menu.addAction(self.tr("打开储层剖面"))
-        reservoir_action.triggered.connect(self._open_selected_reservoir_section)
+        self._panels_menu = view_menu.addMenu(self.tr("面板"))
 
         help_menu = self.menuBar().addMenu(self.tr("帮助"))
         help_menu.addAction(self.tr("关于"), self._show_about)
@@ -240,6 +239,7 @@ class MainWindow(QMainWindow):
     def _build_layer_tree(self) -> None:
         dock = LayerTreeDock(self.layer_store, self, undo_stack=self.undo_stack)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self._register_dock(dock, "data", default_visible=True)
         self._layer_tree = dock
 
     def _build_property_dock(self) -> None:
@@ -249,17 +249,15 @@ class MainWindow(QMainWindow):
             self.undo_stack,
             self,
         )
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        # PropertyDock is the anchor of the right-side tab group; every other
-        # right-side dock built later tabifies onto it so we end up with a
-        # single horizontal row of tabs instead of multiple stacked groups.
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self._register_dock(dock, "data", default_visible=True)
+        self._tabify_with(self._layer_tree, dock)
         self._property_dock = dock
 
     def _build_tool_palette(self) -> None:
         dock = ToolPaletteDock(self.tool_manager, self)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
-        if self._layer_tree is not None:
-            self.tabifyDockWidget(self._layer_tree, dock)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._register_dock(dock, "annotation", default_visible=False)
         self._tool_palette = dock
 
     def _build_manager_docks(self) -> None:
@@ -275,10 +273,12 @@ class MainWindow(QMainWindow):
         for dock in (horizon_dock, fault_dock, wells_dock):
             dock.layer_activated.connect(self._activate_layer_from_dock)
             self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
-            if self._layer_tree is not None:
-                self.tabifyDockWidget(self._layer_tree, dock)
+            self._register_dock(dock, "data", default_visible=False)
+            self._tabify_with(self._layer_tree, dock)
         if self._layer_tree is not None:
             self._layer_tree.raise_()
+        self._horizon_dock = horizon_dock
+        self._fault_dock = fault_dock
         self._wells_dock = wells_dock
 
     def _build_section_navigator(self) -> None:
@@ -291,20 +291,16 @@ class MainWindow(QMainWindow):
             dock.section_activated.connect(self._views_area.activate_section)
             dock.section_close_requested.connect(self._views_area.close_section)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self._register_dock(dock, "result", default_visible=False)
+        self._tabify_result_dock(dock)
         self._section_navigator = dock
-
-    def _build_measurement_dock(self) -> None:
-        dock = MeasurementDock(self.layer_store, self)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
-        self._measurement_dock = dock
 
     def _build_well_section_dock(self) -> None:
         dock = WellSectionDock(self.layer_store, self)
         dock.build_requested.connect(self._open_connected_well_section)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self._register_dock(dock, "result", default_visible=False)
+        self._tabify_result_dock(dock)
         self._well_section_dock = dock
 
     def _build_algorithm_dock(self) -> None:
@@ -316,7 +312,8 @@ class MainWindow(QMainWindow):
             undo_stack=self.undo_stack,
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self._register_dock(dock, "result", default_visible=False)
+        self._tabify_result_dock(dock)
         self._algorithm_dock = dock
 
     def _build_ai_dock(self) -> None:
@@ -329,7 +326,8 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self._register_dock(dock, "annotation", default_visible=True)
+        self._tabify_annotation_dock(dock)
         self._ai_dock = dock
 
     def _build_target_dock(self) -> None:
@@ -340,41 +338,64 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self._register_dock(dock, "annotation", default_visible=True)
+        self._tabify_annotation_dock(dock)
         self._target_dock = dock
         if self._ai_dock is not None:
-            self._ai_dock.track_finished.connect(self._on_ai_track_finished)
+            self._ai_dock.job_finished.connect(self._on_ai_job_finished)
 
-    def _on_ai_track_finished(self, result: dict) -> None:
+    def _on_ai_job_finished(self, result: dict) -> None:
         if self._target_dock is None:
             return
         self._target_dock.refresh()
-        self._target_dock.show_track_result(result)
+        if result.get("kind") == "track" or result.get("suggestions"):
+            self._target_dock.show_track_result(result)
 
-    def _on_reservoir_target_committed(self, _target: object) -> None:
-        if self._target_dock is not None:
-            self._target_dock.refresh()
+    def _register_dock(self, dock: QDockWidget, group: str, *, default_visible: bool) -> None:
+        dock.setObjectName(f"{group}.{dock.windowTitle()}")
+        dock.setProperty("dock_group", group)
+        dock.setProperty("default_visible", default_visible)
+        self._dock_groups.setdefault(group, []).append(dock)
 
-    def _on_reservoir_selection_committed(self, layer: object) -> None:
-        if not isinstance(layer, ReservoirSelectionLayer):
+    def _tabify_with(self, anchor: QDockWidget | None, dock: QDockWidget) -> None:
+        if anchor is None or dock is anchor:
             return
-        command = AddLayerCommand(self.layer_store, layer)
-        self.undo_stack.push(command)
-        if command.layer_id is not None:
-            self.layer_store.select([command.layer_id])
-        self.statusBar().showMessage(
-            self.tr("已添加储层选择：{count} 个单元").format(count=layer.n_cells)
-        )
+        self.tabifyDockWidget(anchor, dock)
 
-    def _tabify_right(self, dock) -> None:
-        """Attach ``dock`` to the right-side tab group anchored on
-        ``_property_dock`` so the right column stays a single row of tabs
-        instead of splitting into multiple stacked sub-areas.
-        """
-
-        if self._property_dock is None or dock is self._property_dock:
+    def _tabify_result_dock(self, dock: QDockWidget) -> None:
+        if self._result_dock_anchor is None:
+            self._result_dock_anchor = dock
             return
-        self.tabifyDockWidget(self._property_dock, dock)
+        self._tabify_with(self._result_dock_anchor, dock)
+
+    def _tabify_annotation_dock(self, dock: QDockWidget) -> None:
+        if self._annotation_dock_anchor is None:
+            self._annotation_dock_anchor = dock
+            if self._tool_palette is not None:
+                self._tabify_with(dock, self._tool_palette)
+            return
+        self._tabify_with(self._annotation_dock_anchor, dock)
+
+    def _populate_panel_menu(self) -> None:
+        if self._panels_menu is None:
+            return
+        self._panels_menu.clear()
+        for group, label in DOCK_GROUP_LABELS.items():
+            group_menu = self._panels_menu.addMenu(self.tr(label))
+            for dock in self._dock_groups.get(group, []):
+                group_menu.addAction(dock.toggleViewAction())
+
+    def _apply_default_dock_visibility(self) -> None:
+        for docks in self._dock_groups.values():
+            for dock in docks:
+                if bool(dock.property("default_visible")):
+                    dock.show()
+                else:
+                    dock.hide()
+        if self._layer_tree is not None:
+            self._layer_tree.raise_()
+        if self._ai_dock is not None:
+            self._ai_dock.raise_()
 
     def _configure_dock_tabs(self) -> None:
         """Stop Qt from eliding dock tab labels (``"P..." "Sli..."``).
@@ -418,14 +439,23 @@ class MainWindow(QMainWindow):
 
         from PyQt6.QtCore import Qt as _Qt
 
-        left_docks = [d for d in (self._layer_tree, self._tool_palette) if d is not None]
+        left_docks = [
+            d
+            for d in (
+                self._layer_tree,
+                self._slice_controls,
+                self._property_dock,
+                self._horizon_dock,
+                self._fault_dock,
+                self._wells_dock,
+            )
+            if d is not None
+        ]
         right_docks = [
             d
             for d in (
-                self._slice_controls,
-                self._property_dock,
+                self._tool_palette,
                 self._section_navigator,
-                self._measurement_dock,
                 self._well_section_dock,
                 self._algorithm_dock,
                 self._ai_dock,
@@ -446,7 +476,7 @@ class MainWindow(QMainWindow):
         # labels + spin boxes side-by-side; the left column only hosts a
         # tool palette / layer tree.
         if left_docks:
-            self.resizeDocks(left_docks, [240] * len(left_docks), _Qt.Orientation.Horizontal)
+            self.resizeDocks(left_docks, [320] * len(left_docks), _Qt.Orientation.Horizontal)
         if right_docks:
             self.resizeDocks(right_docks, [360] * len(right_docks), _Qt.Orientation.Horizontal)
 
@@ -479,8 +509,9 @@ class MainWindow(QMainWindow):
         dock.clim_changed.connect(self._set_clim)
         dock.cmap_changed.connect(self._set_cmap)
         dock.roi_changed.connect(self._set_roi)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self._tabify_right(dock)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self._register_dock(dock, "data", default_visible=True)
+        self._tabify_with(self._layer_tree, dock)
         self._slice_controls = dock
 
     def _discover_default_volumes(self) -> None:
@@ -733,6 +764,14 @@ class MainWindow(QMainWindow):
 
         slice_indices = _default_slice_indices(shape)
         clim = _initial_volume_clim(volume_id)
+        volume_metadata = {"path": str(spec.path), "default_volume": True}
+        info_method = getattr(self.volume_store, "info", None)
+        if callable(info_method):
+            remote_info = info_method(volume_id)
+            if isinstance(remote_info.get("grid_reference"), dict):
+                volume_metadata["grid_reference"] = dict(remote_info["grid_reference"])
+            if remote_info.get("voxel_spacing") is not None:
+                volume_metadata["voxel_spacing"] = list(remote_info["voxel_spacing"])
         layer = VolumeLayer(
             name=spec.label,
             volume_id=volume_id,
@@ -741,7 +780,7 @@ class MainWindow(QMainWindow):
             cmap=spec.cmap,
             slice_indices=slice_indices,
             visible=visible,
-            metadata={"path": str(spec.path), "default_volume": True},
+            metadata=volume_metadata,
             provenance={"source": "default.volume"},
         )
         self.layer_store.add(layer)
@@ -822,7 +861,16 @@ class MainWindow(QMainWindow):
         self.layer_store.layer_changed.emit(layer.id, "slice_indices")
         if self._slice_controls is not None:
             self._slice_controls.set_slice_index(axis, clipped)
-        self.view_sync.publish(f"slice.{axis}_position", clipped, origin)
+        self.view_sync.publish(
+            f"slice.{axis}_position",
+            {
+                "index": clipped,
+                "volume_layer_id": layer.id,
+                "volume_id": layer.volume_id,
+                "seismic_index": local_to_seismic_index(layer.metadata, axis, clipped),
+            },
+            origin,
+        )
         return clipped
 
     def _set_clim(self, clim: object) -> None:
@@ -862,196 +910,6 @@ class MainWindow(QMainWindow):
                 text="修改 ROI",
             )
         )
-
-    def _open_selected_reservoir_section(self) -> None:
-        context = self._selected_reservoir_context()
-        if context is None or self._views_area is None:
-            self.statusBar().showMessage(self.tr("请先选择一个储层模型或储层属性图层"))
-            return
-        grid_layer, property_layer = context
-        grid = self.reservoir_registry.get(grid_layer.grid_id)
-        if grid is None:
-            self.statusBar().showMessage(
-                self.tr("储层网格尚未在当前会话注册：{grid_id}").format(grid_id=grid_layer.grid_id)
-            )
-            return
-
-        roi = grid_layer.roi or default_roi(grid)
-        property_name = property_layer.property_name if property_layer is not None else None
-        view = ViewReservoirSection(
-            grid,
-            axis="i",
-            property_name=property_name,
-            transform=SeismicIndexTransform(),
-            roi=roi,
-            parent=self._views_area,
-        )
-        view.setProperty("grid_layer_id", grid_layer.id)
-        view.setProperty("reservoir_grid_id", grid_layer.grid_id)
-        view.roi_changed.connect(
-            lambda new_roi, layer_id=grid_layer.id, origin=view: self._set_reservoir_roi(
-                layer_id, new_roi, origin=origin
-            )
-        )
-        view.roi_drawn.connect(
-            lambda new_roi, axis, layer_id=grid_layer.id: self._open_sam3_workbench_for_reservoir(
-                layer_id, new_roi, axis
-            )
-        )
-        self._views_area.add_internal_section(
-            view,
-            title=view.title,
-            axis=f"reservoir-{view.axis}",
-            index=view.index,
-        )
-        self.statusBar().showMessage(
-            self.tr("已打开储层剖面：{name}").format(name=grid_layer.name)
-        )
-
-    def _open_sam3_workbench_for_reservoir(
-        self,
-        grid_layer_id: str,
-        roi: object,
-        axis: str,
-    ) -> None:
-        if self._views_area is None:
-            return
-        try:
-            layer = self.layer_store.get(grid_layer_id)
-        except KeyError:
-            return
-        if not isinstance(layer, ReservoirGridLayer):
-            return
-        grid = self.reservoir_registry.get(layer.grid_id)
-        if grid is None:
-            self.statusBar().showMessage(
-                self.tr("储层网格尚未在当前会话注册：{grid_id}").format(grid_id=layer.grid_id)
-            )
-            return
-        if axis not in {"i", "j"}:
-            self.statusBar().showMessage(self.tr("储层 SAM3 工作台仅支持 I/J 剖面"))
-            return
-
-        roi_tuple = tuple(int(v) for v in roi)  # type: ignore[arg-type]
-        workbench = SAM3Workbench(
-            grid,
-            roi_tuple,
-            axis=axis,
-            transform=SeismicIndexTransform(),
-            ai_service=self.ai_service,
-            target_store=self.target_store,
-            grid_layer_id=layer.id,
-            grid_id=layer.grid_id,
-            parent=self._views_area,
-        )
-        workbench.setProperty("grid_layer_id", layer.id)
-        workbench.setProperty("reservoir_grid_id", layer.grid_id)
-        workbench.selection_committed.connect(self._on_reservoir_selection_committed)
-        workbench.target_committed.connect(self._on_reservoir_target_committed)
-        self._views_area.add_internal_section(
-            workbench,
-            title=workbench.title,
-            axis=f"sam3-{axis}",
-            index=workbench.index,
-        )
-        self.statusBar().showMessage(self.tr("已打开储层 SAM3 工作台"))
-
-    def _set_reservoir_roi(
-        self,
-        grid_layer_id: str,
-        roi: object,
-        *,
-        origin: object | None = None,
-    ) -> None:
-        from yj_studio.scene.undo_commands import SetLayerFieldCommand
-
-        try:
-            layer = self.layer_store.get(grid_layer_id)
-        except KeyError:
-            return
-        if not isinstance(layer, ReservoirGridLayer):
-            return
-        new_roi = tuple(int(v) for v in roi)  # type: ignore[arg-type]
-        if layer.roi == new_roi:
-            self._sync_reservoir_roi_views(grid_layer_id, new_roi, origin=origin)
-            return
-        self.undo_stack.push(
-            SetLayerFieldCommand(
-                self.layer_store,
-                layer.id,
-                "roi",
-                new_roi,
-                text="修改储层 ROI",
-            )
-        )
-        self._sync_reservoir_roi_views(grid_layer_id, new_roi, origin=origin)
-
-    def _sync_reservoir_roi_views(
-        self,
-        grid_layer_id: str,
-        roi: tuple[int, int, int, int, int, int],
-        *,
-        origin: object | None = None,
-    ) -> None:
-        if self._views_area is None:
-            return
-        for index in range(self._views_area.count()):
-            widget = self._views_area.widget(index)
-            if widget is origin:
-                continue
-            if widget.property("grid_layer_id") != grid_layer_id:
-                continue
-            set_roi = getattr(widget, "set_roi", None)
-            if callable(set_roi):
-                set_roi(roi)
-
-    def _selected_reservoir_context(
-        self,
-    ) -> tuple[ReservoirGridLayer, ReservoirPropertyLayer | None] | None:
-        for layer_id in self.layer_store.selection:
-            try:
-                layer = self.layer_store.get(layer_id)
-            except KeyError:
-                continue
-            if isinstance(layer, ReservoirGridLayer):
-                return layer, self._reservoir_property_for_grid(layer)
-            if isinstance(layer, ReservoirPropertyLayer):
-                grid_layer = self._reservoir_grid_layer_for_property(layer)
-                if grid_layer is not None:
-                    return grid_layer, layer
-        first = next(self.layer_store.iter_by_type(ReservoirGridLayer), None)
-        if first is None:
-            return None
-        return first, self._reservoir_property_for_grid(first)
-
-    def _reservoir_grid_layer_for_property(
-        self,
-        property_layer: ReservoirPropertyLayer,
-    ) -> ReservoirGridLayer | None:
-        if property_layer.grid_layer_id:
-            try:
-                layer = self.layer_store.get(property_layer.grid_layer_id)
-            except KeyError:
-                layer = None
-            if isinstance(layer, ReservoirGridLayer):
-                return layer
-        for layer in self.layer_store.iter_by_type(ReservoirGridLayer):
-            if layer.grid_id == property_layer.grid_id:
-                return layer
-        return None
-
-    def _reservoir_property_for_grid(
-        self,
-        grid_layer: ReservoirGridLayer,
-    ) -> ReservoirPropertyLayer | None:
-        candidates = [
-            layer for layer in self.layer_store.iter_by_type(ReservoirPropertyLayer)
-            if layer.grid_layer_id == grid_layer.id or layer.grid_id == grid_layer.grid_id
-        ]
-        for layer in candidates:
-            if layer.visible:
-                return layer
-        return candidates[0] if candidates else None
 
     def _open_section(self, axis: SectionAxis) -> None:
         layer = self._active_volume_layer()
@@ -1571,14 +1429,13 @@ def _make_target_store() -> RemoteTargetStore | None:
 def _make_sam3_backend(parent=None):
     backend = (
         os.environ.get("YJ_STUDIO_SAM3_BACKEND")
-        or os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local")
+        or os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "remote")
     ).strip().lower()
     if backend != "remote":
-        return AIService(SAM3Config(), parent=parent)
+        logger.warning("Ignoring YJ_STUDIO_SAM3_BACKEND=%s; SAM3 inference now requires the remote server", backend)
     server_url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
     if not server_url:
-        logger.warning("YJ_STUDIO_SAM3_BACKEND=remote but YJ_STUDIO_SERVER_URL is empty; using local SAM3")
-        return AIService(SAM3Config(), parent=parent)
+        logger.warning("Remote SAM3 requires YJ_STUDIO_SERVER_URL; AI panel will stay unavailable until configured")
     try:
         timeout_s = float(os.environ.get("YJ_STUDIO_REQUEST_TIMEOUT_S", "180"))
     except ValueError:

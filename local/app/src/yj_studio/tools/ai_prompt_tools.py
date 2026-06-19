@@ -3,8 +3,9 @@
 These behave very differently from the regular ``BoxPickTool`` /
 ``PointPickTool`` — instead of selecting layers in the store, they capture
 the *coordinates* of a click / drag on a 2D section view and forward them
-to the active ``AIService``. The AI Dock listens for ``box_prompt_added`` /
-``point_prompt_added`` signals and appends them to its prompt collection.
+to the active remote AI backend. The AI Dock listens for
+``box_prompt_added`` / ``point_prompt_added`` signals and appends them to its
+prompt collection.
 
 Both tools only fire when the view exposes ``axis`` + ``index`` attributes
 (i.e. a 2D inline / xline / Z section), since SAM3 needs to know which
