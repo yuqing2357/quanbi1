@@ -174,6 +174,13 @@ def build_slice_image(
         values = values[j0 : j1 + 1, i0 : i1 + 1]
         if mask is not None:
             mask = mask[j0 : j1 + 1, i0 : i1 + 1]
+        # VTK maps texture v=0 to the last image row.  On a z slice the image
+        # rows are axis1/xline, so leaving them unchanged mirrors that world
+        # direction on the horizontal plane.  Store axis1 in reverse image-row
+        # order so j0 lands on the quad edge whose texture coordinate is v=0.
+        values = values[::-1, :]
+        if mask is not None:
+            mask = mask[::-1, :]
         z_pos = display_z(float(index), nz)
         points = np.asarray(
             [[i0, j0, z_pos], [i1, j0, z_pos], [i1, j1, z_pos], [i0, j1, z_pos]],

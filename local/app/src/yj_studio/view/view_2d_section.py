@@ -9,7 +9,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.colors import to_rgba
 from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 from yj_studio.config.styles import LITH_COLORS
 from yj_studio.data.volume_store import VolumeStore
@@ -78,7 +78,23 @@ class View2DSection(QWidget):
         self._canvas.setMouseTracking(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        navigation = QHBoxLayout()
+        self._previous_button = QPushButton(self)
+        self._current_index_label = QLabel(self)
+        self._current_index_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._next_button = QPushButton(self)
+        navigation.addWidget(self._previous_button)
+        navigation.addWidget(self._current_index_label, 1)
+        navigation.addWidget(self._next_button)
+        layout.addLayout(navigation)
         layout.addWidget(self._canvas)
+
+        self._previous_button.clicked.connect(
+            lambda: self.set_index(self.index - 1, publish=True)
+        )
+        self._next_button.clicked.connect(
+            lambda: self.set_index(self.index + 1, publish=True)
+        )
 
         self._canvas.mpl_connect("button_press_event", self._on_button_press)
         self._canvas.mpl_connect("button_release_event", self._on_button_release)
@@ -98,9 +114,15 @@ class View2DSection(QWidget):
         return f"{section_axis_label(self.axis)} {self.index}"
 
     def set_index(self, index: int, *, publish: bool = False) -> None:
-        if int(index) == self.index:
+        requested = int(index)
+        volume_layer = self._volume_layer()
+        if volume_layer is not None and volume_layer.shape is not None:
+            limit = _axis_size(volume_layer.shape, self.axis)
+            requested = int(np.clip(requested, 0, limit - 1))
+        if requested == self.index:
+            self._update_navigation()
             return
-        self.index = int(index)
+        self.index = requested
         self.refresh()
         self.section_updated.emit(self.section_id, self.title, self.index)
         if publish:
@@ -124,6 +146,7 @@ class View2DSection(QWidget):
         self._axes.clear()
         volume_layer = self._volume_layer()
         if volume_layer is None:
+            self._update_navigation()
             self._draw_message("未加载体数据")
             return
         try:
@@ -134,9 +157,11 @@ class View2DSection(QWidget):
                 self.index,
             )
         except Exception as exc:
+            self._update_navigation()
             self._draw_message(str(exc))
             return
         self.index = section.index
+        self._update_navigation()
         self._current_extent = section.extent
         vmin, vmax = volume_layer.clim if volume_layer.clim is not None else (None, None)
         display_mask = self._display_mask_section(
@@ -176,6 +201,16 @@ class View2DSection(QWidget):
         self._axes.set_xlabel(section.x_label)
         self._axes.set_ylabel(section.y_label)
         self._canvas.draw_idle()
+
+    def _update_navigation(self) -> None:
+        layer = self._volume_layer()
+        shape = layer.shape if layer is not None else None
+        state = section_navigation_state(self.axis, self.index, shape)
+        self._previous_button.setText(state["previous_text"])
+        self._previous_button.setEnabled(bool(state["previous_enabled"]))
+        self._next_button.setText(state["next_text"])
+        self._next_button.setEnabled(bool(state["next_enabled"]))
+        self._current_index_label.setText(state["current_text"])
 
     def _draw_overlays(self) -> None:
         selected_ids = set(self._layer_store.selection)
@@ -814,3 +849,48 @@ def _trap_label(layer: TrapLayer) -> str:
 
 def _unit_suffix(unit: str) -> str:
     return f" {unit}" if unit else ""
+
+
+def section_navigation_state(
+    axis: str,
+    index: int,
+    shape: tuple[int, int, int] | None,
+) -> dict[str, object]:
+    """Build explicit previous/current/next labels for an orthogonal section."""
+
+    axis_name = {"inline": "Inline", "xline": "Xline", "z": "Z"}.get(axis, axis)
+    if shape is None:
+        return {
+            "previous_text": f"← 上一个 {axis_name}",
+            "previous_enabled": False,
+            "current_text": f"当前 {axis_name}：{int(index)}",
+            "next_text": f"下一个 {axis_name} →",
+            "next_enabled": False,
+        }
+    limit = _axis_size(shape, axis)
+    current = int(np.clip(index, 0, limit - 1))
+    previous_index = current - 1
+    next_index = current + 1
+    return {
+        "previous_text": (
+            f"← 上一个 {axis_name}（{previous_index}）"
+            if previous_index >= 0
+            else f"← 上一个 {axis_name}"
+        ),
+        "previous_enabled": previous_index >= 0,
+        "current_text": f"当前 {axis_name}：{current} / {limit - 1}",
+        "next_text": (
+            f"下一个 {axis_name}（{next_index}）→"
+            if next_index < limit
+            else f"下一个 {axis_name} →"
+        ),
+        "next_enabled": next_index < limit,
+    }
+
+
+def _axis_size(shape: tuple[int, int, int], axis: str) -> int:
+    return {
+        "inline": int(shape[0]),
+        "xline": int(shape[1]),
+        "z": int(shape[2]),
+    }[axis]

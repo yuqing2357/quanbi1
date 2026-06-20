@@ -138,6 +138,11 @@ def persist_tracked_targets(
             if linked_id and linked_id in target_set.targets:
                 target_id = linked_id
                 target = target_set.targets[target_id]
+                # The target may have started as an interactive single-frame
+                # segmentation. Once a track job links into it, expose that
+                # provenance so the desktop can distinguish a failed one-frame
+                # track from a plain single-frame segmentation.
+                target.source = source
             else:
                 target_id = target_set.new_id()
                 target = GeoTarget(

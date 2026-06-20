@@ -21,12 +21,14 @@ class SAM3Engine:
         resolution: int = 1008,
         source_root: str | Path | None = None,
         load_video: bool = True,
+        video_temporal_disambiguation: bool = False,
     ) -> None:
         self.checkpoint_path = Path(checkpoint_path)
         self.device = str(device)
         self.resolution = int(resolution)
         self.source_root = Path(source_root) if source_root is not None else None
         self.load_video = bool(load_video)
+        self.video_temporal_disambiguation = bool(video_temporal_disambiguation)
         self._processor: Any | None = None
         self._video_predictor: Any | None = None
         self._video_load_error: str | None = None
@@ -50,6 +52,7 @@ class SAM3Engine:
             "video_enabled": self.load_video,
             "video_loaded": self.video_loaded,
             "video_error": self._video_load_error,
+            "video_temporal_disambiguation": self.video_temporal_disambiguation,
             "device": self.device,
             "resolution": self.resolution,
         }
@@ -129,43 +132,49 @@ class SAM3Engine:
 
         ``frames_dir`` must contain ``00000.jpg`` ... in order (the caller
         renders axis slices to JPEG — no Qt/matplotlib needed for seismic
-        axial slices). ``seeds`` is a list of
-        ``{"obj_id": int, "box_xywh": [cx,cy,w,h], "text": str}`` — one entry
-        per geological target, seeded on the ``seed_local`` frame. The obj_id ↔
-        target_id mapping the caller assigns is what keeps numbering consistent
-        across frames.
+        axial slices). ``seeds`` is a list of one entry per geological target,
+        seeded on the ``seed_local`` frame::
+
+            {"obj_id": int,
+             "box_xywh": [xmin, ymin, w, h],   # normalised, top-left
+             "points": [[x, y], ...],          # optional, normalised [0,1]
+             "point_labels": [1, ...],         # optional, 1=fg / 0=bg
+             "text": str,                      # only used by the detect path
+             "mode": "memory" | "detect"}
+
+        Seeding uses SAM3's **visual-grounding (detector) path**: every seed box
+        is added as ONE multi-box prompt on the seed frame, then
+        ``propagate_in_video`` runs full propagation forward/backward. SAM3's
+        video model is detector-first — its Tracker is only a *refinement* layer
+        on top of an existing propagation cache (``cached_frame_outputs``), so a
+        bare point/mask seed on a fresh state is rejected with "No cached
+        outputs found". Full VG propagation instead carries each prompted object
+        across slices through the Tracker's internal memory + keep-alive, which
+        is the supported mechanism. ``apply_temporal_disambiguation=False`` (the
+        server default) disables the hot-start heuristic that would otherwise
+        suppress a prompted object that is not re-detected every frame.
+
+        A single multi-box prompt (not one ``add_prompt`` per box) is required
+        because the detector path resets the inference state on every call, so
+        sequential prompts would wipe each other — the cause of multi-object
+        seeds collapsing to one. The obj_id ↔ target_id mapping the caller
+        assigns keeps numbering consistent across frames.
 
         Yields ``(frame_idx_local: int, {obj_id: mask (H,W) bool})`` for every
         propagated frame, forward then backward from the seed.
         """
         predictor = self._ensure_video_predictor()
         with self._autocast_ctx(), self._inference_ctx():
-            seed_frame_objects: dict[int, np.ndarray] = {}
-            for seed in seeds:
-                seeded = predictor.add_prompt(
-                    inference_state=self._track_state,
-                    frame_idx=int(seed_local),
-                    text_str=str(seed.get("text") or "visual"),
-                    points=None,
-                    point_labels=None,
-                    boxes_xywh=[list(seed["box_xywh"])],
-                    box_labels=[1],
-                    obj_id=int(seed["obj_id"]),
-                )
-                # add_prompt returns (frame_idx, output_dict) for the prompted
-                # frame. This output bypasses propagate's consecutive-detection
-                # "confirmation" gate, which otherwise drops a box/visual-prompted
-                # object on every frame (symptom: track done, 0 objects). The
-                # box path also ignores the obj_id we pass and assigns its own,
-                # so attribute the returned mask(s) back to this seed's obj_id.
-                detected = _seed_output_objects(seeded)
-                if detected is not None:
-                    seed_frame_objects[int(seed["obj_id"])] = detected
+            seed_frame_objects, model_to_seed_id = self._seed_frame_via_detector(
+                predictor, seeds, int(seed_local)
+            )
             logger.info(
-                "track seed frame: %d/%d seed object(s) detected (ids=%s, seed_local=%d)",
+                "track seed frame: %d/%d seed object(s) detected "
+                "(seed_ids=%s, model_to_seed=%s, seed_local=%d)",
                 len(seed_frame_objects),
                 len(seeds),
                 sorted(seed_frame_objects),
+                model_to_seed_id,
                 int(seed_local),
             )
             # Emit the directly-prompted seed frame first so a good seed always
@@ -181,7 +190,61 @@ class SAM3Engine:
                     max_frame_num_to_track=budget,
                     reverse=reverse,
                 ):
-                    yield int(frame_idx_local), _extract_objects(outputs)
+                    model_objects = _extract_objects(outputs)
+                    # Only keep objects we can attribute to a requested seed;
+                    # the detector path assigns its own ids, mapped on the seed
+                    # frame. ``model_to_seed_id`` is stable across propagation
+                    # because the Tracker keeps each masklet's id.
+                    yield int(frame_idx_local), {
+                        model_to_seed_id[model_id]: mask
+                        for model_id, mask in model_objects.items()
+                        if model_id in model_to_seed_id
+                    }
+
+    def _seed_frame_via_detector(
+        self,
+        predictor: Any,
+        seeds: list[dict[str, Any]],
+        seed_local: int,
+    ) -> tuple[dict[int, np.ndarray], dict[int, int]]:
+        """Add every seed box in one VG prompt; map detections back to seed ids.
+
+        Returns ``(seed_frame_objects, model_to_seed_id)`` where
+        ``seed_frame_objects`` is ``{seed_id: mask}`` on the seed frame and
+        ``model_to_seed_id`` maps the detector's internal object ids to the
+        caller's seed ids so propagated frames can be attributed.
+        """
+        boxes: list[list[float]] = []
+        box_seed_ids: list[int] = []
+        for seed in seeds:
+            box = seed.get("box_xywh")
+            if box and len(box) >= 4:
+                boxes.append([float(v) for v in box[:4]])
+                box_seed_ids.append(int(seed["obj_id"]))
+        text = ""
+        for seed in seeds:
+            if seed.get("text"):
+                text = str(seed["text"])
+                break
+
+        seeded = predictor.add_prompt(
+            inference_state=self._track_state,
+            frame_idx=int(seed_local),
+            text_str=text or "visual",
+            points=None,
+            point_labels=None,
+            boxes_xywh=boxes or None,
+            box_labels=[1] * len(boxes) if boxes else None,
+            obj_id=None,
+        )
+        objects = _extract_objects(_seed_output_dict(seeded))
+        model_to_seed_id = _match_models_to_seeds(objects, boxes, box_seed_ids)
+        seed_frame_objects = {
+            seed_id: objects[model_id]
+            for model_id, seed_id in model_to_seed_id.items()
+            if model_id in objects
+        }
+        return seed_frame_objects, model_to_seed_id
 
     def init_track_state(self, frames_dir: str | Path):
         """Open a video session on a JPEG frame directory. Call before track_video."""
@@ -251,6 +314,9 @@ class SAM3Engine:
     def _ensure_video_predictor(self):
         self._ensure_processor()
         if self._video_predictor is not None:
+            # Idempotent: guarantees the connected-components fallback is active
+            # even on a worker warmed before this code was deployed.
+            _install_cpu_connected_components_fallback()
             return self._video_predictor
         if not self.load_video:
             raise RuntimeError(
@@ -276,8 +342,98 @@ class SAM3Engine:
             checkpoint_path=str(self.checkpoint_path),
             device=self.device,
             strict_state_dict_loading=False,
+            # Natural-video temporal disambiguation uses a 15-frame hot-start
+            # window and may suppress visual-prompted objects that are not
+            # repeatedly re-detected. Geological tracking commonly uses only
+            # 5–11 adjacent slices, so the interactive prompt must be allowed
+            # to propagate directly instead of being removed by that heuristic.
+            apply_temporal_disambiguation=self.video_temporal_disambiguation,
         )
+        _install_cpu_connected_components_fallback()
         self._video_load_error = None
+
+
+def _install_cpu_connected_components_fallback() -> None:
+    """Route SAM3's connected-components through the CPU/skimage backend.
+
+    The Tracker's ``fill_holes_in_mask_scores`` calls
+    ``sam3.perflib.connected_components.connected_components``. Without the
+    optional ``cc_torch`` extension, that dispatches to a Triton CUDA kernel
+    which crashes with ``Triton Error [CUDA]: invalid argument`` on several
+    GPU/Triton/driver combinations — surfacing only on the Tracker (memory)
+    seeding path. ``cc_torch`` present → the fast native kernel is reliable, so
+    we leave it untouched. Otherwise we force the (slightly slower but correct)
+    CPU implementation instead of the broken Triton path. ``fill_holes`` runs
+    on small object masks, so the CPU cost is negligible.
+
+    Idempotent: ``_get_connected_components_with_padding`` re-imports the symbol
+    on every call, so replacing the module attribute is enough.
+    """
+    try:
+        import sam3.perflib.connected_components as cc_mod
+    except Exception:  # noqa: BLE001 - perflib is optional; nothing to patch
+        return
+    if getattr(cc_mod, "_yj_forced_cpu_cc", False):
+        return
+    if getattr(cc_mod, "HAS_CC_TORCH", False):
+        return  # native cc_torch kernel is reliable; keep the fast path
+
+    skimage_impl = getattr(cc_mod, "connected_components_cpu", None)
+
+    def _cpu_connected_components(input_tensor):  # type: ignore[no-untyped-def]
+        tensor = input_tensor
+        if tensor.dim() == 3:
+            tensor = tensor.unsqueeze(1)
+        cv2_result = _connected_components_cv2(tensor)
+        if cv2_result is not None:
+            return cv2_result
+        if skimage_impl is not None:
+            return skimage_impl(tensor)
+        raise RuntimeError(
+            "SAM3 connected-components fallback failed: neither cv2 nor "
+            "scikit-image is available, and the Triton kernel is broken on this GPU."
+        )
+
+    cc_mod.connected_components = _cpu_connected_components
+    cc_mod._yj_forced_cpu_cc = True
+    logger.warning(
+        "SAM3: cc_torch not installed; forcing CPU connected-components to avoid "
+        "the Triton 'invalid argument' kernel crash on the Tracker seeding path."
+    )
+
+
+def _connected_components_cv2(tensor):
+    """OpenCV connected-components matching SAM3's ``(labels, counts)`` contract.
+
+    Input is a ``(B,1,H,W)`` mask tensor; returns ``(labels, counts)`` of the
+    same shape on the same device, where ``counts`` holds each pixel's component
+    size (background == 0). Returns ``None`` if cv2/torch are unavailable so the
+    caller can try the skimage backend instead.
+    """
+    try:
+        import cv2
+        import numpy as _np
+        import torch
+    except Exception:  # noqa: BLE001 - let the caller fall through to skimage
+        return None
+    binary = (tensor != 0).to("cpu", torch.uint8).numpy()  # (B,1,H,W)
+    batch, _ch, height, width = binary.shape
+    labels_out = _np.zeros((batch, height, width), dtype=_np.int32)
+    counts_out = _np.zeros((batch, height, width), dtype=_np.int32)
+    for b in range(batch):
+        num, labelled, stats, _centroids = cv2.connectedComponentsWithStats(
+            binary[b, 0], connectivity=8
+        )
+        labels_out[b] = labelled
+        if num > 0:
+            areas = stats[:, cv2.CC_STAT_AREA].astype(_np.int32)
+            # Background is label 0; SAM3 expects its per-pixel count to be 0.
+            areas[0] = 0
+            counts_out[b] = areas[labelled]
+    out_shape = tensor.shape
+    labels_t = torch.from_numpy(labels_out).to(tensor.device).view(out_shape)
+    counts_t = torch.from_numpy(counts_out).to(tensor.device).view(out_shape)
+    return labels_t, counts_t
 
 
 def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -306,26 +462,112 @@ def decode_sam3_masks(state: dict[str, Any]) -> list[dict[str, Any]]:
     return detections
 
 
-def _seed_output_objects(seeded: Any) -> np.ndarray | None:
-    """Return the seed object's mask from a video ``add_prompt`` return value.
+def _seed_output_dict(seeded: Any) -> dict[str, Any]:
+    """Pull the output dict out of a SAM3 ``add_prompt`` return value.
 
-    The SAM3 video model's box/visual ``add_prompt`` returns
-    ``(frame_idx, output_dict)`` where ``output_dict`` carries
-    ``out_binary_masks`` / ``out_obj_ids`` (same shape as a propagate frame).
-    For single-object seeding we take the largest-area mask as the seed object;
-    returns ``None`` when the seed frame produced no object (off-target box or
-    a confidence miss — the box format/threshold then needs attention).
+    ``add_prompt`` returns ``(frame_idx, output_dict)`` on the detector path
+    (and may return longer tuples on other paths); normalise to the dict.
     """
-    output = seeded
+    if isinstance(seeded, dict):
+        return seeded
     if isinstance(seeded, tuple):
-        # (frame_idx, output_dict) — or longer tuples on the points path.
-        output = next((item for item in seeded if isinstance(item, dict)), None)
-    if not isinstance(output, dict):
-        return None
-    objects = _extract_objects(output)
-    if not objects:
-        return None
-    return max(objects.values(), key=lambda mask: int(np.asarray(mask, dtype=bool).sum()))
+        found = next((item for item in seeded if isinstance(item, dict)), None)
+        if found is not None:
+            return found
+    return {}
+
+
+def _match_models_to_seeds(
+    objects: dict[int, np.ndarray],
+    boxes: list[list[float]],
+    seed_ids: list[int],
+) -> dict[int, int]:
+    """Attribute detector object ids to the caller's seed ids.
+
+    ``objects`` is ``{model_id: mask}`` from the seed frame. ``boxes`` are the
+    normalised top-left ``[x,y,w,h]`` seed boxes, parallel to ``seed_ids``. Each
+    seed is greedily matched to the unused detection whose mask bounding box has
+    the highest IoU with the seed box; seeds/detections that cannot be matched
+    by overlap fall back to descending-area order. Returns ``{model_id: seed_id}``.
+    """
+    if not objects or not seed_ids:
+        return {}
+    model_items = sorted(
+        objects.items(),
+        key=lambda item: int(np.asarray(item[1], dtype=bool).sum()),
+        reverse=True,
+    )
+    model_ids = [mid for mid, _ in model_items]
+    model_boxes = {mid: _mask_norm_box(mask) for mid, mask in objects.items()}
+
+    mapping: dict[int, int] = {}
+    used_models: set[int] = set()
+
+    # Pass 1: best-IoU greedy matching when seed boxes are available.
+    for seed_box, seed_id in zip(boxes, seed_ids):
+        best_mid: int | None = None
+        best_iou = 0.0
+        for mid in model_ids:
+            if mid in used_models:
+                continue
+            iou = _iou_xywh(seed_box, model_boxes[mid])
+            if iou > best_iou:
+                best_iou, best_mid = iou, mid
+        if best_mid is not None and best_iou > 0.0:
+            mapping[best_mid] = seed_id
+            used_models.add(best_mid)
+
+    # Pass 2: assign any still-unmatched seeds to the largest free detection
+    # (covers text-only seeds with no box, or detections that don't overlap).
+    matched_seed_ids = set(mapping.values())
+    free_models = [mid for mid in model_ids if mid not in used_models]
+    for seed_id in seed_ids:
+        if seed_id in matched_seed_ids:
+            continue
+        if not free_models:
+            break
+        mid = free_models.pop(0)
+        mapping[mid] = seed_id
+        used_models.add(mid)
+        matched_seed_ids.add(seed_id)
+
+    return mapping
+
+
+def _mask_norm_box(mask: np.ndarray) -> list[float]:
+    """Normalised top-left ``[x,y,w,h]`` bounding box of a boolean mask."""
+    arr = np.asarray(mask, dtype=bool)
+    if arr.ndim != 2 or not arr.any():
+        return [0.0, 0.0, 0.0, 0.0]
+    height, width = arr.shape
+    rows = np.any(arr, axis=1)
+    cols = np.any(arr, axis=0)
+    y0, y1 = np.where(rows)[0][[0, -1]]
+    x0, x1 = np.where(cols)[0][[0, -1]]
+    return [
+        float(x0) / width,
+        float(y0) / height,
+        float(x1 - x0 + 1) / width,
+        float(y1 - y0 + 1) / height,
+    ]
+
+
+def _iou_xywh(a: list[float], b: list[float]) -> float:
+    """IoU of two normalised top-left ``[x,y,w,h]`` boxes."""
+    if len(a) < 4 or len(b) < 4:
+        return 0.0
+    ax0, ay0, aw, ah = (float(v) for v in a[:4])
+    bx0, by0, bw, bh = (float(v) for v in b[:4])
+    ax1, ay1 = ax0 + aw, ay0 + ah
+    bx1, by1 = bx0 + bw, by0 + bh
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0.0 else 0.0
 
 
 def _extract_objects(outputs: Any) -> dict[int, np.ndarray]:

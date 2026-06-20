@@ -89,6 +89,9 @@ def _worker_init(counter, lock, gpu_ids, engine_cfg) -> None:
             resolution=int(engine_cfg.get("resolution", 1008)),
             source_root=engine_cfg.get("source_root"),
             load_video=bool(engine_cfg.get("load_video", True)),
+            video_temporal_disambiguation=bool(
+                engine_cfg.get("video_temporal_disambiguation", False)
+            ),
         )
         engine.warmup()
         _ENGINE = engine

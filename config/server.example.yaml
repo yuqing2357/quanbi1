@@ -39,6 +39,9 @@ sam3:
   device: cuda
   resolution: 1008
   load_video: true
+  # Geological slice tracking uses short windows; keep natural-video
+  # 15-frame hot-start suppression disabled unless explicitly testing it.
+  video_temporal_disambiguation: false
   results_subdir: sam3
   gpu_ids: [0, 1, 2, 3]
   worker_count: 4

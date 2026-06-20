@@ -14,6 +14,7 @@ from yj_studio.services.section_service import (
     well_intersection,
 )
 from yj_studio.services.horizon_service import find_horizon_high_point, sample_volume_along_horizon
+from yj_studio.view.view_2d_section import section_navigation_state
 
 
 def test_extract_inline_section_uses_z_by_xline_orientation() -> None:
@@ -32,6 +33,26 @@ def test_extract_inline_section_uses_z_by_xline_orientation() -> None:
     np.testing.assert_array_equal(section.values, volume[1, :, :].T)
     assert section.x_label == "Xline"
     assert section.y_label == "Sample"
+
+
+def test_section_navigation_state_shows_neighbor_inline_numbers() -> None:
+    state = section_navigation_state("inline", 1479, (2959, 2201, 2826))
+
+    assert state["previous_text"] == "← 上一个 Inline（1478）"
+    assert state["current_text"] == "当前 Inline：1479 / 2958"
+    assert state["next_text"] == "下一个 Inline（1480）→"
+    assert state["previous_enabled"] is True
+    assert state["next_enabled"] is True
+
+
+def test_section_navigation_state_disables_xline_at_bounds() -> None:
+    first = section_navigation_state("xline", 0, (10, 20, 30))
+    last = section_navigation_state("xline", 19, (10, 20, 30))
+
+    assert first["previous_enabled"] is False
+    assert first["next_text"] == "下一个 Xline（1）→"
+    assert last["previous_text"] == "← 上一个 Xline（18）"
+    assert last["next_enabled"] is False
 
 
 def test_horizon_intersection_inline_returns_one_row() -> None:

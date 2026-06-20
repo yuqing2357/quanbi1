@@ -530,7 +530,30 @@ class RemoteSAM3TrackTask(QObject):
             self._finished_emitted = True
             target_ids = result.get("target_ids", [])
             count = len(target_ids) if isinstance(target_ids, list) else 0
-            self.finished.emit(result, f"追踪完成：{count} 个目标")
+            diagnostics = result.get("tracking_diagnostics", {})
+            persisted = (
+                diagnostics.get("persisted_target_frames", {})
+                if isinstance(diagnostics, dict)
+                else {}
+            )
+            requested = (
+                int(diagnostics.get("requested_frame_count", 0) or 0)
+                if isinstance(diagnostics, dict)
+                else 0
+            )
+            frame_counts = [
+                int(value)
+                for value in persisted.values()
+                if isinstance(value, int | float)
+            ] if isinstance(persisted, dict) else []
+            if frame_counts:
+                detail = "，".join(str(value) for value in frame_counts)
+                suffix = f"；有效帧数：{detail}"
+                if requested:
+                    suffix += f" / 请求 {requested}"
+            else:
+                suffix = "；服务器未返回帧统计"
+            self.finished.emit(result, f"追踪完成：{count} 个目标{suffix}")
         elif state == "cancelled":
             self._finished_emitted = True
             self.cancelled.emit()

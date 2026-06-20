@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 BUILTIN_TARGET_TYPES: tuple[str, ...] = (
@@ -138,6 +138,19 @@ class TargetSet(BaseModel):
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
 
+    @model_validator(mode="after")
+    def _advance_sequence_past_existing_ids(self) -> "TargetSet":
+        """Keep migrated/stale stores from reusing historical numeric ids."""
+
+        numeric_ids = [
+            int(target_id[1:])
+            for target_id in self.targets
+            if target_id.startswith("T") and target_id[1:].isdigit()
+        ]
+        if numeric_ids:
+            self.next_seq = max(int(self.next_seq), max(numeric_ids) + 1)
+        return self
+
     def new_id(self, prefix: str = "T") -> str:
         while True:
             target_id = f"{prefix}{self.next_seq}"
@@ -184,4 +197,11 @@ class TargetSet(BaseModel):
                     "updated_at": target.updated_at,
                 }
             )
-        return sorted(rows, key=lambda row: row["id"])
+        return sorted(rows, key=lambda row: _target_id_sort_key(str(row["id"])))
+
+
+def _target_id_sort_key(target_id: str) -> tuple[str, int, str]:
+    prefix = target_id.rstrip("0123456789")
+    suffix = target_id[len(prefix) :]
+    number = int(suffix) if suffix else -1
+    return prefix, number, target_id

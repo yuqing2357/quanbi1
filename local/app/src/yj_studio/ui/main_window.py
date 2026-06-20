@@ -334,6 +334,7 @@ class MainWindow(QMainWindow):
         dock = TargetDock(
             self.layer_store,
             self.target_store,
+            volume_store=self.volume_store,
             undo_stack=self.undo_stack,
             parent=self,
         )

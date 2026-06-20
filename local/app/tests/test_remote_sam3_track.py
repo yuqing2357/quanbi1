@@ -98,7 +98,14 @@ class _FakeTrackClient:
 
     def result(self, job_id: str) -> dict[str, Any]:
         assert job_id == "job-1"
-        return {"job_id": job_id, "target_ids": ["T1", "T2"]}
+        return {
+            "job_id": job_id,
+            "target_ids": ["T1", "T2"],
+            "tracking_diagnostics": {
+                "requested_frame_count": 11,
+                "persisted_target_frames": {"T1": 9, "T2": 7},
+            },
+        }
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         self.cancelled.append(job_id)
@@ -120,4 +127,16 @@ def test_remote_sam3_track_task_finishes_with_result(qapp) -> None:
     assert client.busy_messages == ["远程 SAM3 追踪中"]
     assert client.ready_count == 1
     assert progress[0][1] == "已提交远程 SAM3 追踪任务"
-    assert finished == [({"job_id": "job-1", "target_ids": ["T1", "T2"]}, "追踪完成：2 个目标")]
+    assert finished == [
+        (
+            {
+                "job_id": "job-1",
+                "target_ids": ["T1", "T2"],
+                "tracking_diagnostics": {
+                    "requested_frame_count": 11,
+                    "persisted_target_frames": {"T1": 9, "T2": 7},
+                },
+            },
+            "追踪完成：2 个目标；有效帧数：9，7 / 请求 11",
+        )
+    ]

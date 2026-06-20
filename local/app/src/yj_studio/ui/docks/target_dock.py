@@ -5,6 +5,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QUndoStack
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QDockWidget,
@@ -21,12 +22,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from yj_studio.ai.adapters import build_mask_layer, sam3_mask_to_layer
 from yj_studio.data import RemoteTargetStore
 from yj_studio.data.remote_target_store import Mask3DResult
 from yj_studio.scene.layer_store import LayerStore
-from yj_studio.scene.layers import MaskLayer
-from yj_studio.scene.undo_commands import AddLayerCommand
 from yj_studio_core.targets import (
     BUILTIN_TARGET_TYPES,
     DEFAULT_VOXEL_SPACING,
@@ -47,16 +45,19 @@ class TargetDock(QDockWidget):
         layer_store: LayerStore,
         target_store: RemoteTargetStore | None,
         *,
+        volume_store=None,
         undo_stack: QUndoStack | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__("目标", parent)
         self._layer_store = layer_store
         self._target_store = target_store
+        self._volume_store = volume_store
         self._undo_stack = undo_stack
         self._targets: dict[str, GeoTarget] = {}
         self._volume_stats: dict[str, dict[str, object]] = {}
         self._pending_suggestion: dict[str, object] | None = None
+        self._visualization_windows: list[QDialog] = []
 
         root = QWidget(self)
         layout = QVBoxLayout(root)
@@ -88,11 +89,39 @@ class TargetDock(QDockWidget):
         layout.addLayout(suggestion_row)
         self._clear_suggestion()
 
-        self._table = QTableWidget(0, 7, root)
-        self._table.setHorizontalHeaderLabels(["ID", "类型", "状态", "帧", "面积", "体积", "Score"])
+        self._table = QTableWidget(0, 9, root)
+        headers = [
+            "目标编号",
+            "目标类型",
+            "结果形式",
+            "状态",
+            "切片范围",
+            "有效帧数",
+            "累计面积(px)",
+            "体积(m³)",
+            "置信度",
+        ]
+        self._table.setHorizontalHeaderLabels(headers)
+        header_tips = [
+            "服务器项目内唯一编号；编号持久化保存，删除后不会复用。",
+            "目标的地质类别，例如浊积体、圈闭、断层或未分类。",
+            "区分单帧分割与跨切片追踪；“追踪仅1帧”表示传播没有产生有效相邻帧。",
+            "目标当前生命周期状态。",
+            "目标所在方向及最小—最大切片索引。",
+            "当前保存了有效 mask 的切片数量。",
+            "所有有效帧 mask 像素数之和，不是三维体积。",
+            "根据三维 mask 与体素间距估算的物理体积。",
+            "模型输出置信度；越接近 1 通常表示模型越确定。",
+        ]
+        for column, tip in enumerate(header_tips):
+            item = self._table.horizontalHeaderItem(column)
+            if item is not None:
+                item.setToolTip(tip)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setWordWrap(False)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
@@ -127,6 +156,8 @@ class TargetDock(QDockWidget):
         load_row = QHBoxLayout()
         self._load_mask_button = QPushButton("2D", root)
         self._load_cells_button = QPushButton("3D", root)
+        self._load_mask_button.setToolTip("打开目标前后切片追踪回放")
+        self._load_cells_button.setToolTip("打开独立的三维目标体窗口")
         self._train_button = QPushButton("训练集", root)
         self._models_button = QPushButton("模型", root)
         for button in (
@@ -161,13 +192,22 @@ class TargetDock(QDockWidget):
             return
         self._targets = dict(target_set.targets)
         rows = target_set.summaries(include_deleted=False)
+        self._status_label.setText(
+            f"远程目标 · 当前显示 {len(rows)} 个 · 下一个编号 T{target_set.next_seq}"
+        )
+        self._status_label.setToolTip(
+            "目标编号由服务器 targets.json 中的 next_seq 持久化分配。"
+            "删除、合并或拆分过的编号不会回收，因此编号允许存在空缺。"
+        )
         self._table.setRowCount(len(rows))
         for row, summary in enumerate(rows):
             values = [
                 summary.get("id", ""),
-                summary.get("type", ""),
-                summary.get("status", ""),
+                _target_type_text(str(summary.get("type", ""))),
+                _result_kind_text(self._targets.get(str(summary.get("id", "")))),
+                _target_status_text(str(summary.get("status", ""))),
                 summary.get("frame_range", ""),
+                summary.get("frame_count", 0),
                 summary.get("area_px", 0),
                 _volume_text(self._targets.get(str(summary.get("id", ""))), self._volume_stats),
                 "" if summary.get("score") is None else f"{float(summary['score']):.3f}",
@@ -200,6 +240,40 @@ class TargetDock(QDockWidget):
             widget.setEnabled(enabled)
 
     def show_track_result(self, result: dict[str, object]) -> None:
+        target_ids = result.get("target_ids", [])
+        if isinstance(target_ids, list):
+            self._select_target_ids([str(item) for item in target_ids if str(item)])
+        diagnostics = result.get("tracking_diagnostics")
+        if isinstance(diagnostics, dict):
+            persisted = diagnostics.get("persisted_target_frames", {})
+            requested = int(diagnostics.get("requested_frame_count", 0) or 0)
+            counts = (
+                [int(value) for value in persisted.values() if isinstance(value, int | float)]
+                if isinstance(persisted, dict)
+                else []
+            )
+            if counts and max(counts) <= 1 and requested > 1:
+                collected = diagnostics.get("collected_object_frames", {})
+                collected_text = (
+                    ", ".join(f"{key}={value}" for key, value in collected.items())
+                    if isinstance(collected, dict)
+                    else ""
+                )
+                QMessageBox.warning(
+                    self,
+                    "追踪诊断",
+                    "本次请求包含 "
+                    f"{requested} 帧，但服务器最终只保存了 1 个有效帧。\n"
+                    f"模型收集阶段：{collected_text or '无详细数据'}。\n"
+                    "这表示问题发生在模型传播或传播输出收集阶段，而不是 2D/3D 显示阶段。",
+                )
+        else:
+            QMessageBox.information(
+                self,
+                "追踪诊断",
+                "服务器没有返回逐阶段帧统计。当前服务器可能尚未更新到新的追踪诊断版本，"
+                "因此暂时无法判断相邻帧是在模型传播、结果收集还是保存阶段丢失。",
+            )
         suggestions = result.get("suggestions", [])
         if not isinstance(suggestions, list):
             self._clear_suggestion()
@@ -218,6 +292,21 @@ class TargetDock(QDockWidget):
         self._suggestion_label.setVisible(True)
         self._suggestion_confirm_button.setVisible(True)
         self._suggestion_ignore_button.setVisible(True)
+
+    def _select_target_ids(self, target_ids: list[str]) -> None:
+        if not target_ids:
+            return
+        preferred = target_ids[0]
+        self._table.clearSelection()
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            target_id = str(item.data(Qt.ItemDataRole.UserRole) if item is not None else "")
+            if target_id != preferred:
+                continue
+            self._table.selectRow(row)
+            if item is not None:
+                self._table.scrollToItem(item)
+            return
 
     def _selected_ids(self) -> list[str]:
         selection = self._table.selectionModel()
@@ -347,37 +436,39 @@ class TargetDock(QDockWidget):
         target = self._selected_target()
         if target is None or self._target_store is None:
             return
-        frame = _first_frame(target)
-        if frame is None:
-            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            mask = self._target_store.fetch_mask(target.id, frame.axis, frame.index, volume_id=target.volume_id)
-            layer = build_mask_layer(
-                sam3_mask_to_layer(mask),
-                name=f"{target.id} {target.type}",
-                axis=_desktop_axis(frame.axis),
-                slice_index=frame.index,
-                score=target.score,
-                metadata={
-                    "target_id": target.id,
-                    "target_type": target.type,
-                    "volume_id": target.volume_id,
-                    "remote_target": True,
-                },
-                provenance={"source": "sam3.target"},
+            from yj_studio.ui.dialogs.target_visualization_dialog import (
+                TargetTrack2DDialog,
+                load_tracking_frames,
             )
-            self._add_layer(layer)
+
+            frames = load_tracking_frames(
+                target,
+                self._target_store,
+                self._volume_store,
+            )
+            if not frames:
+                QMessageBox.information(self, "目标", "该目标没有可显示的追踪帧。")
+                return
+            dialog = TargetTrack2DDialog(target, frames, self)
+            self._show_visualization_window(dialog)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "目标", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _load_selected_cells(self) -> None:
         target = self._selected_target()
         if target is None or self._target_store is None:
             return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self._load_selected_mask3d(target)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "目标", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _load_selected_mask3d(self, target: GeoTarget) -> None:
         if self._target_store is None:
@@ -394,29 +485,31 @@ class TargetDock(QDockWidget):
         stats = _mask3d_metadata(target, mask, result)
         self._volume_stats[target.id] = stats
         target.metadata.update(stats)
-        layer = MaskLayer(
-            name=f"{target.id} 目标体",
-            mask=mask,
+        from yj_studio.ui.dialogs.target_visualization_dialog import TargetVolume3DDialog
+
+        dialog = TargetVolume3DDialog(
+            target,
+            mask,
             axis=axis,
-            slice_index=index_lo,
-            confidence=target.score,
+            index_lo=index_lo,
+            voxel_spacing=tuple(float(v) for v in stats["voxel_spacing"]),
             color=_target_mask_color(target.type),
-            opacity=0.46,
-            metadata={
-                "target_id": target.id,
-                "target_type": target.type,
-                "volume_id": target.volume_id,
-                "remote_target": True,
-                "mask3d": True,
-                "mask3d_index_lo": index_lo,
-                "source_axis": target_axis,
-                "external_mask3d_ref": f"/sam3/targets/{target.id}/mask3d",
-                **stats,
-            },
-            provenance={"source": "sam3.target.mask3d"},
+            parent=self,
         )
-        self._add_layer(layer)
+        self._show_visualization_window(dialog)
         self._update_volume_cell(target.id)
+
+    def _show_visualization_window(self, dialog: QDialog) -> None:
+        self._visualization_windows.append(dialog)
+
+        def _forget(*_args) -> None:
+            if dialog in self._visualization_windows:
+                self._visualization_windows.remove(dialog)
+
+        dialog.destroyed.connect(_forget)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _submit_train_export(self) -> None:
         if self._target_store is None:
@@ -449,22 +542,12 @@ class TargetDock(QDockWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "审校", str(exc))
 
-    def _add_layer(self, layer) -> None:
-        if self._undo_stack is not None:
-            command = AddLayerCommand(self._layer_store, layer)
-            self._undo_stack.push(command)
-            if command.layer_id is not None:
-                self._layer_store.select([command.layer_id])
-            return
-        layer_id = self._layer_store.add(layer)
-        self._layer_store.select([layer_id])
-
     def _update_volume_cell(self, target_id: str) -> None:
         text = _volume_text(self._targets.get(target_id), self._volume_stats)
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 0)
             if item is not None and str(item.data(Qt.ItemDataRole.UserRole)) == target_id:
-                self._table.setItem(row, 5, QTableWidgetItem(text))
+                self._table.setItem(row, 7, QTableWidgetItem(text))
                 return
 
 
@@ -497,6 +580,39 @@ def _target_mask_color(target_type: str) -> tuple[float, float, float, float]:
     from yj_studio_core.targets import target_type_color
 
     return target_type_color(target_type or "unknown", alpha=0.46)
+
+
+def _target_type_text(target_type: str) -> str:
+    return {
+        "trap": "圈闭",
+        "turbidite": "浊积体",
+        "fault": "断层",
+        "sandbody": "砂体",
+        "unknown": "未分类",
+    }.get(target_type, target_type or "未分类")
+
+
+def _target_status_text(status: str) -> str:
+    return {
+        "active": "活动",
+        "to_review": "待审校",
+        "lost": "追踪丢失",
+        "merged": "已合并",
+        "split": "已拆分",
+        "confirmed": "已确认",
+        "rejected": "已打回",
+        "deleted": "已删除",
+    }.get(status, status)
+
+
+def _result_kind_text(target: GeoTarget | None) -> str:
+    if target is None:
+        return ""
+    if target.source == "sam3_video":
+        return "多帧追踪" if target.frame_count > 1 else "追踪仅1帧"
+    if target.frame_count > 1:
+        return "多帧目标"
+    return "单帧分割"
 
 
 def _mask3d_metadata(target: GeoTarget, mask: np.ndarray, result: Mask3DResult) -> dict[str, object]:

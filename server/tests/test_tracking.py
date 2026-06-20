@@ -13,12 +13,12 @@ from pathlib import Path
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-for _src in (_REPO_ROOT / "server" / "src", _REPO_ROOT / "apps" / "yj_studio" / "src"):
+for _src in (_REPO_ROOT / "server" / "src", _REPO_ROOT / "shared" / "src"):
     if str(_src) not in sys.path:
         sys.path.insert(0, str(_src))
 
 from yj_studio_core.targets import TargetStore  # noqa: E402
-from yj_studio_core.targets.model import TargetStatus  # noqa: E402
+from yj_studio_core.targets.model import GeoTarget, TargetSet, TargetStatus  # noqa: E402
 from yj_studio_server.sam3.reassociate import link_targets_by_iou  # noqa: E402
 from yj_studio_server.sam3.tracking import collect_object_frames, persist_tracked_targets  # noqa: E402
 
@@ -44,6 +44,13 @@ class FakeTrackEngine:
                 mask[min(k, h - 1), :] = True  # distinct row per object
                 per_obj[oid] = mask
             yield frame_idx_local, per_obj
+
+
+def test_target_sequence_resumes_after_highest_persisted_id() -> None:
+    target_set = TargetSet(next_seq=1, targets={"T46": GeoTarget(id="T46")})
+
+    assert target_set.next_seq == 47
+    assert target_set.new_id() == "T47"
 
 
 def test_track_assigns_one_consistent_id_per_object(tmp_path: Path) -> None:
@@ -185,5 +192,6 @@ def test_persist_can_link_track_to_existing_target_and_mark_gap(tmp_path: Path) 
     assert set(loaded.targets) == {"T1"}
     target = loaded.targets["T1"]
     assert target.status == TargetStatus.LOST
+    assert target.source == "sam3_video"
     assert sorted(frame.index for frame in target.frames.values()) == [5, 6]
     assert target.metadata["tracking"]["last_gap"]["missing"] == [7, 8]

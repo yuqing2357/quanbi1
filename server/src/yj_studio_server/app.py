@@ -761,6 +761,9 @@ def _engine_cfg(cfg: ServerConfig) -> dict[str, Any]:
         "device": str(sam3_cfg.get("device", "cuda")),
         "resolution": int(sam3_cfg.get("resolution", 1008)),
         "load_video": bool(sam3_cfg.get("load_video", True)),
+        "video_temporal_disambiguation": bool(
+            sam3_cfg.get("video_temporal_disambiguation", False)
+        ),
         # File the GPU workers poll to hot-swap checkpoints without a restart.
         "reload_signal_path": str(cfg.runtime_root / "sam3_active_checkpoint.json"),
     }
@@ -774,6 +777,7 @@ def _make_sam3_engine(cfg: ServerConfig) -> SAM3Engine:
         resolution=spec["resolution"],
         source_root=spec["source_root"],
         load_video=spec["load_video"],
+        video_temporal_disambiguation=spec["video_temporal_disambiguation"],
     )
 
 
@@ -1274,8 +1278,18 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             if not boxes:
                 raise ValueError("text seeding produced no detections to track")
 
+        # SAM3's video model is detector-first: each seed box is added as one
+        # multi-box visual-grounding prompt and carried across slices by full
+        # propagation (the Tracker's memory + keep-alive). The bare point/mask
+        # Tracker path is a refinement layer that requires a prior propagation
+        # cache, so it cannot seed a fresh state.
+        track_mode = "detector_vg"
         seeds = [
-            {"obj_id": k, "box_xywh": _box_to_norm_xywh(box, seed_w, seed_h), "text": text}
+            {
+                "obj_id": k,
+                "box_xywh": _box_to_norm_xywh(box, seed_w, seed_h),
+                "text": text,
+            }
             for k, box in enumerate(boxes, start=1)
         ]
 
@@ -1391,6 +1405,24 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             link_resolver=_resolve_link,
         )
         suggestions = _target_suggestions(object_suggestions, summary.get("obj_to_target_id", {}))
+        collected_object_frames = {
+            str(obj_id): len(frames)
+            for obj_id, frames in collected.items()
+        }
+        tracking_diagnostics = {
+            "requested_frame_count": len(indices),
+            "requested_frame_range": [idx_lo, idx_hi],
+            "collected_object_frames": collected_object_frames,
+            "persisted_target_frames": dict(summary.get("per_target_frames", {})),
+            "missing_frames": {
+                str(obj_id): list(details.get("missing", []))
+                for obj_id, details in gap_metadata.items()
+            },
+            "video_temporal_disambiguation": bool(
+                cfg.sam3.get("video_temporal_disambiguation", False)
+            ),
+            "track_mode": track_mode,
+        }
 
         result = {
             "job_id": job_id,
@@ -1403,6 +1435,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             "target_set_url": f"/sam3/targets?project={project}&volume_id={volume_id}",
             "gaps": {str(key): value for key, value in gap_metadata.items()},
             "suggestions": suggestions,
+            "tracking_diagnostics": tracking_diagnostics,
             **summary,
         }
         jobs.update(job_id, state=JobState.done, progress=1.0, message="done", result=result)

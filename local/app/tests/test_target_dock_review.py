@@ -4,7 +4,6 @@ import numpy as np
 
 from yj_studio.data.remote_target_store import Mask3DResult
 from yj_studio.scene.layer_store import LayerStore
-from yj_studio.scene.layers import MaskLayer
 from yj_studio.ui.docks.target_dock import TargetDock
 from yj_studio_core.targets import GeoTarget, TargetFrame, TargetSet, TargetStatus
 from yj_studio.ui.docks.target_dock import _ReviewQueueDialog, _review_rows
@@ -56,8 +55,8 @@ def test_review_dialog_patches_selected_status_and_removes_rows(qapp) -> None:
     dialog.close()
 
 
-def test_target_dock_loads_mask3d_as_volume_layer_with_volume_stats() -> None:
-    from PyQt6.QtWidgets import QApplication
+def test_target_dock_opens_mask3d_in_standalone_window_with_volume_stats(monkeypatch) -> None:
+    from PyQt6.QtWidgets import QApplication, QDialog
 
     app = QApplication.instance() or QApplication([])
     target = GeoTarget(id="T1", type="sandbody", volume_id="model_lithology", score=0.7)
@@ -85,22 +84,51 @@ def test_target_dock_loads_mask3d_as_volume_layer_with_volume_stats() -> None:
                 voxel_spacing_source="config",
             )
 
+    captured: dict[str, object] = {}
+
+    class FakeVolumeDialog(QDialog):
+        def __init__(
+            self,
+            selected_target,
+            selected_mask,
+            *,
+            axis,
+            index_lo,
+            voxel_spacing,
+            color,
+            parent=None,
+        ) -> None:
+            super().__init__(parent)
+            captured.update(
+                target=selected_target,
+                mask=selected_mask,
+                axis=axis,
+                index_lo=index_lo,
+                voxel_spacing=voxel_spacing,
+                color=color,
+            )
+
+    monkeypatch.setattr(
+        "yj_studio.ui.dialogs.target_visualization_dialog.TargetVolume3DDialog",
+        FakeVolumeDialog,
+    )
     layer_store = LayerStore()
     dock = TargetDock(layer_store, FakeStore())  # type: ignore[arg-type]
     dock.refresh()
 
     dock._load_selected_mask3d(target)
 
-    layers = list(layer_store.iter_layers())
-    assert len(layers) == 1
-    layer = layers[0]
-    assert isinstance(layer, MaskLayer)
-    assert layer.mask is not None and layer.mask.shape == (2, 3, 4)
-    assert layer.metadata["mask3d"] is True
-    assert layer.metadata["mask3d_index_lo"] == 10
-    assert layer.metadata["voxel_count"] == 2
-    assert layer.metadata["voxel_spacing"] == [12.5 / 3.0, 12.5 / 3.0, 10.0 / 3.0]
-    assert layer.metadata["volume_m3"] == 115.74074074074076
-    assert dock._table.item(0, 5).text() == "116 m3"
+    assert list(layer_store.iter_layers()) == []
+    assert captured["target"] is target
+    assert np.asarray(captured["mask"]).shape == (2, 3, 4)
+    assert captured["axis"] == "inline"
+    assert captured["index_lo"] == 10
+    assert captured["voxel_spacing"] == (12.5 / 3.0, 12.5 / 3.0, 10.0 / 3.0)
+    assert target.metadata["voxel_count"] == 2
+    assert target.metadata["volume_m3"] == 115.74074074074076
+    assert dock._table.item(0, 2).text() == "单帧分割"
+    assert dock._table.item(0, 3).text() == "活动"
+    assert dock._table.item(0, 5).text() == "1"
+    assert dock._table.item(0, 7).text() == "116 m3"
     dock.close()
     app.processEvents()
