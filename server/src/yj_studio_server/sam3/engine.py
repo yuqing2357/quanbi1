@@ -127,6 +127,8 @@ class SAM3Engine:
         seed_local: int,
         fwd_budget: int,
         back_budget: int,
+        auto_stop: bool = False,
+        disappear_patience: int = 3,
     ):
         """Multi-object propagation over a pre-rendered JPEG frame sequence.
 
@@ -162,6 +164,12 @@ class SAM3Engine:
 
         Yields ``(frame_idx_local: int, {obj_id: mask (H,W) bool})`` for every
         propagated frame, forward then backward from the seed.
+
+        When ``auto_stop`` is set the caller does not know how far the target
+        persists, so each direction is propagated over a large budget and cut
+        off as soon as *every* tracked object has produced an empty mask for
+        ``disappear_patience`` consecutive frames (the target has left the
+        volume). The seed frame itself never counts toward the patience.
         """
         predictor = self._ensure_video_predictor()
         with self._autocast_ctx(), self._inference_ctx():
@@ -181,9 +189,11 @@ class SAM3Engine:
             # yields at least one tracked frame, regardless of propagation.
             if seed_frame_objects:
                 yield int(seed_local), dict(seed_frame_objects)
+            patience = max(1, int(disappear_patience))
             for reverse, budget in ((False, int(fwd_budget)), (True, int(back_budget))):
                 if budget <= 0:
                     continue
+                consecutive_empty = 0
                 for frame_idx_local, outputs in predictor.propagate_in_video(
                     inference_state=self._track_state,
                     start_frame_idx=int(seed_local),
@@ -195,11 +205,30 @@ class SAM3Engine:
                     # the detector path assigns its own ids, mapped on the seed
                     # frame. ``model_to_seed_id`` is stable across propagation
                     # because the Tracker keeps each masklet's id.
-                    yield int(frame_idx_local), {
+                    mapped = {
                         model_to_seed_id[model_id]: mask
                         for model_id, mask in model_objects.items()
                         if model_id in model_to_seed_id
                     }
+                    yield int(frame_idx_local), mapped
+                    if not auto_stop:
+                        continue
+                    # Auto range: stop this direction once the target has gone
+                    # (all masks empty) for ``patience`` consecutive frames.
+                    alive = any(
+                        np.asarray(mask, dtype=bool).any() for mask in mapped.values()
+                    )
+                    consecutive_empty = 0 if alive else consecutive_empty + 1
+                    if consecutive_empty >= patience:
+                        logger.info(
+                            "track auto-stop %s direction at frame_local=%d "
+                            "(%d consecutive empty frames, patience=%d)",
+                            "reverse" if reverse else "forward",
+                            int(frame_idx_local),
+                            consecutive_empty,
+                            patience,
+                        )
+                        break
 
     def _seed_frame_via_detector(
         self,
@@ -246,15 +275,69 @@ class SAM3Engine:
         }
         return seed_frame_objects, model_to_seed_id
 
-    def init_track_state(self, frames_dir: str | Path):
-        """Open a video session on a JPEG frame directory. Call before track_video."""
+    def init_track_state(self, frames_dir: str | Path, *, async_loading: bool = True):
+        """Open a video session on a JPEG frame directory. Call before track_video.
+
+        ``async_loading=True`` (the default) loads frames lazily as propagation
+        reaches them instead of materialising the whole window up front. Combined
+        with the auto-stop break in :meth:`track_video`, frames past the point
+        where the target disappears are never decoded into memory at all — this
+        is what keeps a local-target track from OOM-ing on a large auto window.
+        Any previously open state is released first so video sessions never stack.
+        """
         predictor = self._ensure_video_predictor()
-        self._track_state = predictor.init_state(
-            resource_path=str(frames_dir),
-            async_loading_frames=False,
-            video_loader_type="jpg",
-        )
+        self.reset_track_state()
+        try:
+            self._track_state = predictor.init_state(
+                resource_path=str(frames_dir),
+                async_loading_frames=bool(async_loading),
+                offload_video_to_cpu=True,
+                video_loader_type="jpg",
+            )
+        except TypeError:
+            # Older predictor builds without these kwargs: fall back to eager.
+            self._track_state = predictor.init_state(
+                resource_path=str(frames_dir),
+                video_loader_type="jpg",
+            )
         return self._track_state
+
+    def reset_track_state(self) -> None:
+        """Drop the current video session and free its GPU/CPU buffers.
+
+        The SAM3 video state holds per-frame image features and the Tracker's
+        memory bank; without an explicit release it stays resident until the next
+        ``init_state`` and accumulates across repeated track jobs (a slow-burn
+        OOM). Call after every track job — see ``collect_object_frames``.
+        """
+        state = self._track_state
+        self._track_state = None
+        if state is not None:
+            reset = getattr(self._video_predictor, "reset_state", None)
+            if callable(reset):
+                try:
+                    reset(state)
+                except Exception:  # noqa: BLE001 - best-effort cleanup
+                    pass
+        del state
+        self._empty_cuda_cache()
+
+    def empty_cache(self) -> None:
+        """Public hook so the GPU worker can release cached blocks after a task."""
+        self._empty_cuda_cache()
+
+    def _empty_cuda_cache(self) -> None:
+        if "cuda" not in self.device:
+            return
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - cache release is best-effort
+            pass
 
     def _autocast_ctx(self):
         # SAM3's add_prompt / propagate_in_video are NOT internally autocast

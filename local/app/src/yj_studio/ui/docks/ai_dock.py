@@ -28,6 +28,7 @@ from typing import Any
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QUndoStack
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
@@ -48,8 +49,8 @@ from PyQt6.QtWidgets import (
 from yj_studio.ai.state import AIServiceState
 from yj_studio.algorithms.runner import AlgorithmRunner, RemoteSAM3TrackTask
 from yj_studio.scene.layer_store import LayerStore
-from yj_studio.scene.layers import VolumeLayer
-from yj_studio.scene.undo_commands import AddLayerCommand
+from yj_studio.scene.layers import MaskLayer, VolumeLayer
+from yj_studio.scene.undo_commands import AddLayerCommand, RemoveLayerCommand
 from yj_studio.tools.tool_manager import ToolManager
 from yj_studio_core.targets import BUILTIN_TARGET_TYPES
 from yj_studio.ui.text import ai_state_label, section_axis_label
@@ -161,6 +162,14 @@ class AIDock(QDockWidget):
         self._top_k_spin.setRange(1, 50)
         self._top_k_spin.setValue(3)
         run_form.addRow("保留前 K", self._top_k_spin)
+        # When checked, the segmentation result is restricted to the single
+        # detection that best fills each selection box (feature: 只保留框内目标).
+        # This supersedes "保留前 K", which is only used in the unchecked /
+        # text-only case, so the spin is disabled while strict mode is on.
+        self._box_strict_check = QCheckBox("仅保留框内目标", body)
+        self._box_strict_check.setChecked(True)
+        self._box_strict_check.toggled.connect(self._on_box_strict_toggled)
+        run_form.addRow("", self._box_strict_check)
         self._target_type_combo = QComboBox(body)
         self._target_type_combo.setEditable(True)
         self._target_type_combo.addItems(list(BUILTIN_TARGET_TYPES))
@@ -174,6 +183,11 @@ class AIDock(QDockWidget):
         self._track_fwd_spin.setRange(0, 5000)
         self._track_fwd_spin.setValue(20)
         run_form.addRow("种子后帧数", self._track_fwd_spin)
+        # Auto range: ignore the manual front/back counts and let the server
+        # propagate until the target disappears, then lock the valid extent.
+        self._auto_range_check = QCheckBox("自动判断帧数", body)
+        self._auto_range_check.toggled.connect(self._on_auto_range_toggled)
+        run_form.addRow("", self._auto_range_check)
         outer.addLayout(run_form)
 
         # Run row
@@ -190,6 +204,14 @@ class AIDock(QDockWidget):
         run_row.addWidget(self._cancel_button)
         outer.addLayout(run_row)
 
+        # Wipe every SAM3 mask visualisation from the scene without restarting,
+        # so a fresh box selection starts from a clean slate.
+        clear_row = QHBoxLayout()
+        self._clear_masks_button = QPushButton("清空所有 Mask 显示", body)
+        self._clear_masks_button.clicked.connect(self._clear_all_masks)
+        clear_row.addWidget(self._clear_masks_button)
+        outer.addLayout(clear_row)
+
         self._progress_bar = QProgressBar(body)
         self._progress_bar.setRange(0, 100)
         outer.addWidget(self._progress_bar)
@@ -197,6 +219,10 @@ class AIDock(QDockWidget):
         self._summary_label = QLabel("", body)
         self._summary_label.setWordWrap(True)
         outer.addWidget(self._summary_label)
+
+        # Reflect the default toggle states (strict box on, auto off).
+        self._on_box_strict_toggled(self._box_strict_check.isChecked())
+        self._on_auto_range_toggled(self._auto_range_check.isChecked())
 
         self.setWidget(body)
 
@@ -273,6 +299,44 @@ class AIDock(QDockWidget):
         self._points.clear()
         self._prompts_list.clear()
 
+    def _clear_all_masks(self) -> None:
+        """Remove every SAM3 mask layer from the scene and reset the prompts.
+
+        Targets the AI-sourced ``MaskLayer`` visualisations only, so manually
+        painted masks survive. Routed through the undo stack so the wipe is one
+        reversible step. Tracking results live in the server-side target store
+        and are managed from the target dock, not here.
+        """
+        mask_ids = [
+            layer.id
+            for layer in self._layer_store.iter_by_type(MaskLayer)
+            if str((getattr(layer, "provenance", {}) or {}).get("source", "")).startswith("ai")
+        ]
+        if mask_ids:
+            if self._undo_stack is not None:
+                self._undo_stack.beginMacro("清空 SAM3 Mask 显示")
+                try:
+                    for layer_id in mask_ids:
+                        self._undo_stack.push(RemoveLayerCommand(self._layer_store, layer_id))
+                finally:
+                    self._undo_stack.endMacro()
+            else:
+                for layer_id in mask_ids:
+                    self._layer_store.remove(layer_id)
+        self._clear_prompts()
+        self._progress_bar.setValue(0)
+        self._summary_label.setText(f"已清空 {len(mask_ids)} 个 Mask 显示。")
+
+    def _on_box_strict_toggled(self, checked: bool) -> None:
+        # "保留前 K" is only meaningful when not restricting to the framed target.
+        self._top_k_spin.setEnabled(not checked)
+
+    def _on_auto_range_toggled(self, checked: bool) -> None:
+        # Manual front/back counts are ignored while the server auto-detects the
+        # valid extent, so grey them out to make the active mode obvious.
+        self._track_back_spin.setEnabled(not checked)
+        self._track_fwd_spin.setEnabled(not checked)
+
     def _activate_box_tool(self) -> None:
         try:
             self._tool_manager.activate("ai_box_prompt")
@@ -315,6 +379,7 @@ class AIDock(QDockWidget):
             "points": list(self._points),
             "confidence_threshold": float(self._confidence_spin.value()),
             "keep_top_k": int(self._top_k_spin.value()),
+            "box_strict": bool(self._box_strict_check.isChecked()),
             "target_type": self._target_type_combo.currentText().strip() or "unknown",
             "name_prefix": "SAM3",
         }
@@ -365,6 +430,8 @@ class AIDock(QDockWidget):
             "text": self._text_edit.toPlainText().strip(),
             "confidence": float(self._confidence_spin.value()),
             "keep_top_k": int(self._top_k_spin.value()),
+            "box_strict": bool(self._box_strict_check.isChecked()),
+            "auto": bool(self._auto_range_check.isChecked()),
             "target_type": self._target_type_combo.currentText().strip() or "unknown",
         }
         self._summary_label.setText("")

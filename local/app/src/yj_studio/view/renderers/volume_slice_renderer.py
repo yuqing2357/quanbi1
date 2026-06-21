@@ -9,6 +9,7 @@ import pyvista as pv
 from yj_studio.data.volume_store import SliceAxis, VolumeStore
 from yj_studio.scene.layers import VolumeLayer
 from yj_studio.view.display_coordinates import display_z
+from yj_studio.view.physical_axes import volume_axes_ranges
 
 try:
     from matplotlib import colormaps
@@ -50,6 +51,7 @@ class VolumeSliceRenderer:
             return
         for axis in ("inline", "xline", "z"):
             self.render_axis(axis)
+        self._update_physical_bounds()
         self._plotter.render()
 
     def render_axis(self, axis: TextureAxis) -> None:
@@ -100,9 +102,47 @@ class VolumeSliceRenderer:
             return None
         return np.isfinite(mask_slice)
 
+    def _update_physical_bounds(self) -> None:
+        """Label the 3D bounding box in metres (depth on Z) without rescaling.
+
+        The slice meshes stay in index space, so the scene's proportions are
+        unchanged; ``axes_ranges`` only overrides the numbers VTK prints on the
+        bounds box. No-op (silently) when the volume has no physical spacing or
+        the plotter does not support a bounds grid (e.g. headless tests).
+        """
+        layer = self._layer
+        if layer is None:
+            return
+        ranges = volume_axes_ranges(layer.shape, layer.metadata)
+        show_bounds = getattr(self._plotter, "show_bounds", None)
+        if ranges is None or not callable(show_bounds):
+            return
+        axes_ranges, titles = ranges
+        try:
+            show_bounds(
+                axes_ranges=axes_ranges,
+                xtitle=titles[0],
+                ytitle=titles[1],
+                ztitle=titles[2],
+                grid=False,
+                location="outer",
+                use_3d_text=False,
+            )
+        except Exception:  # pragma: no cover - depends on live VTK backend
+            pass
+
+    def _remove_physical_bounds(self) -> None:
+        remover = getattr(self._plotter, "remove_bounds_axes", None)
+        if callable(remover):
+            try:
+                remover()
+            except Exception:  # pragma: no cover - depends on live VTK backend
+                pass
+
     def clear(self) -> None:
         for actor_name in self.ACTOR_NAMES.values():
             self._plotter.remove_actor(actor_name, reset_camera=False, render=False)
+        self._remove_physical_bounds()
         self._plotter.render()
 
 

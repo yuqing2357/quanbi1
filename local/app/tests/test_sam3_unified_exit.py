@@ -86,6 +86,7 @@ def test_remote_sam3_client_submit_segment_posts_jobs_contract(monkeypatch, qapp
         "point_box_radius_px": 9.0,
         "confidence": 0.55,
         "keep_top_k": 2,
+        "box_strict": False,
     }
 
 

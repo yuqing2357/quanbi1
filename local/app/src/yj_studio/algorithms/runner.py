@@ -327,6 +327,7 @@ class RemoteSAM3Task(QObject):
                 confidence=float(self._params.get("confidence_threshold", 0.4)),
                 keep_top_k=int(self._params.get("keep_top_k", 3)),
                 target_type=str(self._params.get("target_type", "unknown")),
+                box_strict=bool(self._params.get("box_strict", False)),
             )
         except Exception as exc:  # noqa: BLE001 - UI task boundary
             self._client.mark_ready()

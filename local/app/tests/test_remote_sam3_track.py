@@ -62,6 +62,8 @@ def test_remote_sam3_client_submit_track_posts_contract(monkeypatch, qapp) -> No
         "prompts": {"text": "sandbody", "boxes": [[1.0, 2.0, 10.0, 20.0]]},
         "confidence": 0.55,
         "keep_top_k": 2,
+        "box_strict": False,
+        "auto": False,
     }
 
 

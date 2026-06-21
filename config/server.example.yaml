@@ -37,11 +37,34 @@ sam3:
   checkpoint: weights/sam3.pt
   source_root: libs
   device: cuda
+  # Image-segmentation input size. NOTE: this does NOT affect tracking memory —
+  # SAM3's video model hardcodes image_size=1008 (build_sam3_video_model), so
+  # every tracked frame is resized to 1008x1008 regardless of this value or the
+  # input slice size. Tracking VRAM is bounded by track_chunk below, not here.
   resolution: 1008
   load_video: true
   # Geological slice tracking uses short windows; keep natural-video
   # 15-frame hot-start suppression disabled unless explicitly testing it.
   video_temporal_disambiguation: false
+  # Auto track range ("自动判断帧数"): when the client requests auto=true,
+  # tracking sweeps to the volume edge in each direction and stops a direction
+  # once the target disappears for ``auto_disappear_patience`` consecutive
+  # frames — the target's true extent decides the span, NOT a fixed window.
+  # This is an OPTIONAL safety cap on how far each direction may sweep if the
+  # disappearance heuristic never fires (e.g. a runaway track). 0 (default) =
+  # no cap (bounded only by the volume edge + the dynamic stop). Set a positive
+  # value only to hard-limit a runaway sweep.
+  auto_track_max: 0
+  auto_disappear_patience: 3
+  # Chunked propagation = the VRAM bound. SAM3 keeps every propagated frame's
+  # mask-memory on the GPU and forward+backward share one inference state, so a
+  # single long propagation OOMs (~1 GB/frame at resolution 1008). Tracking
+  # instead runs this many frames at a time, releases the state, and re-seeds
+  # the next chunk from the last mask bbox — so peak VRAM is ONE chunk no matter
+  # how far back/fwd reaches. 12 keeps a chunk well under a 24 GB card; lower it
+  # if a chunk still OOMs, raise it for fewer re-seeds (slightly better
+  # continuity) when you have spare VRAM.
+  track_chunk: 12
   results_subdir: sam3
   gpu_ids: [0, 1, 2, 3]
   worker_count: 4

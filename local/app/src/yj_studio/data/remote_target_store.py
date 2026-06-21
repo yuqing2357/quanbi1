@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 
+from yj_studio_core.masks import decode_sparse_mask, is_sparse_mask_payload
 from yj_studio_core.targets import GeoTarget, TargetSet
 
 
@@ -73,9 +74,9 @@ class RemoteTargetStore:
         *,
         volume_id: str | None = None,
     ) -> np.ndarray:
-        return self._get_npy(
+        return self._get_mask_npy(
             f"/sam3/targets/{quote(target_id)}/mask/{quote(axis)}/{int(index)}",
-            query={"project": self.project_id, "volume_id": volume_id},
+            query={"project": self.project_id, "volume_id": volume_id, "format": "sparse"},
         )
 
     def fetch_cells(self, target_id: str, *, volume_id: str | None = None) -> np.ndarray:
@@ -221,6 +222,19 @@ class RemoteTargetStore:
     def _get_npy(self, path: str, query: dict[str, Any] | None = None) -> np.ndarray:
         with urlopen(self._url(path, query), timeout=self.timeout_s) as response:
             data = response.read()
+        return np.load(BytesIO(data), allow_pickle=False)
+
+    def _get_mask_npy(self, path: str, query: dict[str, Any] | None = None) -> np.ndarray:
+        # Mask endpoints honour ?format=sparse: a tiny bbox/bit-packed JSON the
+        # client expands locally. Older servers stream dense .npy bytes instead,
+        # which decode transparently here.
+        with urlopen(self._url(path, query), timeout=self.timeout_s) as response:
+            content_type = response.headers.get("Content-Type", "")
+            data = response.read()
+        if "json" in content_type.lower() or data[:1] == b"{":
+            payload = json.loads(data.decode("utf-8"))
+            if is_sparse_mask_payload(payload):
+                return decode_sparse_mask(payload)
         return np.load(BytesIO(data), allow_pickle=False)
 
     def _get_npy_with_headers(self, path: str, query: dict[str, Any] | None = None) -> Mask3DResult:

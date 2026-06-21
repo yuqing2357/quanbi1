@@ -41,6 +41,7 @@ from yj_studio.services.section_service import (
 from yj_studio.services.view_sync_service import ViewSyncService
 from yj_studio.ui.text import measurement_value_label, section_axis_label
 from yj_studio.view.highlight import highlight_color, is_layer_highlighted, selected_well_names
+from yj_studio.view.physical_axes import apply_section_axis_units
 from yj_studio_core.volume_grid import local_to_seismic_index, seismic_to_local_index
 
 
@@ -198,8 +199,13 @@ class View2DSection(QWidget):
             )
         self._draw_overlays()
         self._axes.set_title(self.title)
-        self._axes.set_xlabel(section.x_label)
-        self._axes.set_ylabel(section.y_label)
+        apply_section_axis_units(
+            self._axes,
+            self.axis,
+            volume_layer.metadata,
+            fallback_x_label=section.x_label,
+            fallback_y_label=section.y_label,
+        )
         self._canvas.draw_idle()
 
     def _update_navigation(self) -> None:

@@ -21,6 +21,93 @@ from ..targets import GeoTarget, TargetSet, TargetStatus, TargetStore
 logger = logging.getLogger(__name__)
 
 
+def mask_bbox_xyxy(mask: Any) -> list[float] | None:
+    """Tight bounding box ``[xmin, ymin, xmax, ymax]`` (x=col, y=row) or ``None``."""
+    arr = np.asarray(mask, dtype=bool)
+    if arr.ndim != 2 or not arr.any():
+        return None
+    rows = np.flatnonzero(arr.any(axis=1))
+    cols = np.flatnonzero(arr.any(axis=0))
+    return [float(cols[0]), float(rows[0]), float(cols[-1]) + 1.0, float(rows[-1]) + 1.0]
+
+
+def chunked_track(
+    *,
+    seed: int,
+    fwd: int,
+    back: int,
+    axis_len: int,
+    seed_boxes: dict[int, list[float]],
+    chunk_size: int,
+    run_chunk: Callable[[list[int], int, dict[int, list[float]]], dict[int, dict[int, np.ndarray]]],
+    cancelled: Callable[[], bool] | None = None,
+    progress: Callable[[int], None] | None = None,
+) -> dict[int, dict[int, np.ndarray]]:
+    """Expand tracking outward from ``seed`` one bounded chunk at a time.
+
+    SAM3 keeps every propagated frame's mask-memory on the GPU, so a single long
+    propagation OOMs. Instead we propagate a small chunk, release the state, and
+    re-seed the next chunk from the previous chunk's last in-direction mask bbox
+    (``run_chunk`` builds + tracks one chunk and returns ``{obj_id: {abs_index:
+    mask}}``). Peak VRAM is bounded by one chunk regardless of total span; the
+    relay also stops a direction naturally once the target leaves (no mask to
+    seed the next chunk from).
+
+    ``run_chunk(chunk_indices, seed_local_in_chunk, boxes_by_obj)`` renders the
+    given absolute frame indices, seeds ``boxes_by_obj`` (pixel ``xyxy`` per
+    object) at ``chunk_indices[seed_local_in_chunk]``, propagates within the
+    chunk, and returns the per-object masks keyed by absolute frame index.
+    """
+    collected: dict[int, dict[int, np.ndarray]] = {int(oid): {} for oid in seed_boxes}
+    chunk = max(2, int(chunk_size))
+    for reverse, budget in ((False, int(fwd)), (True, int(back))):
+        if budget <= 0:
+            continue
+        anchor = int(seed)
+        relay: dict[int, list[float]] = {int(o): list(b) for o, b in seed_boxes.items()}
+        remaining = int(budget)
+        while remaining > 0 and relay:
+            if cancelled is not None and cancelled():
+                return collected
+            n = min(chunk, remaining)
+            if not reverse:
+                lo, hi = anchor, min(axis_len - 1, anchor + n)
+            else:
+                lo, hi = max(0, anchor - n), anchor
+            if hi <= lo:
+                break  # hit the volume boundary
+            chunk_indices = list(range(lo, hi + 1))
+            seed_local = anchor - lo
+            chunk_collected = run_chunk(chunk_indices, seed_local, dict(relay))
+            for obj_id, frames in chunk_collected.items():
+                if int(obj_id) in collected:
+                    collected[int(obj_id)].update(frames)
+            # Relay each object from its furthest in-direction non-empty mask.
+            new_relay: dict[int, list[float]] = {}
+            new_anchor = anchor
+            for obj_id in relay:
+                frames = chunk_collected.get(obj_id, {})
+                cand = [i for i in frames if (i > anchor if not reverse else i < anchor)]
+                if not cand:
+                    continue
+                far = max(cand) if not reverse else min(cand)
+                bbox = mask_bbox_xyxy(frames[far])
+                if bbox is None:
+                    continue
+                new_relay[int(obj_id)] = bbox
+                if abs(far - seed) > abs(new_anchor - seed):
+                    new_anchor = far
+            advanced = abs(new_anchor - anchor)
+            if not new_relay or advanced <= 0:
+                break  # target gone or no forward progress -> lock this direction
+            remaining -= advanced
+            anchor = new_anchor
+            relay = new_relay
+            if progress is not None:
+                progress(sum(len(frames) for frames in collected.values()))
+    return collected
+
+
 def collect_object_frames(
     engine: Any,
     frames_dir: Any,
@@ -32,39 +119,55 @@ def collect_object_frames(
     indices: list[int],
     cancelled: Callable[[], bool] | None = None,
     progress: Callable[[int], None] | None = None,
+    auto_stop: bool = False,
+    disappear_patience: int = 3,
 ) -> dict[int, dict[int, np.ndarray]]:
     """Drive the engine's video predictor and bucket masks per object.
 
     Returns ``{obj_id: {absolute_frame_index: mask (H,W) bool}}``. Frame-local
     indices yielded by the predictor are mapped back to absolute volume indices
     via ``indices`` (``indices[frame_idx_local]``). Empty masks are dropped.
+
+    ``auto_stop`` forwards the auto-range behaviour to the engine: propagation
+    is cut off in each direction once the target disappears for
+    ``disappear_patience`` consecutive frames, so the caller need not know the
+    target's extent up front.
     """
     engine.init_track_state(frames_dir)
     collected: dict[int, dict[int, np.ndarray]] = {int(s["obj_id"]): {} for s in seeds}
     yielded_frames = 0
     seen_obj_ids: set[int] = set()
     empty_or_oob = 0
-    for frame_idx_local, per_obj in engine.track_video(
-        frames_dir,
-        seeds=seeds,
-        seed_local=seed_local,
-        fwd_budget=fwd_budget,
-        back_budget=back_budget,
-    ):
-        if cancelled is not None and cancelled():
-            break
-        yielded_frames += 1
-        if not 0 <= frame_idx_local < len(indices):
-            empty_or_oob += 1
-            continue
-        abs_index = indices[frame_idx_local]
-        for obj_id, mask in per_obj.items():
-            seen_obj_ids.add(int(obj_id))
-            mask_arr = np.asarray(mask, dtype=bool)
-            if int(obj_id) in collected and mask_arr.any():
-                collected[int(obj_id)][abs_index] = mask_arr
-        if progress is not None:
-            progress(sum(len(frames) for frames in collected.values()))
+    try:
+        for frame_idx_local, per_obj in engine.track_video(
+            frames_dir,
+            seeds=seeds,
+            seed_local=seed_local,
+            fwd_budget=fwd_budget,
+            back_budget=back_budget,
+            auto_stop=auto_stop,
+            disappear_patience=disappear_patience,
+        ):
+            if cancelled is not None and cancelled():
+                break
+            yielded_frames += 1
+            if not 0 <= frame_idx_local < len(indices):
+                empty_or_oob += 1
+                continue
+            abs_index = indices[frame_idx_local]
+            for obj_id, mask in per_obj.items():
+                seen_obj_ids.add(int(obj_id))
+                mask_arr = np.asarray(mask, dtype=bool)
+                if int(obj_id) in collected and mask_arr.any():
+                    collected[int(obj_id)][abs_index] = mask_arr
+            if progress is not None:
+                progress(sum(len(frames) for frames in collected.values()))
+    finally:
+        # Release the video session + CUDA cache so repeated tracks don't stack
+        # up resident GPU memory (slow-burn OOM). No-op on fake test engines.
+        reset = getattr(engine, "reset_track_state", None)
+        if callable(reset):
+            reset()
     # Diagnostic: a successful job that collects nothing (the "追踪完成，0 个目标"
     # symptom) is almost always a seed mismatch — wrong obj_ids, an off-target
     # seed box (all masks empty), or out-of-range frame indices. Log the shape

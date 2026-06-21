@@ -13,18 +13,21 @@ from typing import Any, Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from yj_studio_core.volume_grid import grid_reference_from_mapping
+
+from yj_studio_core.masks import encode_sparse_mask
 
 from .cache import enforce_slice_cache_budget
 from .config import ServerConfig, load_config
 from .sam3.gpu_pool import GpuWorkerPool
 from .volume_cache import VolumeCache
 from .sam3 import JobQueue, JobState, JobStore, SAM3Engine
+from .sam3.detections import limit_detections
 from .sam3.image import slice_to_rgb_image
 from .sam3.models import ModelRegistry
 from .sam3.reassociate import annotate_gaps, detect_merge_split, link_targets_by_iou
-from .sam3.tracking import collect_object_frames, persist_tracked_targets
+from .sam3.tracking import chunked_track, collect_object_frames, persist_tracked_targets
 from .sam3.training import run_training_backend
 from .sam3.validation import validate_sam3_payload
 from .targets import (
@@ -168,20 +171,21 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         return job.result
 
     @app.get("/sam3/jobs/{job_id}/mask/{candidate_index}")
-    def sam3_job_mask(job_id: str, candidate_index: int) -> Response:
+    def sam3_job_mask(
+        job_id: str,
+        candidate_index: int,
+        format: str | None = Query(None),
+    ) -> Response:
         job = _get_job_or_404(app, job_id)
         if candidate_index < 0 or candidate_index >= len(job.mask_paths):
             raise HTTPException(status_code=404, detail=f"Unknown mask candidate: {candidate_index}")
         path = Path(job.mask_paths[candidate_index])
         if not path.exists():
             raise HTTPException(status_code=404, detail=f"Mask file not found: {path}")
-        return FileResponse(
+        return _mask_response(
             path,
-            media_type="application/x-npy",
-            headers={
-                "X-SAM3-Job-Id": job.id,
-                "X-SAM3-Candidate": str(candidate_index),
-            },
+            format,
+            {"X-SAM3-Job-Id": job.id, "X-SAM3-Candidate": str(candidate_index)},
         )
 
     @app.post("/sam3/jobs/{job_id}/cancel")
@@ -387,6 +391,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         index: int,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        format: str | None = Query(None),
     ) -> Response:
         store = _target_store(cfg, project=project, volume_id=volume_id)
         target = _get_target_or_404(store, target_id)
@@ -396,10 +401,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         path = store.resolve_ref(frame.mask_ref)
         if not path.exists():
             raise HTTPException(status_code=404, detail=f"Target mask file not found: {path}")
-        return FileResponse(
+        return _mask_response(
             path,
-            media_type="application/x-npy",
-            headers={"X-Target-Id": target_id, "X-Target-Axis": frame.axis, "X-Target-Index": str(frame.index)},
+            format,
+            {"X-Target-Id": target_id, "X-Target-Axis": frame.axis, "X-Target-Index": str(frame.index)},
         )
 
     @app.put("/sam3/targets/{target_id}/mask/{axis}/{index}")
@@ -630,6 +635,15 @@ def _volume_grid_reference(
     metadata.update(spec)
     reference = grid_reference_from_mapping(metadata)
     reference["metadata_path"] = str(metadata_path) if metadata_path.exists() else None
+    # Absolute depth datum for the sample axis, so the desktop can label depth in
+    # metres instead of sample index. Only present when the source metadata knows
+    # it (e.g. the reservoir model); seismic without a datum keeps index display.
+    depth_range = metadata.get("depth_range_m")
+    if isinstance(depth_range, (list, tuple)) and len(depth_range) >= 2:
+        try:
+            reference["depth_range_m"] = [float(depth_range[0]), float(depth_range[1])]
+        except (TypeError, ValueError):
+            pass
     return reference
 
 
@@ -1056,19 +1070,24 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         prompts = payload.get("prompts") or {}
         if not isinstance(prompts, dict):
             prompts = {}
+        prompt_boxes = _list_of_float_lists(prompts.get("boxes", []))
         jobs.update(job_id, progress=0.25, message="running SAM3")
         detections = _segment_on_engine(
             app,
             rgb,
             text=str(prompts.get("text", payload.get("text", ""))),
-            boxes=_list_of_float_lists(prompts.get("boxes", [])),
+            boxes=prompt_boxes,
             points=_list_of_float_lists(prompts.get("points", [])),
             point_box_radius_px=float(payload.get("point_box_radius_px", 8.0)),
             confidence=float(payload.get("confidence", payload.get("confidence_threshold", 0.4))),
         )
         detections.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        keep_top_k = int(payload.get("keep_top_k", 3))
-        detections = detections[: max(1, keep_top_k)]
+        detections = limit_detections(
+            detections,
+            box_strict=bool(payload.get("box_strict")),
+            boxes=prompt_boxes,
+            keep_top_k=int(payload.get("keep_top_k", 3)),
+        )
 
         jobs.update(job_id, progress=0.85, message="writing masks")
         output_dir = _sam3_job_output_dir(cfg, job_id)
@@ -1240,6 +1259,30 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         axis_index = {"inline": 0, "xline": 1, "z": 2}[volume_axis]
 
         seed, back, fwd = _parse_track_range(payload)
+        # Auto range: the user did not pin the sweep length. Tracking expands
+        # outward in bounded chunks (below) and stops a direction once the target
+        # leaves, so auto just sets a generous per-direction budget the chunked
+        # sweep won't normally reach.
+        auto_range = bool(payload.get("auto"))
+        # Optional *safety* cap per direction for auto tracking — NOT the normal
+        # terminator. Auto tracking expands outward in bounded chunks and stops a
+        # direction once the target disappears for ``disappear_patience``
+        # consecutive frames (engine.track_video / tracking.chunked_track). This
+        # cap only clips a runaway sweep when the disappearance heuristic never
+        # fires; ``<= 0`` means "bounded only by the volume edge + the dynamic
+        # stop". A payload ``auto_track_max`` overrides the config. The old code
+        # pinned this at 40, which truncated targets that genuinely persisted
+        # past 40 frames (the "stops at 81 frames" symptom).
+        auto_track_max = int(payload.get("auto_track_max", cfg.sam3.get("auto_track_max", 0)))
+        disappear_patience = max(1, int(payload.get("disappear_patience", cfg.sam3.get("auto_disappear_patience", 3))))
+        # Chunk size = the VRAM bound. SAM3 keeps every propagated frame's
+        # mask-memory on the GPU and forward+backward share one inference state,
+        # so a single long propagation OOMs. We instead propagate this many
+        # frames at a time, release the state, and re-seed the next chunk from
+        # the last mask bbox (see tracking.chunked_track). Peak VRAM is one
+        # chunk regardless of how far (back/fwd) the target is tracked. Keep it
+        # within a single card's budget (~1 GB/frame at resolution 1008).
+        track_chunk = max(2, int(cfg.sam3.get("track_chunk", 12)))
         prompts = payload.get("prompts") if isinstance(payload.get("prompts"), dict) else {}
         boxes = _list_of_float_lists(prompts.get("boxes", []))
         text = str(prompts.get("text", payload.get("text", "")))
@@ -1256,12 +1299,18 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         seed_data, shape = _slice_array(arr, volume_axis, seed)
         axis_len = int(shape[axis_index])
         seed = max(0, min(seed, axis_len - 1))
+        if auto_range:
+            # Sweep to the volume edge in each direction and let the dynamic
+            # disappear-stop decide where the target actually ends. The safety
+            # cap (if configured > 0) only clips a runaway sweep; it must never
+            # be the reason a still-visible target stops being tracked.
+            back = seed
+            fwd = axis_len - 1 - seed
+            if auto_track_max > 0:
+                back = min(back, auto_track_max)
+                fwd = min(fwd, auto_track_max)
         idx_lo = max(0, seed - back)
         idx_hi = min(axis_len - 1, seed + fwd)
-        indices = list(range(idx_lo, idx_hi + 1))
-        seed_local = seed - idx_lo
-        fwd_budget = idx_hi - seed
-        back_budget = seed - idx_lo
 
         engine = app.state.sam3
         seed_rgb = slice_to_rgb_image(np.asarray(seed_data, dtype=np.float32).T, clim=clim)
@@ -1283,32 +1332,15 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         # propagation (the Tracker's memory + keep-alive). The bare point/mask
         # Tracker path is a refinement layer that requires a prior propagation
         # cache, so it cannot seed a fresh state.
-        track_mode = "detector_vg"
-        seeds = [
-            {
-                "obj_id": k,
-                "box_xywh": _box_to_norm_xywh(box, seed_w, seed_h),
-                "text": text,
-            }
-            for k, box in enumerate(boxes, start=1)
-        ]
-
-        # Render frames to JPEG (image order: rows=samples, cols=trace).
-        tempdir = Path(tempfile.mkdtemp(prefix=f"yj_track_{job_id}_"))
-        for offset, idx in enumerate(indices):
-            if _job_cancelled(jobs, job_id):
-                return
-            data, _shape = _slice_array(arr, volume_axis, idx)
-            rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim)
-            Image.fromarray(rgb).save(tempdir / f"{offset:05d}.jpg", quality=92)
-            jobs.update(
-                job_id,
-                progress=0.05 + 0.25 * (offset + 1) / len(indices),
-                message=f"rendered {offset + 1}/{len(indices)} frames",
-            )
+        track_mode = "detector_vg_chunked"
+        seeds = [{"obj_id": k, "box_xywh": _box_to_norm_xywh(box, seed_w, seed_h), "text": text} for k, box in enumerate(boxes, start=1)]
+        seed_boxes = {k: [float(v) for v in box] for k, box in enumerate(boxes, start=1)}
 
         jobs.update(job_id, progress=0.32, message="tracking")
-        n_obj_frames = max(1, len(indices) * len(seeds))
+        n_obj_frames = max(1, (back + fwd + 1) * len(seeds))
+        tempdir = Path(tempfile.mkdtemp(prefix=f"yj_track_{job_id}_"))
+
+        import time
 
         def _on_progress(done: int) -> None:
             jobs.update(
@@ -1318,50 +1350,80 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             )
 
         pool = getattr(app.state, "pool", None)
-        if pool is not None:
-            # Whole-track propagation runs on one GPU worker (propagation is
-            # inherently sequential); this frees the main process and lets
-            # concurrent jobs spread across the other cards. The worker reports
-            # progress via signal_dir/progress and honours signal_dir/cancel.
-            import time
 
-            signal_dir = tempdir / "_signal"
-            signal_dir.mkdir(exist_ok=True)
-            progress_file = signal_dir / "progress"
-            cancel_file = signal_dir / "cancel"
-            future = pool.submit_track(
-                tempdir,
-                seeds=seeds,
-                seed_local=seed_local,
-                fwd_budget=fwd_budget,
-                back_budget=back_budget,
-                indices=indices,
-                signal_dir=signal_dir,
-            )
-            while not future.done():
-                if _job_cancelled(jobs, job_id) and not cancel_file.exists():
-                    cancel_file.write_text("1", encoding="utf-8")
-                try:
-                    if progress_file.exists():
-                        _on_progress(int(progress_file.read_text(encoding="utf-8") or "0"))
-                except Exception:  # noqa: BLE001 - progress polling is best-effort
-                    pass
-                time.sleep(0.5)
-            collected = future.result()
-        else:
-            collected = collect_object_frames(
-                engine,
-                tempdir,
-                seeds=seeds,
-                seed_local=seed_local,
-                fwd_budget=fwd_budget,
-                back_budget=back_budget,
-                indices=indices,
-                cancelled=lambda: _job_cancelled(jobs, job_id),
-                progress=_on_progress,
-            )
+        def _run_chunk(chunk_indices, seed_local_in_chunk, boxes_by_obj):
+            """Render one chunk's frames and propagate within it on a GPU worker.
+
+            Each chunk is its own video session (its own ``init_state``), so the
+            worker releases the per-frame mask-memory after every chunk and peak
+            VRAM never exceeds one chunk's worth of frames.
+            """
+            chunk_seeds = [
+                {"obj_id": int(oid), "box_xywh": _box_to_norm_xywh(box, seed_w, seed_h), "text": text}
+                for oid, box in boxes_by_obj.items()
+            ]
+            fwd_b = len(chunk_indices) - 1 - int(seed_local_in_chunk)
+            back_b = int(seed_local_in_chunk)
+            chunk_dir = Path(tempfile.mkdtemp(prefix="chunk_", dir=tempdir))
+            try:
+                for offset, idx in enumerate(chunk_indices):
+                    data, _shape = _slice_array(arr, volume_axis, idx)
+                    rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim)
+                    Image.fromarray(rgb).save(chunk_dir / f"{offset:05d}.jpg", quality=92)
+                if pool is not None:
+                    signal_dir = chunk_dir / "_signal"
+                    signal_dir.mkdir(exist_ok=True)
+                    cancel_file = signal_dir / "cancel"
+                    future = pool.submit_track(
+                        chunk_dir,
+                        seeds=chunk_seeds,
+                        seed_local=int(seed_local_in_chunk),
+                        fwd_budget=fwd_b,
+                        back_budget=back_b,
+                        indices=list(chunk_indices),
+                        signal_dir=signal_dir,
+                        auto_stop=True,
+                        disappear_patience=disappear_patience,
+                    )
+                    while not future.done():
+                        if _job_cancelled(jobs, job_id) and not cancel_file.exists():
+                            cancel_file.write_text("1", encoding="utf-8")
+                        time.sleep(0.3)
+                    return future.result()
+                return collect_object_frames(
+                    engine,
+                    chunk_dir,
+                    seeds=chunk_seeds,
+                    seed_local=int(seed_local_in_chunk),
+                    fwd_budget=fwd_b,
+                    back_budget=back_b,
+                    indices=list(chunk_indices),
+                    cancelled=lambda: _job_cancelled(jobs, job_id),
+                    auto_stop=True,
+                    disappear_patience=disappear_patience,
+                )
+            finally:
+                import shutil as _shutil
+
+                _shutil.rmtree(chunk_dir, ignore_errors=True)
+
+        collected = chunked_track(
+            seed=seed,
+            fwd=fwd,
+            back=back,
+            axis_len=axis_len,
+            seed_boxes=seed_boxes,
+            chunk_size=track_chunk,
+            run_chunk=_run_chunk,
+            cancelled=lambda: _job_cancelled(jobs, job_id),
+            progress=_on_progress,
+        )
         if _job_cancelled(jobs, job_id):
             return
+
+        # Diagnostics / gap detection run over the frames actually tracked.
+        tracked = sorted({i for frames in collected.values() for i in frames} | {seed})
+        indices = list(range(tracked[0], tracked[-1] + 1)) if tracked else [seed]
 
         # Atomic write under the per-project lock: allocate ids + persist frames.
         jobs.update(job_id, progress=0.94, message="writing targets")
@@ -1410,8 +1472,9 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             for obj_id, frames in collected.items()
         }
         tracking_diagnostics = {
-            "requested_frame_count": len(indices),
+            "requested_frame_count": idx_hi - idx_lo + 1,
             "requested_frame_range": [idx_lo, idx_hi],
+            "tracked_frame_range": [indices[0], indices[-1]] if indices else [seed, seed],
             "collected_object_frames": collected_object_frames,
             "persisted_target_frames": dict(summary.get("per_target_frames", {})),
             "missing_frames": {
@@ -1422,6 +1485,11 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
                 cfg.sam3.get("video_temporal_disambiguation", False)
             ),
             "track_mode": track_mode,
+            "auto_range": auto_range,
+            "back": back,
+            "fwd": fwd,
+            "disappear_patience": disappear_patience,
+            "track_chunk": track_chunk,
         }
 
         result = {
@@ -1431,7 +1499,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             "volume_id": volume_id,
             "axis": axis,
             "seed": seed,
-            "frame_range": [idx_lo, idx_hi],
+            "frame_range": [indices[0], indices[-1]] if indices else [seed, seed],
             "target_set_url": f"/sam3/targets?project={project}&volume_id={volume_id}",
             "gaps": {str(key): value for key, value in gap_metadata.items()},
             "suggestions": suggestions,
@@ -1602,7 +1670,12 @@ def _run_batch_parallel(
             errors.append({"volume_id": volume_id, "axis": axis, "index": index, "error": f"{type(exc).__name__}: {exc}"})
             return
         detections.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
-        detections = detections[:keep_top_k]
+        detections = limit_detections(
+            detections,
+            box_strict=bool(payload.get("box_strict")),
+            boxes=boxes,
+            keep_top_k=keep_top_k,
+        )
         store = _target_store(cfg, project=project, volume_id=volume_id)
         grid_reference = grid_reference_cache.setdefault(
             volume_id,
@@ -1859,6 +1932,21 @@ def _relative_result_path(cfg: ServerConfig, path: Path) -> str:
         return str(path.relative_to(cfg.data_root)).replace("\\", "/")
     except ValueError:
         return str(path)
+
+
+def _mask_response(path: Path, fmt: str | None, headers: dict[str, str]) -> Response:
+    """Serve a stored ``.npy`` mask either dense (default) or bbox/bit-packed.
+
+    ``fmt="sparse"`` returns a small JSON payload (``yj_studio_core.masks``) that
+    the client expands locally; anything else keeps the legacy dense FileResponse
+    so older clients are unaffected.
+    """
+
+    if str(fmt or "").lower() == "sparse":
+        mask = np.load(path, allow_pickle=False)
+        payload = encode_sparse_mask(mask)
+        return JSONResponse(content=payload, headers={**headers, "X-Mask-Format": "sparse"})
+    return FileResponse(path, media_type="application/x-npy", headers=headers)
 
 
 app = create_app()

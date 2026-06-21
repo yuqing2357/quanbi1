@@ -12,12 +12,14 @@ from PyQt6.QtWidgets import QDialog, QDockWidget, QFileDialog, QLabel, QMainWind
 from yj_studio import __version__
 from yj_studio.config.defaults import DEFAULT_Z_WINDOW_START
 from yj_studio.config.paths import (
+    DATA_ROOT,
     DEFAULT_LITH_POR_MODEL_ROOT,
     DEFAULT_SEISMIC_NPY,
     existing_processed_root,
 )
 from yj_studio.config.styles import LITH_BODY_STYLE, PALETTE
 from yj_studio.data import (
+    HybridVolumeStore,
     RemoteTargetStore,
     RemoteVolumeStore,
     VolumeStore,
@@ -516,7 +518,7 @@ class MainWindow(QMainWindow):
         self._slice_controls = dock
 
     def _discover_default_volumes(self) -> None:
-        if isinstance(self.volume_store, RemoteVolumeStore):
+        if hasattr(self.volume_store, "discover_specs"):
             specs, notes = self.volume_store.discover_specs()
         else:
             processed_root = existing_processed_root()
@@ -1393,18 +1395,26 @@ def _well_display_label(mode: str) -> str:
 
 def _make_volume_store():
     backend = os.environ.get("YJ_STUDIO_VOLUME_BACKEND", "local").strip().lower()
-    if backend != "remote":
+    if backend not in ("remote", "hybrid"):
         return VolumeStore()
     server_url = os.environ.get("YJ_STUDIO_SERVER_URL", "").strip()
     if not server_url:
-        logger.warning("YJ_STUDIO_VOLUME_BACKEND=remote but YJ_STUDIO_SERVER_URL is empty; using local volumes")
+        logger.warning("YJ_STUDIO_VOLUME_BACKEND=%s but YJ_STUDIO_SERVER_URL is empty; using local volumes", backend)
         return VolumeStore()
     try:
         timeout_s = float(os.environ.get("YJ_STUDIO_REQUEST_TIMEOUT_S", "30"))
     except ValueError:
         timeout_s = 30.0
-    logger.info("Using remote volume backend: %s", server_url)
-    return RemoteVolumeStore(server_url, timeout_s=timeout_s)
+    remote = RemoteVolumeStore(server_url, timeout_s=timeout_s)
+    # "remote" now means "hybrid": serve any volume that exists on the local data
+    # root from a local memory-map, and only stream the ones we don't have. Opt
+    # out with YJ_STUDIO_VOLUME_BACKEND=remote_only for the old always-stream path.
+    if backend == "remote" and os.environ.get("YJ_STUDIO_VOLUME_REMOTE_ONLY") == "1":
+        logger.info("Using remote-only volume backend: %s", server_url)
+        return remote
+    local_data_root = Path(os.environ.get("YJ_STUDIO_LOCAL_DATA_ROOT", "").strip() or DATA_ROOT)
+    logger.info("Using hybrid volume backend: local=%s remote=%s", local_data_root, server_url)
+    return HybridVolumeStore(remote, local_data_root)
 
 
 def _make_target_store() -> RemoteTargetStore | None:

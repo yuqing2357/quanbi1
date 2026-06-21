@@ -200,6 +200,105 @@ def test_multi_box_seed_uses_one_prompt_and_maps_each_object(monkeypatch) -> Non
     assert [set(objects) for _frame, objects in rows] == [{1, 2}, {1, 2}]
 
 
+def test_init_track_state_uses_lazy_loading_and_releases_prior(monkeypatch) -> None:
+    """Frames load lazily (async) and any prior session is released first."""
+
+    calls: dict[str, object] = {"init_kwargs": None, "reset": 0}
+
+    class Predictor:
+        def init_state(self, **kwargs):  # noqa: ANN003
+            calls["init_kwargs"] = kwargs
+            return {"session": 1}
+
+        def reset_state(self, state):  # noqa: ANN001
+            calls["reset"] += 1
+
+    predictor = Predictor()
+    engine = SAM3Engine(Path("__missing_sam3.pt__"), load_video=True)
+    engine._video_predictor = predictor
+    monkeypatch.setattr(engine, "_ensure_video_predictor", lambda: predictor)
+    engine._track_state = {"session": 0}  # a stale session to be released
+
+    state = engine.init_track_state(Path("frames"))
+
+    assert calls["init_kwargs"]["async_loading_frames"] is True
+    assert calls["reset"] == 1  # prior state released before re-init
+    assert state == {"session": 1}
+
+
+def test_reset_track_state_drops_session(monkeypatch) -> None:
+    released: list[object] = []
+
+    class Predictor:
+        def reset_state(self, state):  # noqa: ANN001
+            released.append(state)
+
+    engine = SAM3Engine(Path("__missing_sam3.pt__"), load_video=True)
+    engine._video_predictor = Predictor()
+    engine._track_state = {"session": 7}
+
+    engine.reset_track_state()
+
+    assert engine._track_state is None
+    assert released == [{"session": 7}]
+
+
+def test_auto_stop_cuts_direction_after_target_disappears(monkeypatch) -> None:
+    """With ``auto_stop`` the forward direction stops once the object's mask is
+    empty for ``disappear_patience`` consecutive frames, instead of consuming
+    the whole budget."""
+
+    box = [0.1, 0.1, 0.2, 0.2]
+    full = _box_mask(box)
+    empty = np.zeros_like(full)
+    # frames 1,2 alive; 3,4,5 empty -> patience=2 should stop at frame 4.
+    timeline = {1: full, 2: full, 3: empty, 4: empty, 5: empty, 6: full}
+
+    class Predictor:
+        def __init__(self) -> None:
+            self.visited: list[int] = []
+
+        def add_prompt(self, **kwargs):  # noqa: ANN003
+            return int(kwargs["frame_idx"]), {
+                "out_obj_ids": [101],
+                "out_binary_masks": np.stack([full]),
+            }
+
+        def propagate_in_video(self, *, reverse, **kwargs):  # noqa: ANN003
+            if reverse:
+                return
+            for frame in (1, 2, 3, 4, 5, 6):
+                self.visited.append(frame)
+                yield frame, {
+                    "out_obj_ids": [101],
+                    "out_binary_masks": np.stack([timeline[frame]]),
+                }
+
+    predictor = Predictor()
+    engine = SAM3Engine(Path("__missing_sam3.pt__"), load_video=True)
+    engine._track_state = {}
+    monkeypatch.setattr(engine, "_ensure_video_predictor", lambda: predictor)
+    monkeypatch.setattr(engine, "_autocast_ctx", nullcontext)
+    monkeypatch.setattr(engine, "_inference_ctx", nullcontext)
+
+    rows = list(
+        engine.track_video(
+            Path("."),
+            seeds=[{"obj_id": 1, "box_xywh": box, "text": ""}],
+            seed_local=0,
+            fwd_budget=10,
+            back_budget=0,
+            auto_stop=True,
+            disappear_patience=2,
+        )
+    )
+
+    # Generator abandoned after frame 4 (2 empties): frames 5,6 never visited.
+    assert predictor.visited == [1, 2, 3, 4]
+    propagated = [frame for frame, _objects in rows if frame != 0]
+    assert propagated == [1, 2, 3, 4]
+
+
 def test_match_models_to_seeds_assigns_by_overlap() -> None:
     from yj_studio_server.sam3.engine import _match_models_to_seeds
 

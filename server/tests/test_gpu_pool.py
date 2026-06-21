@@ -37,3 +37,22 @@ def test_pool_spawns_workers_and_binds_gpu_env() -> None:
         assert info["engine_loaded"] is False
         # Each worker bound itself to one of the configured GPUs.
         assert int(info["cuda_visible_devices"]) in gpu_ids
+    # Every configured GPU got its own worker (no card left idle).
+    assert {int(info["cuda_visible_devices"]) for info in infos} == set(gpu_ids)
+
+
+def test_round_robin_spreads_jobs_across_all_gpu_executors() -> None:
+    """Sequential dispatch must rotate across every card, not pin to GPU 0.
+
+    Validates the fix for the single-shared-executor funnel: with one executor
+    per GPU, consecutive submits cycle through all of them in order.
+    """
+    pool = GpuWorkerPool([0, 1, 2, 3], engine_cfg=None)
+    try:
+        assert len(pool._executors) == 4
+        picked = [pool._next_executor() for _ in range(8)]
+        # Two full rotations, each visiting all four executors in order.
+        assert picked[:4] == pool._executors
+        assert picked[4:] == pool._executors
+    finally:
+        pool.shutdown()

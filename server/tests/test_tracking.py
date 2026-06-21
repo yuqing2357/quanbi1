@@ -20,7 +20,12 @@ for _src in (_REPO_ROOT / "server" / "src", _REPO_ROOT / "shared" / "src"):
 from yj_studio_core.targets import TargetStore  # noqa: E402
 from yj_studio_core.targets.model import GeoTarget, TargetSet, TargetStatus  # noqa: E402
 from yj_studio_server.sam3.reassociate import link_targets_by_iou  # noqa: E402
-from yj_studio_server.sam3.tracking import collect_object_frames, persist_tracked_targets  # noqa: E402
+from yj_studio_server.sam3.tracking import (  # noqa: E402
+    chunked_track,
+    collect_object_frames,
+    mask_bbox_xyxy,
+    persist_tracked_targets,
+)
 
 
 class FakeTrackEngine:
@@ -30,11 +35,15 @@ class FakeTrackEngine:
         self.n_frames = n_frames
         self.hw = hw
         self.init_calls = 0
+        self.reset_calls = 0
 
     def init_track_state(self, frames_dir) -> None:  # noqa: ANN001
         self.init_calls += 1
 
-    def track_video(self, frames_dir, *, seeds, seed_local, fwd_budget, back_budget):  # noqa: ANN001
+    def reset_track_state(self) -> None:
+        self.reset_calls += 1
+
+    def track_video(self, frames_dir, *, seeds, seed_local, fwd_budget, back_budget, **_):  # noqa: ANN001
         h, w = self.hw
         obj_ids = [int(s["obj_id"]) for s in seeds]
         for frame_idx_local in range(self.n_frames):
@@ -44,6 +53,71 @@ class FakeTrackEngine:
                 mask[min(k, h - 1), :] = True  # distinct row per object
                 per_obj[oid] = mask
             yield frame_idx_local, per_obj
+
+
+def _row_mask(row: int, hw=(8, 8)) -> np.ndarray:
+    m = np.zeros(hw, dtype=bool)
+    m[row, 2:5] = True
+    return m
+
+
+def test_mask_bbox_xyxy_is_tight_or_none() -> None:
+    assert mask_bbox_xyxy(np.zeros((4, 4), dtype=bool)) is None
+    box = mask_bbox_xyxy(_row_mask(3))
+    assert box == [2.0, 3.0, 5.0, 4.0]  # xmin,ymin,xmax,ymax
+
+
+def test_chunked_track_relays_across_chunks_until_target_persists() -> None:
+    """A target alive through frame 25 is tracked across multiple chunks, each
+    re-seeded from the previous chunk's last bbox; memory bound = chunk_size."""
+    seed = 10
+    alive_until = 25  # forward target disappears after frame 25
+    chunk_size = 6
+    chunk_calls: list[tuple[int, int]] = []
+
+    def run_chunk(chunk_indices, seed_local, boxes_by_obj):
+        chunk_calls.append((chunk_indices[0], chunk_indices[-1]))
+        assert len(chunk_indices) <= chunk_size + 1  # one chunk worth of frames
+        out: dict[int, dict[int, np.ndarray]] = {1: {}}
+        for idx in chunk_indices:
+            if idx <= alive_until:  # forward-only test
+                out[1][idx] = _row_mask(min(idx % 7, 7))
+        return out
+
+    collected = chunked_track(
+        seed=seed,
+        fwd=40,
+        back=0,
+        axis_len=200,
+        seed_boxes={1: [2.0, 3.0, 5.0, 4.0]},
+        chunk_size=chunk_size,
+        run_chunk=run_chunk,
+    )
+
+    frames = sorted(collected[1])
+    # Tracked contiguously from seed up to where the target disappeared.
+    assert frames[0] == seed
+    assert frames[-1] == alive_until
+    # Multiple chunks were needed, and no single chunk exceeded the bound.
+    assert len(chunk_calls) >= 2
+    assert all((hi - lo + 1) <= chunk_size + 1 for lo, hi in chunk_calls)
+
+
+def test_chunked_track_stops_direction_when_target_absent_immediately() -> None:
+    def run_chunk(chunk_indices, seed_local, boxes_by_obj):
+        # Only the seed frame has a mask; nothing propagates outward.
+        return {1: {chunk_indices[seed_local]: _row_mask(1)}}
+
+    collected = chunked_track(
+        seed=5,
+        fwd=30,
+        back=30,
+        axis_len=100,
+        seed_boxes={1: [2.0, 1.0, 5.0, 2.0]},
+        chunk_size=8,
+        run_chunk=run_chunk,
+    )
+    assert sorted(collected[1]) == [5]  # locked to the seed frame only
 
 
 def test_target_sequence_resumes_after_highest_persisted_id() -> None:
@@ -73,6 +147,8 @@ def test_track_assigns_one_consistent_id_per_object(tmp_path: Path) -> None:
     )
 
     assert engine.init_calls == 1
+    # The video session is always released after the sweep (OOM guard).
+    assert engine.reset_calls == 1
     assert set(collected) == {1, 2}
     # frame-local indices mapped back to absolute volume indices
     assert sorted(collected[1]) == indices
@@ -130,7 +206,7 @@ def test_collect_drops_empty_masks_and_out_of_range_frames(tmp_path: Path) -> No
     seeds = [{"obj_id": 1, "box_xywh": [0.5, 0.5, 0.2, 0.2], "text": ""}]
 
     class PartialEngine(FakeTrackEngine):
-        def track_video(self, frames_dir, *, seeds, seed_local, fwd_budget, back_budget):  # noqa: ANN001
+        def track_video(self, frames_dir, *, seeds, seed_local, fwd_budget, back_budget, **_):  # noqa: ANN001
             yield 0, {1: np.ones((4, 4), dtype=bool)}     # kept -> index 10
             yield 1, {1: np.zeros((4, 4), dtype=bool)}    # empty -> dropped
             yield 9, {1: np.ones((4, 4), dtype=bool)}     # out of range -> ignored

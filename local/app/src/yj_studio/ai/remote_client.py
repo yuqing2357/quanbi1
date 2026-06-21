@@ -9,8 +9,25 @@ from urllib.request import Request, urlopen
 
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
+from yj_studio_core.masks import decode_sparse_mask, is_sparse_mask_payload
 
 from .state import AIServiceState
+
+
+def _decode_mask_bytes(data: bytes, content_type: str = "") -> np.ndarray:
+    """Decode a mask response that may be sparse JSON or a dense ``.npy``."""
+
+    if "json" in (content_type or "").lower():
+        return decode_sparse_mask(json.loads(data.decode("utf-8")))
+    # Probe for a sparse JSON body even when the content-type is unhelpful.
+    if data[:1] in (b"{", b"["):
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            payload = None
+        if is_sparse_mask_payload(payload):
+            return decode_sparse_mask(payload)
+    return np.load(BytesIO(data), allow_pickle=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +133,7 @@ class RemoteSAM3Client(QObject):
         confidence: float = 0.4,
         keep_top_k: int = 3,
         target_type: str = "unknown",
+        box_strict: bool = False,
     ) -> str:
         body = {
             "kind": "segment",
@@ -132,6 +150,7 @@ class RemoteSAM3Client(QObject):
             "point_box_radius_px": float(point_box_radius_px),
             "confidence": float(confidence),
             "keep_top_k": int(keep_top_k),
+            "box_strict": bool(box_strict),
         }
         payload = self._post_json("/sam3/jobs", body)
         job_id = str(payload.get("job_id", ""))
@@ -152,6 +171,8 @@ class RemoteSAM3Client(QObject):
         confidence: float = 0.4,
         keep_top_k: int = 3,
         target_type: str = "unknown",
+        box_strict: bool = False,
+        auto: bool = False,
     ) -> str:
         body = {
             "kind": "track",
@@ -170,6 +191,8 @@ class RemoteSAM3Client(QObject):
             },
             "confidence": float(confidence),
             "keep_top_k": int(keep_top_k),
+            "box_strict": bool(box_strict),
+            "auto": bool(auto),
         }
         payload = self._post_json("/sam3/jobs", body)
         job_id = str(payload.get("job_id", ""))
@@ -190,12 +213,16 @@ class RemoteSAM3Client(QObject):
         return payload
 
     def fetch_mask(self, job_id: str, candidate_index: int) -> np.ndarray:
+        # Ask for the bbox/bit-packed sparse payload (tiny vs. the dense
+        # full-slice .npy); transparently fall back to dense if an older server
+        # ignores the query and streams raw bytes.
         with urlopen(
-            self._url(f"/sam3/jobs/{job_id}/mask/{int(candidate_index)}"),
+            self._url(f"/sam3/jobs/{job_id}/mask/{int(candidate_index)}?format=sparse"),
             timeout=self.timeout_s,
         ) as response:
+            content_type = response.headers.get("Content-Type", "")
             data = response.read()
-        return np.load(BytesIO(data), allow_pickle=False)
+        return _decode_mask_bytes(data, content_type)
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         return self._post_json(f"/sam3/jobs/{job_id}/cancel", {})
