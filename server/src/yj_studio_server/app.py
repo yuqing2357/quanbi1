@@ -31,14 +31,19 @@ from .sam3.tracking import chunked_track, collect_object_frames, persist_tracked
 from .sam3.training import run_training_backend
 from .sam3.validation import validate_sam3_payload
 from .targets import (
+    STAGE_SUBDIR,
     GeoTarget,
     TargetSet,
+    TargetStage,
     TargetStatus,
     TargetStore,
+    coerce_stage,
     export_confirmed_to_coco,
+    export_stage_to_coco,
     frame_key,
     mask_volume_stats,
     normalise_target_type,
+    relocate_target,
     resolve_voxel_spacing,
 )
 
@@ -258,11 +263,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
         include_deleted: bool = Query(False),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target_set = store.load()
         payload = target_set.model_dump(mode="json")
         payload["summaries"] = target_set.summaries(include_deleted=include_deleted)
+        payload["stage"] = store.stage.value if store.stage else None
         return payload
 
     @app.get("/sam3/targets/{target_id}")
@@ -270,8 +277,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         target_id: str,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target = _get_target_or_404(store, target_id)
         return target.model_dump(mode="json")
 
@@ -281,8 +289,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         payload: dict[str, Any],
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         with store.mutate() as target_set:
             target = _get_target_or_404(store, target_id, target_set=target_set)
             if "name" in payload:
@@ -307,13 +316,22 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         target_id: str,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
+        hard: bool = Query(False),
     ) -> dict[str, Any]:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         with store.mutate() as target_set:
             target = _get_target_or_404(store, target_id, target_set=target_set)
-            target.status = TargetStatus.DELETED
-            target.updated_at = _utc_now_iso()
-            result = target.model_dump(mode="json")
+            if hard:
+                # Physically drop the target + its mask/cell files (batch delete,
+                # "清空" semantics). Soft delete (default) only flips status.
+                target_set.remove_target(target_id)
+                _remove_target_files(store, target_id)
+                result = {"id": target_id, "status": "deleted", "hard": True}
+            else:
+                target.status = TargetStatus.DELETED
+                target.updated_at = _utc_now_iso()
+                result = target.model_dump(mode="json")
         return result
 
     @app.post("/sam3/targets/merge")
@@ -321,11 +339,12 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         payload: dict[str, Any],
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
         ids = [str(item) for item in payload.get("target_ids", []) if str(item).strip()]
         if len(ids) < 2:
             raise HTTPException(status_code=400, detail="At least two target_ids are required")
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         with store.mutate() as target_set:
             base = _get_target_or_404(store, ids[0], target_set=target_set)
             for target_id in ids[1:]:
@@ -349,8 +368,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         payload: dict[str, Any],
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         with store.mutate() as target_set:
             source = _get_target_or_404(store, target_id, target_set=target_set)
             groups = payload.get("groups")
@@ -392,8 +412,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
         format: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> Response:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target = _get_target_or_404(store, target_id)
         frame = target.frames.get(_target_frame_key(axis, index))
         if frame is None or not frame.mask_ref:
@@ -415,6 +436,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         request: Request,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
         raw = await request.body()
         try:
@@ -423,7 +445,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=f"Invalid .npy mask payload: {exc}") from exc
         if np.asarray(mask).ndim != 2:
             raise HTTPException(status_code=400, detail=f"Target mask must be 2D, got shape {np.asarray(mask).shape}")
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target_axis = _target_axis(axis)
         with store.mutate() as target_set:
             target = _get_target_or_404(store, target_id, target_set=target_set)
@@ -449,6 +471,47 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             result = target.model_dump(mode="json")
         return result
 
+    @app.delete("/sam3/targets/{target_id}/mask/{axis}/{index}")
+    def delete_sam3_target_frame(
+        target_id: str,
+        axis: str,
+        index: int,
+        project: str | None = Query(None),
+        volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
+    ) -> dict[str, Any]:
+        """Drop one bad frame from a target (manual per-frame correction).
+
+        Removes the frame from the target's ``frames``/``trajectory`` and deletes
+        its mask file, recording an edit. The target itself stays; use the
+        target-level delete to remove the whole object.
+        """
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
+        target_axis = _target_axis(axis)
+        key = _target_frame_key(axis, index)
+        with store.mutate() as target_set:
+            target = _get_target_or_404(store, target_id, target_set=target_set)
+            frame = target.frames.pop(key, None)
+            if frame is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Target frame not found: {target_id}/{axis}/{index}"
+                )
+            if key in target.trajectory:
+                target.trajectory.remove(key)
+            if frame.mask_ref:
+                store.resolve_ref(frame.mask_ref).unlink(missing_ok=True)
+            target.edits.append(
+                {
+                    "at": _utc_now_iso(),
+                    "kind": "frame_delete",
+                    "axis": target_axis,
+                    "index": int(index),
+                }
+            )
+            target.updated_at = _utc_now_iso()
+            result = target.model_dump(mode="json")
+        return result
+
     @app.post("/sam3/targets/cells")
     async def create_sam3_cell_target(
         request: Request,
@@ -462,6 +525,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         source: str = Query("sam3_reservoir"),
         grid_id: str | None = Query(None),
         grid_layer_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> dict[str, Any]:
         raw = await request.body()
         try:
@@ -475,7 +539,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if cells.shape[0] == 0:
             raise HTTPException(status_code=400, detail="Cell target requires at least one cell")
 
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        # Reservoir cell targets are voxel layer-bodies (a separate business line
+        # from AI single-frame segmentation), so they may persist directly; they
+        # land in ``saved`` unless a stage is given.
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         try:
             target_axis = _target_axis(axis)
         except ValueError as exc:
@@ -521,8 +588,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         target_id: str,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> Response:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target = _get_target_or_404(store, target_id)
         refs = [frame.cell_ids_ref for frame in target.frames.values() if frame.cell_ids_ref]
         path = store.write_cells_union_cache(target_id, [str(ref) for ref in refs])
@@ -533,8 +601,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         target_id: str,
         project: str | None = Query(None),
         volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
     ) -> Response:
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
         target = _get_target_or_404(store, target_id)
         try:
             path, index_lo, index_hi = store.write_target_mask3d_cache(target)
@@ -554,6 +623,88 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         headers["X-Mask3D-Voxel-Spacing"] = ",".join(f"{float(v):.12g}" for v in spacing)
         headers["X-Mask3D-Voxel-Spacing-Source"] = spacing_source
         return FileResponse(path, media_type="application/x-npy", headers=headers)
+
+    @app.post("/sam3/targets/promote")
+    def promote_sam3_targets(
+        payload: dict[str, Any],
+        project: str | None = Query(None),
+        volume_id: str | None = Query(None),
+    ) -> dict[str, Any]:
+        """Promote target(s) one stage forward.
+
+        ``temp -> saved`` MOVES the targets out of temp (temp is a staging area).
+        ``saved -> training`` COPIES them (saved stays a long-term pool) and
+        requires training info (``category`` per id or a shared ``category``).
+        """
+        from_stage = coerce_stage(payload.get("from_stage"), TargetStage.TEMPORARY)
+        ids = [str(i) for i in payload.get("target_ids", []) if str(i).strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="target_ids is required")
+        if from_stage == TargetStage.TEMPORARY:
+            to_stage, move = TargetStage.SAVED, True
+        elif from_stage == TargetStage.SAVED:
+            to_stage, move = TargetStage.TRAINING, False
+        else:
+            raise HTTPException(status_code=400, detail=f"Cannot promote from stage: {from_stage.value}")
+        training_info = payload.get("training") if isinstance(payload.get("training"), dict) else {}
+        shared_category = payload.get("category")
+        src = _target_store(cfg, project=project, volume_id=volume_id, stage=from_stage)
+        dst = _target_store(cfg, project=project, volume_id=volume_id, stage=to_stage)
+        promoted: list[dict[str, Any]] = []
+        # Lock destination first (new ids), then source, mirroring lock order in
+        # all promotions to avoid deadlock.
+        with dst.mutate() as dst_set, src.mutate() as src_set:
+            for old_id in ids:
+                target = src_set.targets.get(old_id)
+                if target is None:
+                    raise HTTPException(status_code=404, detail=f"Unknown target: {old_id} in {from_stage.value}")
+                if to_stage == TargetStage.TRAINING:
+                    category = str(training_info.get(old_id) or shared_category or "").strip()
+                    if not category:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Promotion to training requires a category for {old_id}",
+                        )
+                new_id = dst_set.new_id()
+                relocated = relocate_target(src, dst, target, new_id=new_id, move=move)
+                relocated.metadata = dict(relocated.metadata or {})
+                relocated.metadata["stage"] = to_stage.value
+                if to_stage == TargetStage.SAVED:
+                    relocated.metadata["promoted_from"] = old_id
+                    relocated.status = TargetStatus.CONFIRMED
+                else:
+                    relocated.metadata["derived_from"] = old_id
+                    relocated.metadata["category"] = str(training_info.get(old_id) or shared_category)
+                    relocated.type = normalise_target_type(relocated.metadata["category"])
+                dst_set.add_target(relocated)
+                if move:
+                    src_set.remove_target(old_id)
+                promoted.append(relocated.model_dump(mode="json"))
+        return {"from_stage": from_stage.value, "to_stage": to_stage.value, "targets": promoted}
+
+    @app.post("/sam3/targets/clear")
+    def clear_sam3_stage(
+        project: str | None = Query(None),
+        volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
+    ) -> dict[str, Any]:
+        resolved = coerce_stage(stage, TargetStage.TEMPORARY)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=resolved)
+        store.clear()
+        return {"stage": resolved.value, "cleared": True}
+
+    @app.post("/sam3/targets/renumber")
+    def renumber_sam3_stage(
+        project: str | None = Query(None),
+        volume_id: str | None = Query(None),
+        stage: str | None = Query(None),
+    ) -> dict[str, Any]:
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=stage)
+        target_set = store.renumber()
+        payload = target_set.model_dump(mode="json")
+        payload["summaries"] = target_set.summaries()
+        payload["stage"] = store.stage.value if store.stage else None
+        return payload
 
     @app.post("/sam3/train/jobs")
     def submit_train_job(payload: dict[str, Any]) -> dict[str, Any]:
@@ -873,9 +1024,61 @@ def _target_store(
     *,
     project: str | None = None,
     volume_id: str | None = None,
+    stage: "str | TargetStage | None" = TargetStage.SAVED,
 ) -> TargetStore:
+    """Resolve a stage-scoped target store.
+
+    ``stage`` selects the physical subdir + id prefix (temp/saved/training).
+    Defaults to ``saved`` — the long-term pool the legacy flat layout migrates
+    into — so callers that don't care about staging keep working.
+    """
     subdir = str(cfg.sam3.get("results_subdir", "sam3"))
-    return TargetStore(cfg.results_root / subdir, project=_project_id(cfg, project=project), volume_id=volume_id)
+    project_id = _project_id(cfg, project=project)
+    root = cfg.results_root / subdir
+    resolved_stage = coerce_stage(stage) if stage is not None else TargetStage.SAVED
+    _migrate_legacy_target_layout(root, project_id)
+    return TargetStore(root, project=project_id, volume_id=volume_id, stage=resolved_stage)
+
+
+def _migrate_legacy_target_layout(root: Path, project_id: str) -> None:
+    """One-time move of a pre-staging flat store into the ``saved`` stage.
+
+    Old layout kept ``<root>/<project>/targets.json`` + ``masks/`` directly under
+    the project. The first time any stage store is opened we relocate that flat
+    store into ``saved/`` (preserving ids as ``metadata.legacy_id`` is left to a
+    later renumber; here we keep the files verbatim) and stamp a marker so the
+    migration is idempotent. New ``TMP/SAV/TRN`` ids never collide with the old
+    ``T`` ids, so saved keeps the legacy numbers until the user renumbers.
+    """
+    project_root = root / project_id
+    legacy_manifest = project_root / "targets.json"
+    marker = project_root / ".staged_layout"
+    if marker.exists() or not legacy_manifest.exists():
+        return
+    saved_root = project_root / STAGE_SUBDIR[TargetStage.SAVED]
+    saved_root.mkdir(parents=True, exist_ok=True)
+    import shutil as _shutil
+
+    for name in ("targets.json", "masks", "cells", "volumes", "exports"):
+        src = project_root / name
+        if not src.exists():
+            continue
+        dst = saved_root / name
+        if dst.exists():
+            continue  # saved already populated; don't clobber
+        _shutil.move(str(src), str(dst))
+    marker.write_text("migrated flat layout -> saved/\n", encoding="utf-8")
+
+
+def _remove_target_files(store: TargetStore, target_id: str) -> None:
+    """Delete a target's mask dir, cell dir, and volume caches from disk."""
+    import shutil as _shutil
+
+    for directory in (store.target_mask_dir(target_id), store.target_cells_dir(target_id)):
+        if directory.exists():
+            _shutil.rmtree(directory, ignore_errors=True)
+    for path in store.target_volume_files(target_id):
+        path.unlink(missing_ok=True)
 
 
 def _payload_target_type(payload: dict[str, Any]) -> str:
@@ -1093,7 +1296,9 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         output_dir = _sam3_job_output_dir(cfg, job_id)
         output_dir.mkdir(parents=True, exist_ok=True)
         project = _project_id(cfg, payload)
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        # AI-generated detections are staged, never auto-saved: they land in the
+        # TEMPORARY stage for user review/promotion.
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=TargetStage.TEMPORARY)
         target_type = _payload_target_type(payload)
         grid_reference = _target_grid_reference(cfg, volume_id)
         candidates: list[dict[str, Any]] = []
@@ -1198,6 +1403,32 @@ def _parse_track_range(payload: dict[str, Any]) -> tuple[int, int, int]:
     return seed, max(0, back), max(0, fwd)
 
 
+def _eligible_track_objects(
+    collected: dict[int, dict[int, np.ndarray]],
+    gap_limit: int,
+    min_frames: int,
+) -> tuple[dict[int, dict[int, np.ndarray]], list[int]]:
+    """Keep only objects forming a multi-frame, gap-tolerant continuous body.
+
+    An object qualifies when it has ``>= min_frames`` masks AND no internal gap
+    between consecutive tracked indices exceeds ``gap_limit`` missing frames.
+    Returns ``(eligible, dropped_obj_ids)``.
+    """
+    eligible: dict[int, dict[int, np.ndarray]] = {}
+    dropped: list[int] = []
+    for obj_id, frames in collected.items():
+        indices = sorted(frames)
+        if len(indices) < min_frames:
+            dropped.append(int(obj_id))
+            continue
+        max_gap = max((b - a - 1) for a, b in zip(indices, indices[1:])) if len(indices) > 1 else 0
+        if max_gap > max(0, gap_limit):
+            dropped.append(int(obj_id))
+            continue
+        eligible[obj_id] = frames
+    return eligible, dropped
+
+
 def _box_to_norm_xywh(box: list[float], width: int, height: int) -> list[float]:
     """Normalised TOP-LEFT ``[xmin, ymin, w, h]`` in [0, 1] for SAM3 video.
 
@@ -1264,17 +1495,25 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         # leaves, so auto just sets a generous per-direction budget the chunked
         # sweep won't normally reach.
         auto_range = bool(payload.get("auto"))
-        # Optional *safety* cap per direction for auto tracking — NOT the normal
-        # terminator. Auto tracking expands outward in bounded chunks and stops a
-        # direction once the target disappears for ``disappear_patience``
-        # consecutive frames (engine.track_video / tracking.chunked_track). This
-        # cap only clips a runaway sweep when the disappearance heuristic never
-        # fires; ``<= 0`` means "bounded only by the volume edge + the dynamic
-        # stop". A payload ``auto_track_max`` overrides the config. The old code
-        # pinned this at 40, which truncated targets that genuinely persisted
-        # past 40 frames (the "stops at 81 frames" symptom).
-        auto_track_max = int(payload.get("auto_track_max", cfg.sam3.get("auto_track_max", 0)))
+        # Free (auto) tracking is bounded to a HARD per-direction cap. The target
+        # is tracked at most ``free_track_max`` frames forward and ``free_track_max``
+        # backward from the seed; once the cap is reached the direction stops even
+        # if the target is still visible, and NO further tracking pass is started.
+        # The point is a stable, single-target result with a bounded VRAM /
+        # intermediate-state footprint — not maximum span. ``<= 0`` in config
+        # falls back to the 120-frame default (there is no "unbounded" mode for
+        # free tracking anymore). A payload ``auto_track_max`` overrides the config.
+        free_track_max = int(payload.get("auto_track_max", cfg.sam3.get("auto_track_max", 120)))
+        if free_track_max <= 0:
+            free_track_max = 120
         disappear_patience = max(1, int(payload.get("disappear_patience", cfg.sam3.get("auto_disappear_patience", 3))))
+        # Drift guard: each relay chunk is re-seeded from the previous chunk's
+        # last bbox, so the detector can latch onto a *different* object. If the
+        # re-detected mask at the shared anchor overlaps the fed bbox by less than
+        # this IoU, that direction stops instead of merging a new/different target
+        # into the same track. Reported back as ``drift_stops`` so the desktop can
+        # ask the user to re-confirm rather than silently extending.
+        drift_iou_min = float(payload.get("track_drift_iou_min", cfg.sam3.get("track_drift_iou_min", 0.1)))
         # Chunk size = the VRAM bound. SAM3 keeps every propagated frame's
         # mask-memory on the GPU and forward+backward share one inference state,
         # so a single long propagation OOMs. We instead propagate this many
@@ -1300,15 +1539,12 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         axis_len = int(shape[axis_index])
         seed = max(0, min(seed, axis_len - 1))
         if auto_range:
-            # Sweep to the volume edge in each direction and let the dynamic
-            # disappear-stop decide where the target actually ends. The safety
-            # cap (if configured > 0) only clips a runaway sweep; it must never
-            # be the reason a still-visible target stops being tracked.
-            back = seed
-            fwd = axis_len - 1 - seed
-            if auto_track_max > 0:
-                back = min(back, auto_track_max)
-                fwd = min(fwd, auto_track_max)
+            # Free tracking: expand outward up to the HARD per-direction cap (or
+            # the volume edge, whichever is closer). The dynamic disappear-stop
+            # may end a direction earlier, but the cap is the firm upper bound —
+            # past it we stop and do not continue with another pass.
+            back = min(seed, free_track_max)
+            fwd = min(axis_len - 1 - seed, free_track_max)
         idx_lo = max(0, seed - back)
         idx_hi = min(axis_len - 1, seed + fwd)
 
@@ -1407,6 +1643,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
 
                 _shutil.rmtree(chunk_dir, ignore_errors=True)
 
+        track_events: dict[str, Any] = {}
         collected = chunked_track(
             seed=seed,
             fwd=fwd,
@@ -1417,21 +1654,56 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             run_chunk=_run_chunk,
             cancelled=lambda: _job_cancelled(jobs, job_id),
             progress=_on_progress,
+            max_span=free_track_max if auto_range else None,
+            drift_iou_min=drift_iou_min,
+            events=track_events,
         )
+        # Free tracking is finished for both directions: release the engine's
+        # CUDA cache / any residual intermediate state before we render + persist.
+        # Each chunk already resets its own video session (collect_object_frames /
+        # _worker_track); this is the final sweep-level release so VRAM does not
+        # creep across repeated jobs. No-op in the multi-GPU pool path (workers
+        # release per task) and on CPU/fake engines.
+        try:
+            _release = getattr(app.state.sam3, "empty_cache", None)
+            if callable(_release):
+                _release()
+        except Exception:  # noqa: BLE001 - cache release is best-effort
+            logger.debug("post-track cache release failed", exc_info=True)
         if _job_cancelled(jobs, job_id):
             return
+        drift_stops = track_events.get("drift_stops", [])
+        if drift_stops:
+            logger.info("track drift-stop events: %s", drift_stops)
+
+        # Temporary-stage admission gate: only multi-frame tracks that form a
+        # (gap-tolerant) continuous slice body become temporary targets. Single-
+        # frame or fragmented results are visualization-only and never persist —
+        # this is the boundary that keeps single-frame masks out of the pipeline.
+        gap_limit = int(payload.get("gap_limit", 5))
+        min_track_frames = max(2, int(payload.get("min_track_frames", 2)))
+        eligible, dropped_objs = _eligible_track_objects(collected, gap_limit, min_track_frames)
+        if dropped_objs:
+            logger.info(
+                "track admission: dropped %d object(s) failing >=%d-frame/continuity gate: %s",
+                len(dropped_objs), min_track_frames, dropped_objs,
+            )
+        collected = eligible
 
         # Diagnostics / gap detection run over the frames actually tracked.
         tracked = sorted({i for frames in collected.values() for i in frames} | {seed})
         indices = list(range(tracked[0], tracked[-1] + 1)) if tracked else [seed]
 
         # Atomic write under the per-project lock: allocate ids + persist frames.
+        # Tracks land in the TEMPORARY stage (临时识别目标); promotion to saved is
+        # an explicit user action. No link-back into existing targets — temp is a
+        # fresh-generation area.
         jobs.update(job_id, progress=0.94, message="writing targets")
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=TargetStage.TEMPORARY)
         gap_metadata = annotate_gaps(
             collected,
             indices,
-            gap_limit=int(payload.get("gap_limit", 5)),
+            gap_limit=gap_limit,
         )
         object_suggestions = detect_merge_split(
             collected,
@@ -1439,20 +1711,6 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             iou_merge=float(payload.get("merge_iou", 0.5)),
             persist_frames=int(payload.get("suggestion_frames", 3)),
         )
-
-        def _resolve_link(
-            obj_id: int,
-            frames: dict[int, np.ndarray],
-            target_set: TargetSet,
-            linkable_target_ids: set[str],
-        ) -> str | None:
-            existing = _existing_target_rows(store, target_set, volume_id, linkable_target_ids)
-            return link_targets_by_iou(
-                existing,
-                frames,
-                iou_thresh=float(payload.get("link_iou", 0.3)),
-                min_overlap_frames=int(payload.get("link_overlap_frames", 1)),
-            )
 
         summary = persist_tracked_targets(
             store,
@@ -1463,8 +1721,11 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             volume_id=volume_id,
             image_axis_label=axis,
             gap_metadata=gap_metadata,
-            target_metadata={"volume_grid": _target_grid_reference(cfg, volume_id)},
-            link_resolver=_resolve_link,
+            target_metadata={
+                "volume_grid": _target_grid_reference(cfg, volume_id),
+                "stage": TargetStage.TEMPORARY.value,
+            },
+            link_resolver=None,
         )
         suggestions = _target_suggestions(object_suggestions, summary.get("obj_to_target_id", {}))
         collected_object_frames = {
@@ -1490,6 +1751,13 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             "fwd": fwd,
             "disappear_patience": disappear_patience,
             "track_chunk": track_chunk,
+            "free_track_max": free_track_max if auto_range else None,
+            "free_track_capped": bool(
+                auto_range
+                and (back >= free_track_max or fwd >= free_track_max)
+            ),
+            "drift_iou_min": drift_iou_min,
+            "drift_stops": drift_stops,
         }
 
         result = {
@@ -1676,7 +1944,8 @@ def _run_batch_parallel(
             boxes=boxes,
             keep_top_k=keep_top_k,
         )
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        # AI-generated detections are staged (TEMPORARY), never auto-saved.
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=TargetStage.TEMPORARY)
         grid_reference = grid_reference_cache.setdefault(
             volume_id,
             _target_grid_reference(cfg, volume_id),
@@ -1793,12 +2062,14 @@ def _run_train_job(app: FastAPI, job_id: str) -> None:
         jobs.update(job_id, state=JobState.running, progress=0.1, message="exporting dataset")
         project = _project_id(cfg, payload)
         volume_id = str(payload.get("volume_id") or "") or None
-        store = _target_store(cfg, project=project, volume_id=volume_id)
+        # The training dataset is exactly the TRAINING stage: every target a user
+        # explicitly classified and promoted there. No status-based gate.
+        store = _target_store(cfg, project=project, volume_id=volume_id, stage=TargetStage.TRAINING)
         target_set = store.load()
         dataset_version = str(payload.get("dataset_version") or f"D{uuid.uuid4().hex[:8]}")
         dataset_subdir = str(cfg.training.get("dataset_subdir", "sam3/datasets"))
         output_dir = cfg.results_root / dataset_subdir / project / dataset_version
-        export_payload = export_confirmed_to_coco(store, target_set, output_dir)
+        export_payload = export_stage_to_coco(store, target_set, output_dir)
         metrics: dict[str, Any] = {
             "exported_images": len(export_payload.get("images", [])),
             "exported_annotations": len(export_payload.get("annotations", [])),

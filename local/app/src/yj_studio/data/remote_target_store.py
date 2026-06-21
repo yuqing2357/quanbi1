@@ -38,29 +38,43 @@ class RemoteTargetStore:
         self.project_id = project_id or "default"
         self.timeout_s = float(timeout_s)
 
-    def load_targets(self, *, volume_id: str | None = None, include_deleted: bool = False) -> TargetSet:
+    def load_targets(
+        self, *, volume_id: str | None = None, include_deleted: bool = False, stage: str | None = None
+    ) -> TargetSet:
         payload = self._get_json(
             "/sam3/targets",
-            query={"project": self.project_id, "volume_id": volume_id, "include_deleted": include_deleted},
+            query={
+                "project": self.project_id,
+                "volume_id": volume_id,
+                "include_deleted": include_deleted,
+                "stage": stage,
+            },
         )
         if not isinstance(payload, dict):
             raise ValueError("Target list response must be a JSON object")
         return TargetSet.model_validate(payload)
 
-    def summaries(self, *, volume_id: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
+    def summaries(
+        self, *, volume_id: str | None = None, include_deleted: bool = False, stage: str | None = None
+    ) -> list[dict[str, Any]]:
         payload = self._get_json(
             "/sam3/targets",
-            query={"project": self.project_id, "volume_id": volume_id, "include_deleted": include_deleted},
+            query={
+                "project": self.project_id,
+                "volume_id": volume_id,
+                "include_deleted": include_deleted,
+                "stage": stage,
+            },
         )
         if not isinstance(payload, dict):
             return []
         summaries = payload.get("summaries", [])
         return summaries if isinstance(summaries, list) else []
 
-    def fetch_target(self, target_id: str, *, volume_id: str | None = None) -> GeoTarget:
+    def fetch_target(self, target_id: str, *, volume_id: str | None = None, stage: str | None = None) -> GeoTarget:
         payload = self._get_json(
             f"/sam3/targets/{quote(target_id)}",
-            query={"project": self.project_id, "volume_id": volume_id},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
         )
         if not isinstance(payload, dict):
             raise ValueError("Target response must be a JSON object")
@@ -73,25 +87,46 @@ class RemoteTargetStore:
         index: int,
         *,
         volume_id: str | None = None,
+        stage: str | None = None,
     ) -> np.ndarray:
         return self._get_mask_npy(
             f"/sam3/targets/{quote(target_id)}/mask/{quote(axis)}/{int(index)}",
-            query={"project": self.project_id, "volume_id": volume_id, "format": "sparse"},
+            query={"project": self.project_id, "volume_id": volume_id, "format": "sparse", "stage": stage},
         )
 
-    def fetch_cells(self, target_id: str, *, volume_id: str | None = None) -> np.ndarray:
+    def delete_frame(
+        self,
+        target_id: str,
+        axis: str,
+        index: int,
+        *,
+        volume_id: str | None = None,
+        stage: str | None = None,
+    ) -> GeoTarget:
+        """Remove a single (bad) frame from a target, keeping the target."""
+        payload = self._request_json(
+            f"/sam3/targets/{quote(target_id)}/mask/{quote(axis)}/{int(index)}",
+            method="DELETE",
+            payload=None,
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
+        )
+        return GeoTarget.model_validate(payload)
+
+    def fetch_cells(self, target_id: str, *, volume_id: str | None = None, stage: str | None = None) -> np.ndarray:
         return self._get_npy(
             f"/sam3/targets/{quote(target_id)}/cells",
-            query={"project": self.project_id, "volume_id": volume_id},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
         )
 
-    def fetch_mask3d(self, target_id: str, *, volume_id: str | None = None) -> np.ndarray:
-        return self.fetch_mask3d_with_metadata(target_id, volume_id=volume_id).mask
+    def fetch_mask3d(self, target_id: str, *, volume_id: str | None = None, stage: str | None = None) -> np.ndarray:
+        return self.fetch_mask3d_with_metadata(target_id, volume_id=volume_id, stage=stage).mask
 
-    def fetch_mask3d_with_metadata(self, target_id: str, *, volume_id: str | None = None) -> Mask3DResult:
+    def fetch_mask3d_with_metadata(
+        self, target_id: str, *, volume_id: str | None = None, stage: str | None = None
+    ) -> Mask3DResult:
         return self._get_npy_with_headers(
             f"/sam3/targets/{quote(target_id)}/mask3d",
-            query={"project": self.project_id, "volume_id": volume_id},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
         )
 
     def put_mask(
@@ -102,6 +137,7 @@ class RemoteTargetStore:
         mask: np.ndarray,
         *,
         volume_id: str | None = None,
+        stage: str | None = None,
     ) -> GeoTarget:
         buffer = BytesIO()
         np.save(buffer, np.asarray(mask), allow_pickle=False)
@@ -109,7 +145,7 @@ class RemoteTargetStore:
             f"/sam3/targets/{quote(target_id)}/mask/{quote(axis)}/{int(index)}",
             method="PUT",
             payload_bytes=buffer.getvalue(),
-            query={"project": self.project_id, "volume_id": volume_id},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
             content_type="application/x-npy",
         )
         return GeoTarget.model_validate(payload)
@@ -155,39 +191,78 @@ class RemoteTargetStore:
         )
         return GeoTarget.model_validate(payload)
 
-    def patch_target(self, target_id: str, updates: dict[str, Any]) -> GeoTarget:
+    def patch_target(self, target_id: str, updates: dict[str, Any], *, stage: str | None = None) -> GeoTarget:
         payload = self._request_json(
             f"/sam3/targets/{quote(target_id)}",
             method="PATCH",
             payload=updates,
-            query={"project": self.project_id},
+            query={"project": self.project_id, "stage": stage},
         )
         return GeoTarget.model_validate(payload)
 
-    def delete_target(self, target_id: str) -> GeoTarget:
-        payload = self._request_json(
+    def delete_target(self, target_id: str, *, stage: str | None = None, hard: bool = False) -> dict[str, Any]:
+        return self._request_json(
             f"/sam3/targets/{quote(target_id)}",
             method="DELETE",
             payload=None,
-            query={"project": self.project_id},
+            query={"project": self.project_id, "stage": stage, "hard": hard or None},
         )
-        return GeoTarget.model_validate(payload)
 
-    def merge_targets(self, target_ids: list[str]) -> GeoTarget:
+    def merge_targets(self, target_ids: list[str], *, stage: str | None = None) -> GeoTarget:
         payload = self._request_json(
             "/sam3/targets/merge",
             method="POST",
             payload={"target_ids": target_ids},
-            query={"project": self.project_id},
+            query={"project": self.project_id, "stage": stage},
         )
         return GeoTarget.model_validate(payload)
 
-    def split_target(self, target_id: str, groups: list[list[str]] | None = None) -> dict[str, Any]:
+    def split_target(
+        self, target_id: str, groups: list[list[str]] | None = None, *, stage: str | None = None
+    ) -> dict[str, Any]:
         return self._request_json(
             f"/sam3/targets/{quote(target_id)}/split",
             method="POST",
             payload={"groups": groups or []},
-            query={"project": self.project_id},
+            query={"project": self.project_id, "stage": stage},
+        )
+
+    def promote_targets(
+        self,
+        target_ids: list[str],
+        *,
+        from_stage: str,
+        volume_id: str | None = None,
+        category: str | None = None,
+        training: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Promote targets one stage forward (temp->saved move, saved->training copy)."""
+        body: dict[str, Any] = {"target_ids": target_ids, "from_stage": from_stage}
+        if category is not None:
+            body["category"] = category
+        if training:
+            body["training"] = training
+        return self._request_json(
+            "/sam3/targets/promote",
+            method="POST",
+            payload=body,
+            query={"project": self.project_id, "volume_id": volume_id},
+        )
+
+    def clear_stage(self, stage: str, *, volume_id: str | None = None) -> dict[str, Any]:
+        return self._request_json(
+            "/sam3/targets/clear",
+            method="POST",
+            payload={},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
+        )
+
+    def renumber_stage(self, stage: str, *, volume_id: str | None = None) -> dict[str, Any]:
+        return self._request_json(
+            "/sam3/targets/renumber",
+            method="POST",
+            payload={},
+            query={"project": self.project_id, "volume_id": volume_id, "stage": stage},
         )
 
     def gpus(self) -> dict[str, Any]:

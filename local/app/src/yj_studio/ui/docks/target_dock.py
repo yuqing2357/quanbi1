@@ -6,16 +6,15 @@ from PyQt6.QtGui import QUndoStack
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QComboBox,
     QDialog,
     QDockWidget,
-    QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
-    QLineEdit,
     QMessageBox,
     QPushButton,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,19 +25,33 @@ from yj_studio.data import RemoteTargetStore
 from yj_studio.data.remote_target_store import Mask3DResult
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio_core.targets import (
-    BUILTIN_TARGET_TYPES,
     DEFAULT_VOXEL_SPACING,
     GeoTarget,
     TargetFrame,
     TargetSet,
+    TargetStage,
     TargetStatus,
     mask_volume_stats,
     review_queue,
 )
 
+# Stage -> tab title for the workspace.
+_STAGE_TITLES: dict[str, str] = {
+    TargetStage.TEMPORARY.value: "临时识别目标",
+    TargetStage.SAVED.value: "保存识别目标",
+    TargetStage.TRAINING.value: "训练目标",
+}
+
 
 class TargetDock(QDockWidget):
-    """Remote target manager for SAM3 geological objects."""
+    """Tabbed workspace of the three target stages (临时/保存/训练).
+
+    The AI assistant only generates results; tracks land in the *temporary*
+    stage, the user confirms them into *saved*, then classifies them into the
+    *training* dataset. Each tab is a :class:`StageTargetPanel`. The legacy
+    single-panel constructor signature is preserved so existing callers keep
+    working; ``refresh`` refreshes every stage.
+    """
 
     def __init__(
         self,
@@ -50,44 +63,86 @@ class TargetDock(QDockWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__("目标", parent)
+        self._target_store = target_store
+        self._tabs = QTabWidget(self)
+        self._panels: dict[str, StageTargetPanel] = {}
+        for stage in (TargetStage.TEMPORARY, TargetStage.SAVED, TargetStage.TRAINING):
+            panel = StageTargetPanel(
+                layer_store,
+                target_store,
+                stage=stage.value,
+                volume_store=volume_store,
+                undo_stack=undo_stack,
+                parent=self._tabs,
+            )
+            self._panels[stage.value] = panel
+            self._tabs.addTab(panel, _STAGE_TITLES[stage.value])
+        self.setWidget(self._tabs)
+
+    def refresh(self) -> None:
+        for panel in self._panels.values():
+            panel.refresh()
+
+    def panel(self, stage: str) -> "StageTargetPanel | None":
+        return self._panels.get(stage)
+
+    def show_track_result(self, result: dict[str, object]) -> None:
+        # Tracks become temporary targets; surface them on that tab.
+        temp = self._panels.get(TargetStage.TEMPORARY.value)
+        if temp is None:
+            return
+        self._tabs.setCurrentWidget(temp)
+        temp.refresh()
+        temp.show_track_result(result)
+
+
+class StageTargetPanel(QWidget):
+    """Target manager scoped to a single lifecycle stage."""
+
+    def __init__(
+        self,
+        layer_store: LayerStore,
+        target_store: RemoteTargetStore | None,
+        *,
+        stage: str | None = None,
+        volume_store=None,
+        undo_stack: QUndoStack | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
         self._layer_store = layer_store
         self._target_store = target_store
+        self._stage = stage  # "temporary"/"saved"/"training" or None (legacy)
         self._volume_store = volume_store
         self._undo_stack = undo_stack
         self._targets: dict[str, GeoTarget] = {}
         self._volume_stats: dict[str, dict[str, object]] = {}
-        self._pending_suggestion: dict[str, object] | None = None
         self._visualization_windows: list[QDialog] = []
 
-        root = QWidget(self)
+        is_temp = stage == TargetStage.TEMPORARY.value
+        is_saved = stage == TargetStage.SAVED.value
+        is_training = stage == TargetStage.TRAINING.value
+
+        root = self
         layout = QVBoxLayout(root)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
         top = QHBoxLayout()
         self._status_label = QLabel("远程模式" if target_store is not None else "本地模式", root)
+        self._select_all_button = QPushButton("全选", root)
         self._refresh_button = QPushButton("刷新", root)
         self._review_button = QPushButton("审校", root)
+        self._select_all_button.clicked.connect(self._select_all)
         self._refresh_button.clicked.connect(self.refresh)
         self._review_button.clicked.connect(self._show_review_queue)
+        self._review_button.setVisible(is_saved)
         top.addWidget(self._status_label)
         top.addStretch(1)
+        top.addWidget(self._select_all_button)
         top.addWidget(self._review_button)
         top.addWidget(self._refresh_button)
         layout.addLayout(top)
-
-        suggestion_row = QHBoxLayout()
-        self._suggestion_label = QLabel("", root)
-        self._suggestion_label.setWordWrap(True)
-        self._suggestion_confirm_button = QPushButton("确认", root)
-        self._suggestion_confirm_button.clicked.connect(self._confirm_suggestion)
-        self._suggestion_ignore_button = QPushButton("忽略", root)
-        self._suggestion_ignore_button.clicked.connect(self._clear_suggestion)
-        suggestion_row.addWidget(self._suggestion_label, 1)
-        suggestion_row.addWidget(self._suggestion_confirm_button)
-        suggestion_row.addWidget(self._suggestion_ignore_button)
-        layout.addLayout(suggestion_row)
-        self._clear_suggestion()
 
         self._table = QTableWidget(0, 9, root)
         headers = [
@@ -125,79 +180,72 @@ class TargetDock(QDockWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.itemSelectionChanged.connect(self._sync_selection_controls)
         layout.addWidget(self._table, 1)
 
-        form = QFormLayout()
-        self._name_edit = QLineEdit(root)
-        self._type_combo = QComboBox(root)
-        self._type_combo.setEditable(True)
-        self._type_combo.addItems(list(BUILTIN_TARGET_TYPES))
-        form.addRow("名称", self._name_edit)
-        form.addRow("类型", self._type_combo)
-        layout.addLayout(form)
+        # Lifecycle action: the forward-promotion button is the heart of each
+        # stage. temp -> 确认到保存; saved -> 分类并设为训练; training -> 导出.
+        promote_row = QHBoxLayout()
+        self._promote_button = QPushButton(root)
+        if is_temp:
+            self._promote_button.setText("确认 → 保存")
+            self._promote_button.setToolTip("将选中的临时目标确认并移动到“保存识别目标”。")
+        elif is_saved:
+            self._promote_button.setText("分类 → 训练")
+            self._promote_button.setToolTip("为选中目标设置类别并复制到“训练目标”数据集。")
+        else:
+            self._promote_button.setText("导出训练集")
+            self._promote_button.setToolTip("导出训练目标为 COCO 数据集并提交训练任务。")
+        self._promote_button.clicked.connect(self._on_promote)
+        self._clear_button = QPushButton("清空", root)
+        self._clear_button.setToolTip("清空该阶段的全部目标（不可恢复）。")
+        self._clear_button.clicked.connect(self._on_clear_stage)
+        self._clear_button.setVisible(is_temp)
+        self._renumber_button = QPushButton("重新编号", root)
+        self._renumber_button.setToolTip("将该阶段编号重排为连续序列。")
+        self._renumber_button.clicked.connect(self._on_renumber)
+        self._models_button = QPushButton("模型", root)
+        self._models_button.clicked.connect(self._show_models)
+        self._models_button.setVisible(is_training)
+        promote_row.addWidget(self._promote_button)
+        promote_row.addWidget(self._clear_button)
+        promote_row.addWidget(self._renumber_button)
+        promote_row.addWidget(self._models_button)
+        layout.addLayout(promote_row)
 
+        # Core review actions only: view/correct (2D), inspect (3D), delete.
         action_row = QHBoxLayout()
-        self._apply_button = QPushButton("应用", root)
-        self._confirm_button = QPushButton("确认", root)
-        self._delete_button = QPushButton("删除", root)
-        self._merge_button = QPushButton("合并", root)
-        self._split_button = QPushButton("拆分", root)
-        for button in (
-            self._apply_button,
-            self._confirm_button,
-            self._delete_button,
-            self._merge_button,
-            self._split_button,
-        ):
+        self._load_mask_button = QPushButton("2D 查看/修正", root)
+        self._load_cells_button = QPushButton("3D", root)
+        self._delete_button = QPushButton("删除目标", root)
+        self._load_mask_button.setToolTip("打开 2D 逐帧回放与掩膜修正（笔刷添加/擦除、删除错误帧）")
+        self._load_cells_button.setToolTip("打开独立的三维目标体窗口")
+        self._delete_button.setToolTip("删除选中的整个目标（含其 mask 文件）。")
+        for button in (self._load_mask_button, self._load_cells_button, self._delete_button):
             action_row.addWidget(button)
         layout.addLayout(action_row)
 
-        load_row = QHBoxLayout()
-        self._load_mask_button = QPushButton("2D", root)
-        self._load_cells_button = QPushButton("3D", root)
-        self._load_mask_button.setToolTip("打开目标前后切片追踪回放")
-        self._load_cells_button.setToolTip("打开独立的三维目标体窗口")
-        self._train_button = QPushButton("训练集", root)
-        self._models_button = QPushButton("模型", root)
-        for button in (
-            self._load_mask_button,
-            self._load_cells_button,
-            self._train_button,
-            self._models_button,
-        ):
-            load_row.addWidget(button)
-        layout.addLayout(load_row)
-
-        self._apply_button.clicked.connect(self._apply_selected)
-        self._confirm_button.clicked.connect(self._confirm_selected)
         self._delete_button.clicked.connect(self._delete_selected)
-        self._merge_button.clicked.connect(self._merge_selected)
-        self._split_button.clicked.connect(self._split_selected)
         self._load_mask_button.clicked.connect(self._load_selected_mask)
         self._load_cells_button.clicked.connect(self._load_selected_cells)
-        self._train_button.clicked.connect(self._submit_train_export)
-        self._models_button.clicked.connect(self._show_models)
 
-        self.setWidget(root)
         self._set_remote_enabled(target_store is not None)
 
     def refresh(self) -> None:
         if self._target_store is None:
             return
         try:
-            target_set = self._target_store.load_targets(include_deleted=False)
+            target_set = self._target_store.load_targets(include_deleted=False, stage=self._stage)
         except Exception as exc:  # noqa: BLE001 - UI boundary
             QMessageBox.warning(self, "目标", str(exc))
             return
         self._targets = dict(target_set.targets)
         rows = target_set.summaries(include_deleted=False)
+        prefix = target_set.id_prefix or "T"
         self._status_label.setText(
-            f"远程目标 · 当前显示 {len(rows)} 个 · 下一个编号 T{target_set.next_seq}"
+            f"{_STAGE_TITLES.get(self._stage or '', '目标')} · 当前 {len(rows)} 个 · 下一个编号 {prefix}{target_set.next_seq}"
         )
         self._status_label.setToolTip(
-            "目标编号由服务器 targets.json 中的 next_seq 持久化分配。"
-            "删除、合并或拆分过的编号不会回收，因此编号允许存在空缺。"
+            "目标编号由服务器持久化分配，删除/合并/拆分过的编号不会回收；可用“重新编号”整理。"
         )
         self._table.setRowCount(len(rows))
         for row, summary in enumerate(rows):
@@ -216,28 +264,75 @@ class TargetDock(QDockWidget):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.ItemDataRole.UserRole, summary.get("id", ""))
                 self._table.setItem(row, col, item)
-        self._sync_selection_controls()
 
     def _set_remote_enabled(self, enabled: bool) -> None:
         for widget in (
+            self._select_all_button,
             self._refresh_button,
             self._review_button,
             self._table,
-            self._name_edit,
-            self._type_combo,
-            self._apply_button,
-            self._confirm_button,
+            self._promote_button,
+            self._clear_button,
+            self._renumber_button,
+            self._models_button,
             self._delete_button,
-            self._merge_button,
-            self._split_button,
             self._load_mask_button,
             self._load_cells_button,
-            self._train_button,
-            self._models_button,
-            self._suggestion_confirm_button,
-            self._suggestion_ignore_button,
         ):
             widget.setEnabled(enabled)
+
+    def _select_all(self) -> None:
+        self._table.selectAll()
+
+    def _on_promote(self) -> None:
+        if self._target_store is None:
+            return
+        if self._stage == TargetStage.TRAINING.value:
+            self._submit_train_export()
+            return
+        ids = self._selected_ids()
+        if not ids:
+            QMessageBox.information(self, "目标", "请先选择目标。")
+            return
+        try:
+            if self._stage == TargetStage.TEMPORARY.value:
+                self._target_store.promote_targets(ids, from_stage=TargetStage.TEMPORARY.value)
+                QMessageBox.information(self, "保存识别目标", f"已确认 {len(ids)} 个目标到“保存识别目标”。")
+            elif self._stage == TargetStage.SAVED.value:
+                category, ok = QInputDialog.getText(
+                    self, "分类并设为训练", "为选中目标设置训练类别（如 浊积体/圈闭/断层/砂体）："
+                )
+                if not ok or not category.strip():
+                    return
+                self._target_store.promote_targets(
+                    ids, from_stage=TargetStage.SAVED.value, category=category.strip()
+                )
+                QMessageBox.information(self, "训练目标", f"已将 {len(ids)} 个目标加入“训练目标”。")
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "目标", str(exc))
+
+    def _on_clear_stage(self) -> None:
+        if self._target_store is None or not self._stage:
+            return
+        if QMessageBox.question(
+            self, "清空", f"确定清空“{_STAGE_TITLES.get(self._stage, '')}”的全部目标吗？此操作不可恢复。"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._target_store.clear_stage(self._stage)
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "清空", str(exc))
+
+    def _on_renumber(self) -> None:
+        if self._target_store is None or not self._stage:
+            return
+        try:
+            self._target_store.renumber_stage(self._stage)
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "重新编号", str(exc))
 
     def show_track_result(self, result: dict[str, object]) -> None:
         target_ids = result.get("target_ids", [])
@@ -274,24 +369,6 @@ class TargetDock(QDockWidget):
                 "服务器没有返回逐阶段帧统计。当前服务器可能尚未更新到新的追踪诊断版本，"
                 "因此暂时无法判断相邻帧是在模型传播、结果收集还是保存阶段丢失。",
             )
-        suggestions = result.get("suggestions", [])
-        if not isinstance(suggestions, list):
-            self._clear_suggestion()
-            return
-        useful = next((_normalise_suggestion(item) for item in suggestions if _normalise_suggestion(item)), None)
-        if useful is None:
-            self._clear_suggestion()
-            return
-        self._pending_suggestion = useful
-        kind = str(useful.get("type", ""))
-        if kind == "merge":
-            ids = ", ".join(str(item) for item in useful.get("target_ids", []))
-            self._suggestion_label.setText(f"检测到 {ids} 可能应合并。")
-        elif kind == "split":
-            self._suggestion_label.setText(f"检测到 {useful.get('target_id')} 可能应拆分。")
-        self._suggestion_label.setVisible(True)
-        self._suggestion_confirm_button.setVisible(True)
-        self._suggestion_ignore_button.setVisible(True)
 
     def _select_target_ids(self, target_ids: list[str]) -> None:
         if not target_ids:
@@ -330,104 +407,25 @@ class TargetDock(QDockWidget):
         if self._target_store is None:
             return None
         try:
-            target = self._target_store.fetch_target(ids[0])
+            target = self._target_store.fetch_target(ids[0], stage=self._stage)
         except Exception:  # noqa: BLE001
             return None
         self._targets[target.id] = target
         return target
 
-    def _sync_selection_controls(self) -> None:
-        target = self._selected_target()
-        if target is None:
-            self._name_edit.clear()
-            self._type_combo.setCurrentText("unknown")
-            return
-        self._name_edit.setText(target.name or "")
-        self._type_combo.setCurrentText(target.type or "unknown")
-
-    def _apply_selected(self) -> None:
-        target = self._selected_target()
-        if target is None or self._target_store is None:
-            return
-        try:
-            self._target_store.patch_target(
-                target.id,
-                {
-                    "name": self._name_edit.text().strip(),
-                    "type": self._type_combo.currentText().strip() or "unknown",
-                },
-            )
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "目标", str(exc))
-
-    def _confirm_selected(self) -> None:
-        self._patch_status(TargetStatus.CONFIRMED.value)
-
     def _delete_selected(self) -> None:
         if self._target_store is None:
             return
-        try:
-            for target_id in self._selected_ids():
-                self._target_store.delete_target(target_id)
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "目标", str(exc))
-
-    def _patch_status(self, status: str) -> None:
-        if self._target_store is None:
-            return
-        try:
-            for target_id in self._selected_ids():
-                self._target_store.patch_target(target_id, {"status": status})
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "目标", str(exc))
-
-    def _merge_selected(self) -> None:
         ids = self._selected_ids()
-        if len(ids) < 2 or self._target_store is None:
+        if not ids:
+            return
+        if QMessageBox.question(
+            self, "删除目标", f"确定删除选中的 {len(ids)} 个目标吗？此操作不可恢复。"
+        ) != QMessageBox.StandardButton.Yes:
             return
         try:
-            self._target_store.merge_targets(ids)
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "目标", str(exc))
-
-    def _confirm_suggestion(self) -> None:
-        if self._target_store is None or self._pending_suggestion is None:
-            return
-        suggestion = dict(self._pending_suggestion)
-        try:
-            if suggestion.get("type") == "merge":
-                target_ids = [str(item) for item in suggestion.get("target_ids", [])]
-                if len(target_ids) >= 2:
-                    self._target_store.merge_targets(target_ids)
-            elif suggestion.get("type") == "split":
-                target_id = str(suggestion.get("target_id", ""))
-                if target_id:
-                    self._target_store.split_target(target_id)
-            self._clear_suggestion()
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "目标建议", str(exc))
-
-    def _clear_suggestion(self) -> None:
-        self._pending_suggestion = None
-        self._suggestion_label.clear()
-        self._suggestion_label.setVisible(False)
-        self._suggestion_confirm_button.setVisible(False)
-        self._suggestion_ignore_button.setVisible(False)
-
-    def _split_selected(self) -> None:
-        target = self._selected_target()
-        if target is None or self._target_store is None:
-            return
-        groups = [[key] for key in (target.trajectory or sorted(target.frames))]
-        if len(groups) < 2:
-            return
-        try:
-            self._target_store.split_target(target.id, groups)
+            for target_id in ids:
+                self._target_store.delete_target(target_id, stage=self._stage, hard=True)
             self.refresh()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "目标", str(exc))
@@ -447,11 +445,19 @@ class TargetDock(QDockWidget):
                 target,
                 self._target_store,
                 self._volume_store,
+                stage=self._stage,
             )
             if not frames:
                 QMessageBox.information(self, "目标", "该目标没有可显示的追踪帧。")
                 return
-            dialog = TargetTrack2DDialog(target, frames, self)
+            dialog = TargetTrack2DDialog(
+                target,
+                frames,
+                self,
+                target_store=self._target_store,
+                stage=self._stage,
+                on_changed=self.refresh,
+            )
             self._show_visualization_window(dialog)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "目标", str(exc))
@@ -473,7 +479,9 @@ class TargetDock(QDockWidget):
     def _load_selected_mask3d(self, target: GeoTarget) -> None:
         if self._target_store is None:
             return
-        result = self._target_store.fetch_mask3d_with_metadata(target.id, volume_id=target.volume_id)
+        result = self._target_store.fetch_mask3d_with_metadata(
+            target.id, volume_id=target.volume_id, stage=self._stage
+        )
         mask = np.asarray(result.mask, dtype=np.uint8)
         if mask.ndim != 3 or not np.any(mask):
             QMessageBox.information(self, "目标", "该目标还没有可显示的 3D mask。")
@@ -534,7 +542,7 @@ class TargetDock(QDockWidget):
         if self._target_store is None:
             return
         try:
-            target_set = self._target_store.load_targets(include_deleted=False)
+            target_set = self._target_store.load_targets(include_deleted=False, stage=self._stage)
             self._targets = dict(target_set.targets)
             dialog = _ReviewQueueDialog(self._target_store, _review_rows(target_set), self)
             dialog.status_changed.connect(self.refresh)
@@ -653,25 +661,6 @@ def _format_volume(value_m3: float) -> str:
     if abs(value_m3) >= 1_000.0:
         return f"{value_m3:,.0f} m3"
     return f"{value_m3:.3g} m3"
-
-
-def _normalise_suggestion(value: object) -> dict[str, object] | None:
-    if not isinstance(value, dict):
-        return None
-    kind = str(value.get("type", ""))
-    if kind == "merge":
-        target_ids = [str(item) for item in value.get("target_ids", []) if str(item)]
-        if len(set(target_ids)) >= 2:
-            row = dict(value)
-            row["target_ids"] = target_ids
-            return row
-    if kind == "split":
-        target_id = str(value.get("target_id", ""))
-        if target_id:
-            row = dict(value)
-            row["target_id"] = target_id
-            return row
-    return None
 
 
 def _model_rows(payload: dict[str, object]) -> list[dict[str, object]]:

@@ -4,7 +4,7 @@ import numpy as np
 
 from yj_studio.data.remote_target_store import Mask3DResult
 from yj_studio.scene.layer_store import LayerStore
-from yj_studio.ui.docks.target_dock import TargetDock
+from yj_studio.ui.docks.target_dock import StageTargetPanel
 from yj_studio_core.targets import GeoTarget, TargetFrame, TargetSet, TargetStatus
 from yj_studio.ui.docks.target_dock import _ReviewQueueDialog, _review_rows
 
@@ -65,10 +65,12 @@ def test_target_dock_opens_mask3d_in_standalone_window_with_volume_stats(monkeyp
     target_set.add_target(target)
 
     class FakeStore:
-        def load_targets(self, *, include_deleted: bool = False):  # noqa: ARG002
+        def load_targets(self, *, include_deleted: bool = False, stage: str | None = None):  # noqa: ARG002
             return target_set
 
-        def fetch_mask3d_with_metadata(self, target_id: str, *, volume_id: str | None = None):
+        def fetch_mask3d_with_metadata(
+            self, target_id: str, *, volume_id: str | None = None, stage: str | None = None  # noqa: ARG002
+        ):
             assert target_id == "T1"
             assert volume_id == "model_lithology"
             mask = np.zeros((2, 3, 4), dtype=np.uint8)
@@ -113,7 +115,7 @@ def test_target_dock_opens_mask3d_in_standalone_window_with_volume_stats(monkeyp
         FakeVolumeDialog,
     )
     layer_store = LayerStore()
-    dock = TargetDock(layer_store, FakeStore())  # type: ignore[arg-type]
+    dock = StageTargetPanel(layer_store, FakeStore(), stage="saved")  # type: ignore[arg-type]
     dock.refresh()
 
     dock._load_selected_mask3d(target)

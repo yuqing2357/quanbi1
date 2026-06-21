@@ -36,6 +36,49 @@ class TargetStatus(str, Enum):
     DELETED = "deleted"
 
 
+class TargetStage(str, Enum):
+    """Lifecycle stage of a target, mapped to a physically separate store.
+
+    ``temporary`` holds AI-assistant results awaiting review (only multi-frame
+    tracks). ``saved`` holds user-confirmed targets (long-term pool).
+    ``training`` holds classified targets assembled into the training dataset.
+    Each stage lives in its own subdirectory with its own ``next_seq`` and id
+    prefix so numbering never collides across stages.
+    """
+
+    TEMPORARY = "temporary"
+    SAVED = "saved"
+    TRAINING = "training"
+
+
+# Stage -> on-disk subdirectory under ``<root>/<project>/``.
+STAGE_SUBDIR: dict[TargetStage, str] = {
+    TargetStage.TEMPORARY: "temp",
+    TargetStage.SAVED: "saved",
+    TargetStage.TRAINING: "training",
+}
+
+# Stage -> id prefix (e.g. TMP1, SAV1, TRN1).
+STAGE_PREFIX: dict[TargetStage, str] = {
+    TargetStage.TEMPORARY: "TMP",
+    TargetStage.SAVED: "SAV",
+    TargetStage.TRAINING: "TRN",
+}
+
+
+def coerce_stage(value: "str | TargetStage | None", default: TargetStage = TargetStage.SAVED) -> TargetStage:
+    """Best-effort parse of a stage from a string/enum, falling back to ``default``."""
+    if isinstance(value, TargetStage):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    for stage in TargetStage:
+        if text in (stage.value, STAGE_SUBDIR[stage], STAGE_PREFIX[stage].lower()):
+            return stage
+    return default
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -132,6 +175,10 @@ class TargetSet(BaseModel):
     schema_version: int = 1
     version: int = 1
     next_seq: int = 1
+    # Id prefix for this set's stage (e.g. "TMP"/"SAV"/"TRN"; legacy "T").
+    # ``new_id`` and the sequence-advance validator both key off this so each
+    # stage's numbering is independent and never collides.
+    id_prefix: str = "T"
     targets: dict[str, GeoTarget] = Field(default_factory=dict)
     target_types: list[str] = Field(default_factory=lambda: list(BUILTIN_TARGET_TYPES))
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -142,16 +189,19 @@ class TargetSet(BaseModel):
     def _advance_sequence_past_existing_ids(self) -> "TargetSet":
         """Keep migrated/stale stores from reusing historical numeric ids."""
 
-        numeric_ids = [
-            int(target_id[1:])
-            for target_id in self.targets
-            if target_id.startswith("T") and target_id[1:].isdigit()
-        ]
+        prefix = self.id_prefix or "T"
+        numeric_ids = []
+        for target_id in self.targets:
+            if target_id.startswith(prefix):
+                suffix = target_id[len(prefix):]
+                if suffix.isdigit():
+                    numeric_ids.append(int(suffix))
         if numeric_ids:
             self.next_seq = max(int(self.next_seq), max(numeric_ids) + 1)
         return self
 
-    def new_id(self, prefix: str = "T") -> str:
+    def new_id(self, prefix: str | None = None) -> str:
+        prefix = prefix or self.id_prefix or "T"
         while True:
             target_id = f"{prefix}{self.next_seq}"
             self.next_seq += 1

@@ -8,11 +8,16 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QRadioButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +47,8 @@ def load_tracking_frames(
     target: GeoTarget,
     target_store: Any,
     volume_store: Any | None,
+    *,
+    stage: str | None = None,
 ) -> list[TrackingFrameView]:
     """Fetch source slices and masks using the same image orientation as SAM3."""
 
@@ -57,6 +64,7 @@ def load_tracking_frames(
                 frame.axis,
                 frame.index,
                 volume_id=target.volume_id,
+                stage=stage,
             ),
             dtype=bool,
         )
@@ -99,14 +107,37 @@ def load_tracking_frames(
     return rows
 
 
+def _stamp_brush(mask: np.ndarray, cx: int, cy: int, radius: int, value: bool) -> None:
+    """Paint a filled disk of ``value`` into ``mask`` centred at ``(cx, cy)``."""
+    height, width = mask.shape
+    r = max(1, int(radius))
+    y0, y1 = max(0, cy - r), min(height, cy + r + 1)
+    x0, x1 = max(0, cx - r), min(width, cx + r + 1)
+    if y0 >= y1 or x0 >= x1:
+        return
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    disk = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+    mask[y0:y1, x0:x1][disk] = value
+
+
 class TargetTrack2DDialog(QDialog):
-    """Frame player for inspecting one tracked target through adjacent slices."""
+    """Frame player + per-frame manual correction for one tracked target.
+
+    When constructed with a ``target_store`` it gains an edit mode: a brush to
+    add/erase mask pixels on the current slice (saved back via ``put_mask``) and
+    a "删除此帧" action to drop a bad frame (``delete_frame``). Without a store it
+    is a read-only player (back-compat).
+    """
 
     def __init__(
         self,
         target: GeoTarget,
         frames: list[TrackingFrameView],
         parent: QWidget | None = None,
+        *,
+        target_store: Any | None = None,
+        stage: str | None = None,
+        on_changed: Any | None = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -115,6 +146,19 @@ class TargetTrack2DDialog(QDialog):
         self._target = target
         self._frames = frames
         self._crop = _union_crop([row.mask for row in frames])
+        # Inset (zoom) axes, rebuilt each draw. The main axes shows the full
+        # slice for global context; the inset magnifies the mask neighbourhood.
+        self._inset: Any | None = None
+        self._target_store = target_store
+        self._stage = stage
+        self._on_changed = on_changed
+        self._editable = target_store is not None
+        self._edit_mode = False
+        self._brush_add = True
+        self._painting = False
+        # Editable mask overrides keyed by frame position (lazily copied so the
+        # original fetched arrays are never mutated until saved).
+        self._edited: dict[int, np.ndarray] = {}
 
         layout = QVBoxLayout(self)
         self._figure = Figure(figsize=(8, 6), tight_layout=True)
@@ -133,6 +177,50 @@ class TargetTrack2DDialog(QDialog):
         controls.addWidget(self._frame_label)
         layout.addLayout(controls)
 
+        if self._editable:
+            edit_row = QHBoxLayout()
+            self._edit_check = QCheckBox("编辑掩膜", self)
+            self._edit_check.setToolTip("勾选后用鼠标在切片上拖动来修改 mask。")
+            # Explicit, mutually-exclusive add/erase mode so erasing is obvious.
+            self._add_radio = QRadioButton("添加", self)
+            self._erase_radio = QRadioButton("擦除", self)
+            self._add_radio.setToolTip("在掩膜上补充漏掉的区域。")
+            self._erase_radio.setToolTip("从掩膜上擦除多分割的区域。")
+            self._add_radio.setChecked(True)
+            self._brush_group = QButtonGroup(self)
+            self._brush_group.addButton(self._add_radio)
+            self._brush_group.addButton(self._erase_radio)
+            self._brush_spin = QSpinBox(self)
+            self._brush_spin.setRange(1, 80)
+            self._brush_spin.setValue(8)
+            self._brush_spin.setPrefix("笔刷 ")
+            self._brush_spin.setSuffix(" px")
+            self._save_button = QPushButton("保存修正", self)
+            self._revert_button = QPushButton("撤销修正", self)
+            self._delete_frame_button = QPushButton("删除此帧", self)
+            self._edit_status = QLabel("", self)
+            self._edit_check.toggled.connect(self._toggle_edit_mode)
+            self._add_radio.toggled.connect(lambda checked: setattr(self, "_brush_add", bool(checked)))
+            self._save_button.clicked.connect(self._save_current_frame)
+            self._revert_button.clicked.connect(self._revert_current_frame)
+            self._delete_frame_button.clicked.connect(self._delete_current_frame)
+            for widget in (
+                self._edit_check,
+                self._add_radio,
+                self._erase_radio,
+                self._brush_spin,
+                self._save_button,
+                self._revert_button,
+                self._delete_frame_button,
+            ):
+                edit_row.addWidget(widget)
+            edit_row.addWidget(self._edit_status, 1)
+            layout.addLayout(edit_row)
+            self._canvas.mpl_connect("button_press_event", self._on_canvas_press)
+            self._canvas.mpl_connect("motion_notify_event", self._on_canvas_motion)
+            self._canvas.mpl_connect("button_release_event", self._on_canvas_release)
+            self._update_edit_controls()
+
         self._timer = QTimer(self)
         self._timer.setInterval(450)
         self._timer.timeout.connect(self._advance)
@@ -140,6 +228,159 @@ class TargetTrack2DDialog(QDialog):
         self._slider.valueChanged.connect(self._draw_frame)
         self.finished.connect(lambda _result: self._timer.stop())
         self._draw_frame(0)
+
+    def _position(self) -> int:
+        return int(np.clip(self._slider.value(), 0, max(0, len(self._frames) - 1)))
+
+    def _effective_mask(self, position: int) -> np.ndarray:
+        if position in self._edited:
+            return self._edited[position]
+        return self._frames[position].mask
+
+    def _editable_mask(self, position: int) -> np.ndarray:
+        """Return the position's mask as a writable buffer (copy-on-write)."""
+        if position not in self._edited:
+            self._edited[position] = np.array(self._frames[position].mask, dtype=bool, copy=True)
+        return self._edited[position]
+
+    def _toggle_edit_mode(self, checked: bool) -> None:
+        self._edit_mode = bool(checked)
+        if checked and self._timer.isActive():
+            self._toggle_playback()
+        self._update_edit_controls()
+        # Switch the canvas layout: edit -> local-only zoom; view -> global+inset.
+        self._draw_frame(self._position())
+
+    def _update_edit_controls(self) -> None:
+        if not self._editable:
+            return
+        editing = self._edit_mode
+        self._add_radio.setEnabled(editing)
+        self._erase_radio.setEnabled(editing)
+        self._brush_spin.setEnabled(editing)
+        has_edit = self._position() in self._edited
+        self._save_button.setEnabled(editing and has_edit)
+        self._revert_button.setEnabled(has_edit)
+        has_frames = bool(self._frames)
+        self._delete_frame_button.setEnabled(has_frames)
+        self._play_button.setEnabled(not editing and len(self._frames) > 1)
+
+    def _is_paint_axes(self, event: Any) -> bool:
+        """Painting is allowed on either the global axes or the zoom inset.
+
+        Both render the slice in the same full-image pixel coordinates, so the
+        brush math is identical regardless of which one the cursor is over; the
+        inset just exposes it at higher magnification.
+        """
+        return event.inaxes is self._axes or (
+            self._inset is not None and event.inaxes is self._inset
+        )
+
+    def _on_canvas_press(self, event: Any) -> None:
+        if not self._edit_mode or not self._is_paint_axes(event):
+            return
+        self._painting = True
+        self._paint_at(event)
+
+    def _on_canvas_motion(self, event: Any) -> None:
+        if self._painting:
+            self._paint_at(event)
+
+    def _on_canvas_release(self, _event: Any) -> None:
+        if self._painting:
+            self._painting = False
+            self._update_edit_controls()
+
+    def _paint_at(self, event: Any) -> None:
+        if not self._is_paint_axes(event) or event.xdata is None or event.ydata is None:
+            return
+        if not self._frames:
+            return
+        position = self._position()
+        mask = self._editable_mask(position)
+        cx, cy = int(round(event.xdata)), int(round(event.ydata))
+        radius = int(self._brush_spin.value())
+        _stamp_brush(mask, cx, cy, radius, self._brush_add)
+        self._draw_frame(position)
+
+    def _save_current_frame(self) -> None:
+        if self._target_store is None or not self._frames:
+            return
+        position = self._position()
+        if position not in self._edited:
+            return
+        row = self._frames[position]
+        mask = self._edited[position]
+        try:
+            self._target_store.put_mask(
+                self._target.id,
+                row.frame.axis,
+                int(row.frame.index),
+                mask.astype(np.uint8),
+                volume_id=self._target.volume_id,
+                stage=self._stage,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "保存修正", str(exc))
+            return
+        # Bake the saved edit into the frame view so playback shows the result.
+        self._frames[position] = TrackingFrameView(
+            frame=row.frame, image=row.image, mask=np.array(mask, dtype=bool, copy=True)
+        )
+        self._edited.pop(position, None)
+        self._edit_status.setText(f"已保存 {_desktop_axis(row.frame.axis)}={row.frame.index} 修正")
+        # Saving exits edit mode and returns to the global + inset view so the
+        # user immediately sees the corrected result in its full context.
+        if self._edit_check.isChecked():
+            self._edit_check.setChecked(False)  # triggers _toggle_edit_mode -> redraw
+        else:
+            self._draw_frame(position)
+        if callable(self._on_changed):
+            self._on_changed()
+
+    def _revert_current_frame(self) -> None:
+        position = self._position()
+        if self._edited.pop(position, None) is not None:
+            self._edit_status.setText("已撤销未保存修正")
+            self._draw_frame(position)
+
+    def _delete_current_frame(self) -> None:
+        if self._target_store is None or not self._frames:
+            return
+        position = self._position()
+        row = self._frames[position]
+        if row.frame.origin == "missing":
+            QMessageBox.information(self, "删除此帧", "该位置本就没有有效帧。")
+            return
+        if QMessageBox.question(
+            self,
+            "删除此帧",
+            f"确定删除 {_desktop_axis(row.frame.axis)}={row.frame.index} 这一帧吗？",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._target_store.delete_frame(
+                self._target.id,
+                row.frame.axis,
+                int(row.frame.index),
+                volume_id=self._target.volume_id,
+                stage=self._stage,
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "删除此帧", str(exc))
+            return
+        del self._frames[position]
+        # Edited overrides are keyed by position; rebuild past the removed index.
+        self._edited = {
+            (pos if pos < position else pos - 1): buf
+            for pos, buf in self._edited.items()
+            if pos != position
+        }
+        self._slider.setRange(0, max(0, len(self._frames) - 1))
+        self._edit_status.setText(f"已删除 {_desktop_axis(row.frame.axis)}={row.frame.index}")
+        self._draw_frame(self._position())
+        if callable(self._on_changed):
+            self._on_changed()
 
     def _toggle_playback(self) -> None:
         if self._timer.isActive():
@@ -157,40 +398,90 @@ class TargetTrack2DDialog(QDialog):
         self._slider.setValue((self._slider.value() + 1) % len(self._frames))
 
     def _draw_frame(self, position: int) -> None:
-        self._axes.clear()
+        # Full rebuild each draw so the inset (zoom) axes never accumulates.
+        self._figure.clear()
+        self._inset = None
+        self._axes = self._figure.add_subplot(111)
         if not self._frames:
             self._axes.text(0.5, 0.5, "没有可显示的追踪帧", ha="center", va="center")
             self._axes.set_axis_off()
             self._canvas.draw_idle()
             return
 
-        row = self._frames[int(np.clip(position, 0, len(self._frames) - 1))]
-        self._axes.imshow(row.image, origin="upper", interpolation="nearest")
-        overlay = np.zeros((*row.mask.shape, 4), dtype=np.float32)
-        overlay[..., :3] = (0.1, 1.0, 0.45)
-        overlay[..., 3] = row.mask.astype(np.float32) * 0.48
-        self._axes.imshow(overlay, origin="upper", interpolation="nearest")
-        if min(row.mask.shape) >= 2 and np.any(row.mask):
-            self._axes.contour(
-                row.mask.astype(np.uint8),
-                levels=[0.5],
-                colors=["#00ff72"],
-                linewidths=1.5,
-            )
-        if self._crop is not None:
-            x0, x1, y0, y1 = self._crop
-            self._axes.set_xlim(x0, x1)
-            self._axes.set_ylim(y1, y0)
+        position = int(np.clip(position, 0, len(self._frames) - 1))
+        row = self._frames[position]
+        mask = self._effective_mask(position)
+        edited = position in self._edited
+        fill_rgb = (1.0, 0.6, 0.1) if edited else (0.1, 1.0, 0.45)
+        contour_color = "#ffaa22" if edited else "#00ff72"
+
+        def _render(ax: Any, *, draw_contour: bool) -> None:
+            ax.imshow(row.image, origin="upper", interpolation="nearest")
+            overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
+            overlay[..., :3] = fill_rgb
+            overlay[..., 3] = mask.astype(np.float32) * 0.48
+            ax.imshow(overlay, origin="upper", interpolation="nearest")
+            if draw_contour and min(mask.shape) >= 2 and np.any(mask):
+                ax.contour(
+                    mask.astype(np.uint8),
+                    levels=[0.5],
+                    colors=[contour_color],
+                    linewidths=1.5,
+                )
+
+        height, width = mask.shape
+        editing = self._editable and self._edit_mode
+
+        if editing:
+            # Edit mode: ONLY the local zoom region on a single, large axes so the
+            # brush has a clear, simple, precise canvas — no global view to fight
+            # with. We zoom to the (padded) mask neighbourhood.
+            _render(self._axes, draw_contour=True)
+            if self._crop is not None:
+                x0, x1, y0, y1 = self._crop
+                self._axes.set_xlim(x0, x1)
+                self._axes.set_ylim(y1, y0)
+            else:
+                self._axes.set_xlim(0, width - 1)
+                self._axes.set_ylim(height - 1, 0)
+            mode_tag = "编辑模式 · 仅局部放大"
+        else:
+            # View mode: the full slice (global position is never lost) plus an
+            # inset that marks + magnifies the mask neighbourhood (paper-style
+            # "inset zoom"), tied together by the indicator rectangle + lines.
+            _render(self._axes, draw_contour=self._crop is None)
+            self._axes.set_xlim(0, width - 1)
+            self._axes.set_ylim(height - 1, 0)
+            if self._crop is not None:
+                x0, x1, y0, y1 = self._crop
+                inset = self._axes.inset_axes([0.60, 0.58, 0.38, 0.38])
+                _render(inset, draw_contour=True)
+                inset.set_xlim(x0, x1)
+                inset.set_ylim(y1, y0)
+                inset.set_xticks([])
+                inset.set_yticks([])
+                for spine in inset.spines.values():
+                    spine.set_edgecolor(contour_color)
+                    spine.set_linewidth(1.4)
+                self._axes.indicate_inset_zoom(inset, edgecolor=contour_color, alpha=0.9)
+                inset.set_title("局部放大", fontsize=8, color=contour_color, pad=2)
+                self._inset = inset
+            mode_tag = "全局图 + 局部放大"
+
         axis_label = _desktop_axis(row.frame.axis)
-        state_text = "未识别" if row.frame.origin == "missing" else f"area={int(row.mask.sum())} px"
+        state_text = "未识别" if row.frame.origin == "missing" else f"area={int(mask.sum())} px"
+        if edited:
+            state_text += " · 已修改(未保存)"
         self._axes.set_title(
             f"{self._target.id}  {axis_label}={row.frame.index}"
-            f"  {state_text}"
+            f"  {state_text}  ·  {mode_tag}"
         )
         self._axes.set_xlabel(_horizontal_label(axis_label))
         self._axes.set_ylabel(_vertical_label(axis_label))
         self._frame_label.setText(f"{position + 1} / {len(self._frames)}")
         self._canvas.draw_idle()
+        if self._editable:
+            self._update_edit_controls()
 
 
 class TargetVolume3DDialog(QDialog):

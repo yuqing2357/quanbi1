@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
 
-from .model import BUILTIN_TARGET_TYPES, TargetSet, TargetStatus
+from .model import BUILTIN_TARGET_TYPES, GeoTarget, TargetSet, TargetStatus
 from .store import TargetStore
 
 
@@ -20,7 +20,7 @@ def _bbox_xywh(bbox: tuple[float, float, float, float] | None) -> list[float]:
     return [float(x0), float(y0), float(max(0.0, x1 - x0)), float(max(0.0, y1 - y0))]
 
 
-def export_confirmed_to_coco(
+def export_stage_to_coco(
     store: TargetStore,
     target_set: TargetSet,
     output_dir: str | Path,
@@ -29,11 +29,38 @@ def export_confirmed_to_coco(
     val_fraction: float = 0.1,
     test_fraction: float = 0.1,
 ) -> dict[str, Any]:
+    """Export every (non-deleted) target in the set to a COCO-style dataset.
+
+    Used for the dedicated training stage, where membership itself means "in the
+    training set" — there is no per-target confirmed/edited gate.
+    """
+    return export_confirmed_to_coco(
+        store,
+        target_set,
+        output_dir,
+        split_strategy=split_strategy,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        include=lambda target: target.status != TargetStatus.DELETED,
+    )
+
+
+def export_confirmed_to_coco(
+    store: TargetStore,
+    target_set: TargetSet,
+    output_dir: str | Path,
+    *,
+    split_strategy: str = "spatial",
+    val_fraction: float = 0.1,
+    test_fraction: float = 0.1,
+    include: Callable[[GeoTarget], bool] | None = None,
+) -> dict[str, Any]:
     """Export confirmed targets to a compact COCO-style dataset.
 
     The internal source of truth remains ``targets.json`` plus ``.npy`` masks.
     This exporter creates PNG masks and a COCO JSON file for training and
-    interchange.
+    interchange. ``include`` overrides the default "confirmed or edited" filter
+    (see :func:`export_stage_to_coco`).
     """
 
     output = Path(output_dir)
@@ -50,8 +77,10 @@ def export_confirmed_to_coco(
     annotation_id = 1
     records: list[dict[str, Any]] = []
 
+    default_include = lambda target: target.status == TargetStatus.CONFIRMED or bool(target.edits)
+    accept = include or default_include
     for target in target_set.targets.values():
-        if target.status != TargetStatus.CONFIRMED and not target.edits:
+        if not accept(target):
             continue
         cat_id = category_id.setdefault(target.type, len(category_id) + 1)
         if not any(category["name"] == target.type for category in categories):

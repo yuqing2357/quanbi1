@@ -103,6 +103,72 @@ def test_chunked_track_relays_across_chunks_until_target_persists() -> None:
     assert all((hi - lo + 1) <= chunk_size + 1 for lo, hi in chunk_calls)
 
 
+def test_chunked_track_hard_caps_span_even_if_target_persists() -> None:
+    """Free tracking stops at the per-direction cap, not at the volume edge.
+
+    The target is present on every frame, but ``max_span=120`` bounds the sweep
+    to 120 forward + 120 backward — no further pass is started past the cap."""
+    def run_chunk(chunk_indices, seed_local, boxes_by_obj):
+        out: dict[int, dict[int, np.ndarray]] = {1: {}}
+        for idx in chunk_indices:
+            out[1][idx] = _row_mask(3)  # alive everywhere, identical bbox
+        return out
+
+    collected = chunked_track(
+        seed=200,
+        fwd=500,
+        back=500,
+        axis_len=2000,
+        seed_boxes={1: [2.0, 3.0, 5.0, 4.0]},
+        chunk_size=10,
+        run_chunk=run_chunk,
+        max_span=120,
+    )
+
+    frames = sorted(collected[1])
+    assert frames[0] == 200 - 120  # backward capped
+    assert frames[-1] == 200 + 120  # forward capped
+    assert len(frames) == 241
+
+
+def test_chunked_track_drift_guard_stops_on_relay_mismatch() -> None:
+    """A relay chunk whose re-detected anchor mask doesn't overlap the fed bbox
+    is treated as drift: that direction stops and the hop is not merged in."""
+    calls: list[int] = []
+
+    def run_chunk(chunk_indices, seed_local, boxes_by_obj):
+        calls.append(len(calls) + 1)
+        # First chunk tracks the real target (row 3); a later relay chunk
+        # "re-detects" a different region (row 6) -> zero IoU with the fed bbox.
+        row = 3 if len(calls) == 1 else 6
+        out: dict[int, dict[int, np.ndarray]] = {1: {}}
+        for idx in chunk_indices:
+            out[1][idx] = _row_mask(row)
+        return out
+
+    events: dict[str, object] = {}
+    collected = chunked_track(
+        seed=10,
+        fwd=120,
+        back=0,
+        axis_len=400,
+        seed_boxes={1: [2.0, 3.0, 5.0, 4.0]},
+        chunk_size=6,
+        run_chunk=run_chunk,
+        drift_iou_min=0.1,
+        events=events,
+    )
+
+    frames = sorted(collected[1])
+    # Only the clean first chunk survives; the drifted relay is dropped.
+    assert frames[0] == 10
+    assert frames[-1] == 16  # seed + chunk_size, where the relay then drifted
+    # Every surviving frame is the clean row-3 target, never the row-6 hop.
+    assert all(mask_bbox_xyxy(collected[1][i]) == [2.0, 3.0, 5.0, 4.0] for i in frames)
+    assert events.get("drift_stops")
+    assert events["drift_stops"][0]["direction"] == "forward"
+
+
 def test_chunked_track_stops_direction_when_target_absent_immediately() -> None:
     def run_chunk(chunk_indices, seed_local, boxes_by_obj):
         # Only the seed frame has a mask; nothing propagates outward.

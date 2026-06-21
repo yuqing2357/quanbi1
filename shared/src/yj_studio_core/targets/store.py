@@ -11,7 +11,19 @@ from typing import Any, Iterator, Literal
 
 import numpy as np
 
-from .model import GeoTarget, TargetFrame, TargetSet, frame_key, utc_now_iso
+import shutil
+
+from .model import (
+    STAGE_PREFIX,
+    STAGE_SUBDIR,
+    GeoTarget,
+    TargetFrame,
+    TargetSet,
+    TargetStage,
+    coerce_stage,
+    frame_key,
+    utc_now_iso,
+)
 
 
 # Process-global registry of per-project locks. Every ``TargetStore`` pointing
@@ -38,20 +50,40 @@ def _project_lock(key: str) -> threading.RLock:
 
 
 class TargetStore:
-    """Project-scoped target store.
+    """Project- and stage-scoped target store.
 
-    Layout:
+    Layout (legacy, ``stage=None``):
         <root>/<project>/targets.json
         <root>/<project>/masks/<target_id>/<axis>_<index>.npy
+
+    Layout (staged, e.g. ``stage=TargetStage.TEMPORARY`` -> ``temp``):
+        <root>/<project>/temp/targets.json
+        <root>/<project>/temp/masks/<target_id>/<axis>_<index>.npy
         <root>/<project>/cells/<target_id>/<axis>_<index>.npy
         <root>/<project>/volumes/<target_id>_*.npy
+
+    Each stage has its own ``next_seq`` and id prefix (TMP/SAV/TRN) so numbering
+    never collides across stages. Promotion between stages relocates a target's
+    mask/cell files via :func:`relocate_target`.
     """
 
-    def __init__(self, root: str | Path, project: str = "default", volume_id: str | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        project: str = "default",
+        volume_id: str | None = None,
+        stage: "str | TargetStage | None" = None,
+    ):
         self.root = Path(root)
         self.project = project or "default"
         self.volume_id = volume_id
-        self.project_root = self.root / self.project
+        self.stage: TargetStage | None = coerce_stage(stage) if stage is not None else None
+        if self.stage is not None:
+            self.id_prefix = STAGE_PREFIX[self.stage]
+            self.project_root = self.root / self.project / STAGE_SUBDIR[self.stage]
+        else:
+            self.id_prefix = "T"
+            self.project_root = self.root / self.project
 
     @property
     def targets_path(self) -> Path:
@@ -103,13 +135,21 @@ class TargetStore:
     def load(self) -> TargetSet:
         self.ensure_dirs()
         if not self.targets_path.exists():
-            return TargetSet(project=self.project, volume_id=self.volume_id)
+            return TargetSet(
+                project=self.project, volume_id=self.volume_id, id_prefix=self.id_prefix
+            )
         payload = self.targets_path.read_text(encoding="utf-8")
         target_set = TargetSet.model_validate_json(payload)
         if not target_set.project:
             target_set.project = self.project
         if self.volume_id and not target_set.volume_id:
             target_set.volume_id = self.volume_id
+        # Pin the id prefix to this store's stage so ``new_id`` allocates the
+        # right TMP/SAV/TRN series even for sets written before id_prefix
+        # existed, then re-advance the sequence past any existing ids.
+        if target_set.id_prefix != self.id_prefix:
+            target_set.id_prefix = self.id_prefix
+            target_set._advance_sequence_past_existing_ids()
         return target_set
 
     def save(self, target_set: TargetSet) -> None:
@@ -137,6 +177,105 @@ class TargetStore:
         if path.is_absolute():
             return path
         return self.project_root / path
+
+    def target_mask_dir(self, target_id: str) -> Path:
+        return self.masks_dir / target_id
+
+    def target_cells_dir(self, target_id: str) -> Path:
+        return self.cells_dir / target_id
+
+    def target_volume_files(self, target_id: str) -> list[Path]:
+        if not self.volumes_dir.exists():
+            return []
+        return sorted(self.volumes_dir.glob(f"{target_id}_*.npy"))
+
+    def clear(self) -> TargetSet:
+        """Drop every target in this stage (manifest + mask/cell/volume files).
+
+        Used by "清空临时" — empties the temporary stage in one shot. Returns the
+        fresh empty set.
+        """
+        with self._lock:
+            for directory in (self.masks_dir, self.cells_dir, self.volumes_dir):
+                if directory.exists():
+                    shutil.rmtree(directory, ignore_errors=True)
+            if self.targets_path.exists():
+                self.targets_path.unlink()
+            self.ensure_dirs()
+            empty = TargetSet(
+                project=self.project, volume_id=self.volume_id, id_prefix=self.id_prefix
+            )
+            self.save(empty)
+            return empty
+
+    def renumber(self) -> TargetSet:
+        """Re-pack ids in this stage to a gapless ``<PREFIX>1..N`` sequence.
+
+        Targets are reordered by their current id sort key; each is reassigned
+        ``<id_prefix><n>`` and its mask/cell/volume files are moved to match. A
+        two-phase move through unique staging ids keeps the operation safe even
+        when the new ids overlap the old ones (e.g. SAV3 -> SAV1).
+        """
+        from .model import _target_id_sort_key
+
+        with self._lock:
+            target_set = self.load()
+            ordered = sorted(target_set.targets.values(), key=lambda t: _target_id_sort_key(t.id))
+            mapping = {t.id: f"{self.id_prefix}{i}" for i, t in enumerate(ordered, start=1)}
+            if all(old == new for old, new in mapping.items()):
+                target_set.next_seq = len(ordered) + 1
+                self.save(target_set)
+                return target_set
+            # Phase 1: every target -> a unique staging id (no collisions).
+            staged: list[tuple[str, GeoTarget]] = []
+            for stage_idx, target in enumerate(ordered):
+                final_id = mapping[target.id]
+                staging_id = f"__reindex__{stage_idx}"
+                self._move_target_files(target.id, staging_id)
+                self._rewrite_target_refs(target, target.id, staging_id)
+                target.id = staging_id
+                staged.append((final_id, target))
+            # Phase 2: staging id -> final id.
+            new_targets: dict[str, GeoTarget] = {}
+            for new_id, target in staged:
+                staging_id = target.id
+                self._move_target_files(staging_id, new_id)
+                self._rewrite_target_refs(target, staging_id, new_id)
+                target.id = new_id
+                target.updated_at = utc_now_iso()
+                new_targets[new_id] = target
+            target_set.targets = new_targets
+            target_set.next_seq = len(new_targets) + 1
+            self.save(target_set)
+            return target_set
+
+    def _move_target_files(self, old_id: str, new_id: str) -> None:
+        """Move a target's mask dir, cell dir, and volume caches to ``new_id``."""
+        moves: list[tuple[Path, Path]] = [
+            (self.target_mask_dir(old_id), self.target_mask_dir(new_id)),
+            (self.target_cells_dir(old_id), self.target_cells_dir(new_id)),
+        ]
+        for src, dst in moves:
+            if src.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    shutil.rmtree(dst, ignore_errors=True)
+                shutil.move(str(src), str(dst))
+        for src in self.target_volume_files(old_id):
+            suffix = src.name[len(old_id):]  # e.g. "_mask3d.npy"
+            dst = self.volumes_dir / f"{new_id}{suffix}"
+            shutil.move(str(src), str(dst))
+
+    @staticmethod
+    def _rewrite_target_refs(target: GeoTarget, old_id: str, new_id: str) -> None:
+        """Swap the id segment in this target's frame mask/cell refs."""
+        for frame in target.frames.values():
+            if frame.mask_ref:
+                frame.mask_ref = frame.mask_ref.replace(f"masks/{old_id}/", f"masks/{new_id}/", 1)
+            if frame.cell_ids_ref:
+                frame.cell_ids_ref = frame.cell_ids_ref.replace(
+                    f"cells/{old_id}/", f"cells/{new_id}/", 1
+                )
 
     def write_mask(self, target_id: str, axis: str, index: int, mask: np.ndarray) -> str:
         self.ensure_dirs()
@@ -335,6 +474,50 @@ class TargetStore:
             return True
         data = json.loads(self.targets_path.read_text(encoding="utf-8"))
         return not _contains_large_inline_array(data)
+
+
+def relocate_target(
+    src_store: TargetStore,
+    dst_store: TargetStore,
+    target: GeoTarget,
+    *,
+    new_id: str,
+    move: bool,
+) -> GeoTarget:
+    """Copy or move a target's files from ``src_store`` into ``dst_store``.
+
+    Returns a fresh :class:`GeoTarget` (id ``new_id``, frame refs rewritten to
+    the destination) ready to be added to the destination set. When ``move`` is
+    true the source files are relocated (left dir removed); the caller still
+    removes the source manifest entry. Used to promote temp->saved (move) and
+    saved->training (copy).
+    """
+    relocated = target.model_copy(deep=True)
+    relocated.id = new_id
+    dst_store.ensure_dirs()
+    pairs = [
+        (src_store.target_mask_dir(target.id), dst_store.target_mask_dir(new_id)),
+        (src_store.target_cells_dir(target.id), dst_store.target_cells_dir(new_id)),
+    ]
+    for src, dst in pairs:
+        if src.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                shutil.rmtree(dst, ignore_errors=True)
+            if move:
+                shutil.move(str(src), str(dst))
+            else:
+                shutil.copytree(src, dst)
+    for src in src_store.target_volume_files(target.id):
+        suffix = src.name[len(target.id):]
+        dst = dst_store.volumes_dir / f"{new_id}{suffix}"
+        if move:
+            shutil.move(str(src), str(dst))
+        else:
+            shutil.copy2(src, dst)
+    TargetStore._rewrite_target_refs(relocated, target.id, new_id)
+    relocated.updated_at = utc_now_iso()
+    return relocated
 
 
 def get_frame(target: GeoTarget, axis: str, index: int) -> TargetFrame | None:

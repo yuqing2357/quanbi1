@@ -47,15 +47,22 @@ sam3:
   # 15-frame hot-start suppression disabled unless explicitly testing it.
   video_temporal_disambiguation: false
   # Auto track range ("自动判断帧数"): when the client requests auto=true,
-  # tracking sweeps to the volume edge in each direction and stops a direction
-  # once the target disappears for ``auto_disappear_patience`` consecutive
-  # frames — the target's true extent decides the span, NOT a fixed window.
-  # This is an OPTIONAL safety cap on how far each direction may sweep if the
-  # disappearance heuristic never fires (e.g. a runaway track). 0 (default) =
-  # no cap (bounded only by the volume edge + the dynamic stop). Set a positive
-  # value only to hard-limit a runaway sweep.
-  auto_track_max: 0
+  # tracking expands outward from the seed and stops a direction once the target
+  # disappears for ``auto_disappear_patience`` consecutive frames OR once this
+  # HARD per-direction cap is reached — whichever comes first. The cap is a firm
+  # upper bound on the free-tracking span (max this many frames forward AND this
+  # many backward): when it is hit the direction stops even if the target is
+  # still visible, and NO further tracking pass is started. This keeps results
+  # stable, single-target, and VRAM-bounded rather than maximally long. 0/neg
+  # falls back to 120 (there is no "unbounded" free-tracking mode).
+  auto_track_max: 120
   auto_disappear_patience: 3
+  # Drift guard for the chunk relay. Each relay chunk is re-seeded from the
+  # previous chunk's last bbox; if the re-detected mask at the shared anchor
+  # frame overlaps that bbox by less than this IoU, the track has drifted/split
+  # onto a different region and the direction stops (surfaced as ``drift_stops``
+  # so the desktop can ask the user to re-confirm). 0 disables the guard.
+  track_drift_iou_min: 0.1
   # Chunked propagation = the VRAM bound. SAM3 keeps every propagated frame's
   # mask-memory on the GPU and forward+backward share one inference state, so a
   # single long propagation OOMs (~1 GB/frame at resolution 1008). Tracking

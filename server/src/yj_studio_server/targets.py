@@ -29,27 +29,39 @@ def _ensure_shared_src_on_path() -> None:
 _ensure_shared_src_on_path()
 
 from yj_studio_core.targets import (  # noqa: E402
+    STAGE_PREFIX,
+    STAGE_SUBDIR,
     GeoTarget,
     TargetFrame,
     TargetSet,
+    TargetStage,
     TargetStatus,
     TargetStore,
+    coerce_stage,
     export_confirmed_to_coco,
+    export_stage_to_coco,
     frame_key,
     mask_volume_stats,
     normalise_target_type,
+    relocate_target,
     resolve_voxel_spacing,
 )
 
 __all__ = [
+    "STAGE_PREFIX",
+    "STAGE_SUBDIR",
     "GeoTarget",
     "TargetFrame",
     "TargetSet",
+    "TargetStage",
     "TargetStatus",
     "TargetStore",
+    "coerce_stage",
     "export_confirmed_to_coco",
+    "export_stage_to_coco",
     "frame_key",
     "mask_volume_stats",
     "normalise_target_type",
+    "relocate_target",
     "resolve_voxel_spacing",
 ]

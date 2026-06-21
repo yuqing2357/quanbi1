@@ -161,19 +161,24 @@ def _worker_track(
             except Exception:  # noqa: BLE001 - progress is best-effort
                 pass
 
-    return collect_object_frames(
-        _ENGINE,
-        frames_dir,
-        seeds=seeds,
-        seed_local=seed_local,
-        fwd_budget=fwd_budget,
-        back_budget=back_budget,
-        indices=indices,
-        cancelled=cancelled,
-        progress=progress,
-        auto_stop=bool(auto_stop),
-        disappear_patience=int(disappear_patience),
-    )
+    try:
+        return collect_object_frames(
+            _ENGINE,
+            frames_dir,
+            seeds=seeds,
+            seed_local=seed_local,
+            fwd_budget=fwd_budget,
+            back_budget=back_budget,
+            indices=indices,
+            cancelled=cancelled,
+            progress=progress,
+            auto_stop=bool(auto_stop),
+            disappear_patience=int(disappear_patience),
+        )
+    finally:
+        # Return cached CUDA blocks to the driver after every chunk so VRAM does
+        # not creep across the relay sweep (matches _worker_segment).
+        _release_worker_cache()
 
 
 def _worker_gpu_info() -> dict[str, Any]:

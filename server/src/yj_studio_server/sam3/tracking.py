@@ -31,6 +31,21 @@ def mask_bbox_xyxy(mask: Any) -> list[float] | None:
     return [float(cols[0]), float(rows[0]), float(cols[-1]) + 1.0, float(rows[-1]) + 1.0]
 
 
+def bbox_iou(a: list[float], b: list[float]) -> float:
+    """IoU of two ``[xmin, ymin, xmax, ymax]`` boxes (0.0 when disjoint/empty)."""
+    ax0, ay0, ax1, ay1 = (float(v) for v in a[:4])
+    bx0, by0, bx1, by1 = (float(v) for v in b[:4])
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
 def chunked_track(
     *,
     seed: int,
@@ -42,16 +57,30 @@ def chunked_track(
     run_chunk: Callable[[list[int], int, dict[int, list[float]]], dict[int, dict[int, np.ndarray]]],
     cancelled: Callable[[], bool] | None = None,
     progress: Callable[[int], None] | None = None,
+    max_span: int | None = None,
+    drift_iou_min: float = 0.0,
+    events: dict[str, Any] | None = None,
 ) -> dict[int, dict[int, np.ndarray]]:
     """Expand tracking outward from ``seed`` one bounded chunk at a time.
 
     SAM3 keeps every propagated frame's mask-memory on the GPU, so a single long
-    propagation OOMs. Instead we propagate a small chunk, release the state, and
-    re-seed the next chunk from the previous chunk's last in-direction mask bbox
-    (``run_chunk`` builds + tracks one chunk and returns ``{obj_id: {abs_index:
-    mask}}``). Peak VRAM is bounded by one chunk regardless of total span; the
-    relay also stops a direction naturally once the target leaves (no mask to
-    seed the next chunk from).
+    propagation OOMs. The chunk relay exists **only** to bound VRAM: we propagate
+    a small chunk, release the state (``collect_object_frames`` resets the video
+    session + CUDA cache after every chunk), and re-seed the next chunk from the
+    previous chunk's last in-direction mask bbox. Peak VRAM is one chunk's worth
+    of frames regardless of how far the target is tracked. The relay is *not* a
+    mechanism for extending past the target — it is bounded on two fronts:
+
+    * ``max_span`` — a HARD per-direction cap (frames). Free/auto tracking passes
+      this so a still-visible target is cut off at a fixed range (e.g. 120) and a
+      new tracking pass is never started. ``None`` = bounded only by ``fwd``/
+      ``back`` + the volume edge.
+    * ``drift_iou_min`` — drift guard. Each relay chunk is re-seeded at the shared
+      anchor frame; if the detector's re-detected mask there overlaps the bbox we
+      seeded from by less than this IoU, the object has drifted/split onto a
+      different region, so that direction stops instead of merging a new target
+      into the same track. ``0.0`` disables the guard (used by unit tests). Stops
+      are reported in ``events["drift_stops"]`` when ``events`` is provided.
 
     ``run_chunk(chunk_indices, seed_local_in_chunk, boxes_by_obj)`` renders the
     given absolute frame indices, seeds ``boxes_by_obj`` (pixel ``xyxy`` per
@@ -60,12 +89,17 @@ def chunked_track(
     """
     collected: dict[int, dict[int, np.ndarray]] = {int(oid): {} for oid in seed_boxes}
     chunk = max(2, int(chunk_size))
+    cap = int(max_span) if max_span is not None and int(max_span) > 0 else None
     for reverse, budget in ((False, int(fwd)), (True, int(back))):
+        budget = int(budget)
+        if cap is not None:
+            budget = min(budget, cap)  # hard per-direction cap
         if budget <= 0:
             continue
         anchor = int(seed)
         relay: dict[int, list[float]] = {int(o): list(b) for o, b in seed_boxes.items()}
         remaining = int(budget)
+        first = True  # the seed chunk is prompt-seeded; skip drift check on it
         while remaining > 0 and relay:
             if cancelled is not None and cancelled():
                 return collected
@@ -79,14 +113,33 @@ def chunked_track(
             chunk_indices = list(range(lo, hi + 1))
             seed_local = anchor - lo
             chunk_collected = run_chunk(chunk_indices, seed_local, dict(relay))
-            for obj_id, frames in chunk_collected.items():
-                if int(obj_id) in collected:
-                    collected[int(obj_id)].update(frames)
-            # Relay each object from its furthest in-direction non-empty mask.
+            # Relay each object from its furthest in-direction non-empty mask,
+            # gating each object on the drift guard before accepting its frames.
             new_relay: dict[int, list[float]] = {}
             new_anchor = anchor
             for obj_id in relay:
-                frames = chunk_collected.get(obj_id, {})
+                frames = chunk_collected.get(int(obj_id), {})
+                if not first and drift_iou_min > 0.0:
+                    anchor_mask = frames.get(anchor)
+                    anchor_bbox = mask_bbox_xyxy(anchor_mask) if anchor_mask is not None else None
+                    if anchor_bbox is None or bbox_iou(relay[obj_id], anchor_bbox) < drift_iou_min:
+                        # Drifted/split onto a different region: drop this chunk's
+                        # contribution for the object and stop relaying it. The
+                        # clean track collected so far is kept.
+                        if events is not None:
+                            events.setdefault("drift_stops", []).append(
+                                {
+                                    "obj_id": int(obj_id),
+                                    "direction": "reverse" if reverse else "forward",
+                                    "anchor": int(anchor),
+                                    "iou": round(bbox_iou(relay[obj_id], anchor_bbox), 4)
+                                    if anchor_bbox is not None
+                                    else 0.0,
+                                }
+                            )
+                        continue
+                if int(obj_id) in collected:
+                    collected[int(obj_id)].update(frames)
                 cand = [i for i in frames if (i > anchor if not reverse else i < anchor)]
                 if not cand:
                     continue
@@ -99,10 +152,11 @@ def chunked_track(
                     new_anchor = far
             advanced = abs(new_anchor - anchor)
             if not new_relay or advanced <= 0:
-                break  # target gone or no forward progress -> lock this direction
+                break  # target gone, drifted, or no forward progress -> lock direction
             remaining -= advanced
             anchor = new_anchor
             relay = new_relay
+            first = False
             if progress is not None:
                 progress(sum(len(frames) for frames in collected.values()))
     return collected
