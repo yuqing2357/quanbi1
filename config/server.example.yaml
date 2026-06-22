@@ -72,6 +72,16 @@ sam3:
   # if a chunk still OOMs, raise it for fewer re-seeds (slightly better
   # continuity) when you have spare VRAM.
   track_chunk: 12
+  # Hand-drawn morphology template search ("形态模板识别", template_match job).
+  # A 2D-only feature run on RESERVOIR MODEL slices (not seismic): the user
+  # sketches an abstract shape on a blank whiteboard and the server finds
+  # similarly-shaped structures. It extracts the slice foreground (the body,
+  # excluding the empty background), slides multi-scale windows over it, and
+  # ranks each local silhouette against the template by an orientation-aware,
+  # size-independent shape metric. ``template_keep_top_k`` caps returned matches;
+  # ``template_min_score`` (0-1) drops weak matches. Results are NEVER persisted.
+  template_keep_top_k: 8
+  template_min_score: 0.0
   results_subdir: sam3
   gpu_ids: [0, 1, 2, 3]
   worker_count: 4

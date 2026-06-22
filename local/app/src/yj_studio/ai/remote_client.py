@@ -158,6 +158,40 @@ class RemoteSAM3Client(QObject):
             raise RuntimeError("Remote SAM3 server did not return a job_id")
         return job_id
 
+    def submit_template_match(
+        self,
+        *,
+        volume_id: str,
+        axis: str,
+        index: int,
+        template: list[list[float]],
+        confidence: float = 0.4,
+        keep_top_k: int = 8,
+        grid: int | None = None,
+        roi: list[list[float]] | None = None,
+        target_type: str = "unknown",
+    ) -> str:
+        body: dict[str, Any] = {
+            "kind": "template_match",
+            "project": self.project_id,
+            "volume_id": volume_id,
+            "axis": axis,
+            "index": int(index),
+            "template": [[float(x), float(y)] for x, y in template],
+            "confidence": float(confidence),
+            "keep_top_k": int(keep_top_k),
+            "target_type": target_type or "unknown",
+        }
+        if grid is not None:
+            body["grid"] = int(grid)
+        if roi:
+            body["roi"] = [[float(v) for v in pair] for pair in roi]
+        payload = self._post_json("/sam3/jobs", body)
+        job_id = str(payload.get("job_id", ""))
+        if not job_id:
+            raise RuntimeError("Remote SAM3 server did not return a job_id for template_match")
+        return job_id
+
     def submit_track(
         self,
         *,

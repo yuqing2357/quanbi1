@@ -315,26 +315,33 @@ class RemoteSAM3Task(QObject):
             self._emit_error("远程 SAM3 服务未就绪，请先在 AI 面板中启动 AI。", "")
             return
         try:
-            self._client.mark_busy("远程 SAM3 分割中")
-            self._job_id = self._client.submit_segment(
-                volume_id=volume_layer.volume_id,
-                axis=str(self._params.get("axis", "inline")),
-                index=int(self._params.get("slice_index", 0)),
-                text=str(self._params.get("text_prompt", "")),
-                boxes=list(self._params.get("boxes", [])),
-                points=list(self._params.get("points", [])),
-                point_box_radius_px=float(self._params.get("point_box_radius_px", 8.0)),
-                confidence=float(self._params.get("confidence_threshold", 0.4)),
-                keep_top_k=int(self._params.get("keep_top_k", 3)),
-                target_type=str(self._params.get("target_type", "unknown")),
-                box_strict=bool(self._params.get("box_strict", False)),
-            )
+            self._client.mark_busy(self._busy_message)
+            self._job_id = self._submit_job(volume_layer)
         except Exception as exc:  # noqa: BLE001 - UI task boundary
             self._client.mark_ready()
             self._emit_error(f"{type(exc).__name__}: {exc}", traceback.format_exc())
             return
         self.progress.emit(0.02, "已提交远程 SAM3 任务")
         self._timer.start()
+
+    # Submission is a hook so subclasses (e.g. template-match) can swap the
+    # remote call while reusing the poll / candidate→layer machinery unchanged.
+    _busy_message = "远程 SAM3 分割中"
+
+    def _submit_job(self, volume_layer: VolumeLayer) -> str:
+        return self._client.submit_segment(
+            volume_id=volume_layer.volume_id,
+            axis=str(self._params.get("axis", "inline")),
+            index=int(self._params.get("slice_index", 0)),
+            text=str(self._params.get("text_prompt", "")),
+            boxes=list(self._params.get("boxes", [])),
+            points=list(self._params.get("points", [])),
+            point_box_radius_px=float(self._params.get("point_box_radius_px", 8.0)),
+            confidence=float(self._params.get("confidence_threshold", 0.4)),
+            keep_top_k=int(self._params.get("keep_top_k", 3)),
+            target_type=str(self._params.get("target_type", "unknown")),
+            box_strict=bool(self._params.get("box_strict", False)),
+        )
 
     def cancel(self) -> None:
         if self._job_id is not None:
@@ -443,6 +450,31 @@ class RemoteSAM3Task(QObject):
     def _stop_timer(self) -> None:
         if self._timer.isActive():
             self._timer.stop()
+
+
+class RemoteSAM3TemplateMatchTask(RemoteSAM3Task):
+    """Template-guided 2D search: same poll/candidate→layer flow as segment.
+
+    Only the remote call differs — it submits a ``template_match`` job carrying
+    the hand-drawn polygon. Candidates come back in the same JSON shape, so
+    ``_poll`` / ``_build_layers`` / ``fetch_mask`` are inherited unchanged.
+    Results are visualisation-only (no target id, never persisted).
+    """
+
+    _busy_message = "远程形态模板搜索中"
+
+    def _submit_job(self, volume_layer: VolumeLayer) -> str:
+        return self._client.submit_template_match(
+            volume_id=volume_layer.volume_id,
+            axis=str(self._params.get("axis", "inline")),
+            index=int(self._params.get("slice_index", 0)),
+            template=list(self._params.get("template", [])),
+            confidence=float(self._params.get("confidence_threshold", 0.4)),
+            keep_top_k=int(self._params.get("keep_top_k", 8)),
+            grid=self._params.get("grid"),
+            roi=self._params.get("roi"),
+            target_type=str(self._params.get("target_type", "unknown")),
+        )
 
 
 class RemoteSAM3TrackTask(QObject):

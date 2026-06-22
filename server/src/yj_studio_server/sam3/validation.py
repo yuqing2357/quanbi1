@@ -14,8 +14,10 @@ def validate_sam3_payload(
     max_batch_frames: int = 5000,
 ) -> None:
     """Validate user-facing SAM3 requests before they enter the job queue."""
-    if kind not in {"segment", "track", "batch", "infer_volume"}:
-        raise ValueError("SAM3 job kind must be 'segment', 'track', 'batch', or 'infer_volume'")
+    if kind not in {"segment", "track", "batch", "infer_volume", "template_match"}:
+        raise ValueError(
+            "SAM3 job kind must be 'segment', 'track', 'batch', 'infer_volume', or 'template_match'"
+        )
 
     keep_top_k = _optional_int(payload, "keep_top_k", default=3)
     if keep_top_k < 1 or keep_top_k > max_keep_top_k:
@@ -53,6 +55,18 @@ def validate_sam3_payload(
             raise ValueError("batch job requires frames, indices, or start/end")
         if n_frames > max_batch_frames:
             raise ValueError(f"batch frame count must be <= {max_batch_frames}")
+
+    if kind == "template_match":
+        template = payload.get("template")
+        if not isinstance(template, (list, tuple)) or len(template) < 3:
+            raise ValueError("template_match requires a polygon of at least 3 [x, y] points")
+        if len(template) > max_points:
+            raise ValueError(f"template polygon may contain at most {max_points} points")
+        for index, point in enumerate(template):
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                raise ValueError(f"template[{index}] must contain [x, y]")
+            for coord in point[:2]:
+                _float(coord, f"template[{index}]")
 
 
 def _optional_int(payload: dict[str, Any], key: str, *, default: int) -> int:

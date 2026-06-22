@@ -17,6 +17,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from yj_studio_core.volume_grid import grid_reference_from_mapping
 
 from yj_studio_core.masks import encode_sparse_mask
+from yj_studio_core.shapes import (
+    match_template_in_foreground,
+    rasterize_polygon,
+    slice_foreground,
+)
 
 from .cache import enforce_slice_cache_budget
 from .config import ServerConfig, load_config
@@ -145,8 +150,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     @app.post("/sam3/jobs")
     def submit_sam3_job(payload: dict[str, Any]) -> dict[str, Any]:
         kind = str(payload.get("kind", "")).strip().lower()
-        if kind not in {"segment", "track", "infer_volume"}:
-            raise HTTPException(status_code=400, detail="SAM3 job kind must be 'segment', 'track', or 'infer_volume'")
+        if kind not in {"segment", "track", "infer_volume", "template_match"}:
+            raise HTTPException(
+                status_code=400,
+                detail="SAM3 job kind must be 'segment', 'track', 'infer_volume', or 'template_match'",
+            )
         request = dict(payload)
         if kind == "infer_volume":
             request.setdefault("target_status", TargetStatus.TO_REVIEW.value)
@@ -155,9 +163,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         else:
             _validate_sam3_request(cfg, request, kind=kind)
         job = app.state.jobs.create(kind, request)
-        runner = _run_track_job if kind == "track" else _run_sam3_job
-        if kind == "infer_volume":
+        if kind == "track":
+            runner = _run_track_job
+        elif kind == "infer_volume":
             runner = _run_sam3_batch_job
+        elif kind == "template_match":
+            runner = _run_template_match_job
+        else:
+            runner = _run_sam3_job
         app.state.queue.submit(runner, app, job.id)
         return {"job_id": job.id, "state": job.state.value}
 
@@ -1368,6 +1381,120 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - job boundary returns status instead of crashing uvicorn
         logger.exception("SAM3 segment job failed: job_id=%s", job_id)
+        jobs.update(
+            job_id,
+            state=JobState.error,
+            progress=1.0,
+            message="failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _run_template_match_job(app: FastAPI, job_id: str) -> None:
+    """Template-guided 2D search: rank class-agnostic proposals by morphology.
+
+    The user draws a shape template on the current slice; this renders that
+    slice, generates class-agnostic mask proposals (grid-point AMG), ranks them
+    against the rasterised template with the orientation-aware shape metric, and
+    returns the top matches. Unlike the segment job this is **purely 2D and never
+    persisted** — candidates are written to the job's output dir for retrieval
+    only; no target store (temp/saved/training) is touched. The user decides
+    afterwards whether to save/track a candidate via the normal flows.
+    """
+    jobs: JobStore = app.state.jobs
+    job = jobs.get(job_id)
+    if job is None or job.state == JobState.cancelled:
+        return
+    cfg: ServerConfig = app.state.config
+    payload = dict(job.params)
+    try:
+        jobs.update(job_id, state=JobState.running, progress=0.05, message="loading slice")
+        volume_id = str(payload.get("volume_id", ""))
+        axis = str(payload.get("axis", ""))
+        index = int(payload.get("index", payload.get("slice_index", 0)))
+        if axis not in {"inline", "xline", "crossline", "z", "timeslice"}:
+            raise ValueError(f"Unsupported axis: {axis}")
+        volume_axis = _volume_axis(axis)
+
+        spec, _path = _volume_spec_and_path(cfg, volume_id)
+        arr, _mode = app.state.volumes.get(volume_id)
+        data, shape = _slice_array(arr, volume_axis, index)
+        # Same orientation as the SAM3 segment/track path: rows are samples/depth.
+        slice2d = np.asarray(data, dtype=np.float32).T
+        height, width = slice2d.shape[:2]
+
+        template_points = payload.get("template") or []
+        template_mask = rasterize_polygon(template_points, height, width, normalized=True)
+        if not template_mask.any():
+            raise ValueError("template polygon did not enclose any pixels")
+
+        sam3_cfg = dict(cfg.sam3)
+        keep_top_k = int(payload.get("keep_top_k", sam3_cfg.get("template_keep_top_k", 8)))
+        min_score = float(payload.get("min_score", sam3_cfg.get("template_min_score", 0.0)))
+
+        # Template search works on the reservoir model's CONTENT, not a SAM3
+        # segmentation of the rendered RGB: it extracts the foreground (the body,
+        # excluding the empty/black background) and slides multi-scale windows
+        # over it, scoring each local silhouette against the drawn shape. This
+        # keeps results on real structures and never on background.
+        jobs.update(job_id, progress=0.2, message="extracting foreground")
+        foreground = slice_foreground(slice2d)
+        if not foreground.any():
+            raise ValueError(
+                "reservoir slice has no foreground content to search (is this a model volume?)"
+            )
+
+        jobs.update(job_id, progress=0.4, message="matching morphology")
+        matches = match_template_in_foreground(
+            template_mask, foreground, top_k=keep_top_k, min_score=min_score
+        )
+
+        output_dir = _sam3_job_output_dir(cfg, job_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        project = _project_id(cfg, payload)
+        target_type = _payload_target_type(payload)
+        candidates: list[dict[str, Any]] = []
+        mask_paths: list[str] = []
+        for candidate_index, match in enumerate(matches):
+            mask = np.asarray(match.get("mask"), dtype=bool)
+            mask_path = output_dir / f"cand{candidate_index}.npy"
+            np.save(mask_path, mask.astype(np.uint8), allow_pickle=False)
+            mask_paths.append(str(mask_path))
+            candidates.append(
+                {
+                    "index": candidate_index,
+                    # 2D-only, never persisted → no target id.
+                    "target_id": "",
+                    "target_type": target_type,
+                    "score": float(match.get("score", 0.0)),
+                    "box": [float(v) for v in match.get("box", [])],
+                    "mask_path": _relative_result_path(cfg, mask_path),
+                    "mask_url": f"/sam3/jobs/{job_id}/mask/{candidate_index}",
+                    "shape": [int(v) for v in mask.shape],
+                    "dtype": "uint8",
+                }
+            )
+
+        result = {
+            "job_id": job_id,
+            "kind": "template_match",
+            "project": project,
+            "volume_id": volume_id,
+            "axis": axis,
+            "index": index,
+            "volume_shape": [int(v) for v in shape],
+            "candidates": candidates,
+        }
+        jobs.update(
+            job_id,
+            state=JobState.done,
+            progress=1.0,
+            message="done",
+            result=result,
+            mask_paths=mask_paths,
+        )
+    except Exception as exc:  # noqa: BLE001 - job boundary returns status, never crashes uvicorn
+        logger.exception("SAM3 template_match job failed: job_id=%s", job_id)
         jobs.update(
             job_id,
             state=JobState.error,

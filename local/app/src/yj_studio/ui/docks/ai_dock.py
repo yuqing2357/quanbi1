@@ -30,6 +30,7 @@ from PyQt6.QtGui import QUndoStack
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDockWidget,
     QDoubleSpinBox,
     QFormLayout,
@@ -47,7 +48,11 @@ from PyQt6.QtWidgets import (
 )
 
 from yj_studio.ai.state import AIServiceState
-from yj_studio.algorithms.runner import AlgorithmRunner, RemoteSAM3TrackTask
+from yj_studio.algorithms.runner import (
+    AlgorithmRunner,
+    RemoteSAM3TemplateMatchTask,
+    RemoteSAM3TrackTask,
+)
 from yj_studio.scene.layer_store import LayerStore
 from yj_studio.scene.layers import MaskLayer, VolumeLayer
 from yj_studio.scene.undo_commands import AddLayerCommand, RemoveLayerCommand
@@ -81,6 +86,7 @@ class AIDock(QDockWidget):
         self._undo_stack = undo_stack
         self._boxes: list[tuple[float, float, float, float]] = []
         self._points: list[tuple[float, float]] = []
+        self._template: list[list[float]] | None = None
         self._current_task: Any = None
 
         self._build_ui()
@@ -212,6 +218,37 @@ class AIDock(QDockWidget):
         clear_row.addWidget(self._clear_masks_button)
         outer.addLayout(clear_row)
 
+        # Morphology template search (形态模板识别): an independent module from the
+        # point/box/text prompts. The user sketches an abstract shape on a blank
+        # whiteboard (NOT on the section), and the server searches a RESERVOIR
+        # MODEL slice for structures of similar morphology (size-independent).
+        outer.addWidget(QLabel("形态模板识别（储层模型）：", body))
+        template_form = QFormLayout()
+        self._template_volume_combo = QComboBox(body)
+        template_form.addRow("储层模型体", self._template_volume_combo)
+        self._template_top_k_spin = QSpinBox(body)
+        self._template_top_k_spin.setRange(1, 50)
+        self._template_top_k_spin.setValue(8)
+        template_form.addRow("返回候选数", self._template_top_k_spin)
+        outer.addLayout(template_form)
+
+        template_buttons = QHBoxLayout()
+        self._draw_template_button = QPushButton("绘制模板", body)
+        self._draw_template_button.clicked.connect(self._open_template_canvas)
+        self._clear_template_button = QPushButton("清除模板", body)
+        self._clear_template_button.clicked.connect(self._clear_template)
+        template_buttons.addWidget(self._draw_template_button)
+        template_buttons.addWidget(self._clear_template_button)
+        outer.addLayout(template_buttons)
+
+        self._template_status_label = QLabel("未绘制模板", body)
+        self._template_status_label.setWordWrap(True)
+        outer.addWidget(self._template_status_label)
+
+        self._template_search_button = QPushButton("按模板搜索相似", body)
+        self._template_search_button.clicked.connect(self._on_template_search_clicked)
+        outer.addWidget(self._template_search_button)
+
         self._progress_bar = QProgressBar(body)
         self._progress_bar.setRange(0, 100)
         outer.addWidget(self._progress_bar)
@@ -223,6 +260,7 @@ class AIDock(QDockWidget):
         # Reflect the default toggle states (strict box on, auto off).
         self._on_box_strict_toggled(self._box_strict_check.isChecked())
         self._on_auto_range_toggled(self._auto_range_check.isChecked())
+        self._refresh_template_volume_combo()
 
         self.setWidget(body)
 
@@ -266,6 +304,7 @@ class AIDock(QDockWidget):
         self._track_button.setEnabled(
             state == AIServiceState.READY and _has_remote_track_backend(self._ai_service)
         )
+        self._update_template_search_enabled()
 
     def _on_box_prompt(
         self, axis: str, slice_index: int, x_min: float, y_min: float, x_max: float, y_max: float
@@ -349,6 +388,115 @@ class AIDock(QDockWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "AI 工具", str(exc))
 
+    def _open_template_canvas(self) -> None:
+        # Drawing happens on an independent blank whiteboard, never on the
+        # section — the template expresses a shape, not a region of the image.
+        from yj_studio.ui.dialogs.template_canvas_dialog import TemplateCanvasDialog
+
+        self._refresh_template_volume_combo()
+        dialog = TemplateCanvasDialog(self)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        points = dialog.template_points()
+        if len(points) < 3:
+            self._clear_template()
+            return
+        self._template = [[float(x), float(y)] for x, y in points]
+        self._template_status_label.setText(
+            f"已保存模板（{len(self._template)} 点），可点击“按模板搜索相似”。"
+        )
+        self._update_template_search_enabled()
+
+    def _clear_template(self) -> None:
+        self._template = None
+        self._template_status_label.setText("未绘制模板")
+        self._update_template_search_enabled()
+
+    def _reservoir_volume_layers(self) -> list[VolumeLayer]:
+        """Loaded volume layers that are reservoir models (i.e. not seismic).
+
+        Template search runs on reservoir model slices, never on the seismic
+        cube, so the seismic volume is excluded from the search-target list.
+        """
+        return [
+            layer
+            for layer in self._layer_store.iter_by_type(VolumeLayer)
+            if layer.shape is not None and str(layer.volume_id) != "seismic"
+        ]
+
+    def _refresh_template_volume_combo(self) -> None:
+        previous = str(self._template_volume_combo.currentData() or "")
+        self._template_volume_combo.blockSignals(True)
+        self._template_volume_combo.clear()
+        for layer in self._reservoir_volume_layers():
+            self._template_volume_combo.addItem(layer.name or layer.volume_id, layer.volume_id)
+        if previous:
+            idx = self._template_volume_combo.findData(previous)
+            if idx >= 0:
+                self._template_volume_combo.setCurrentIndex(idx)
+        self._template_volume_combo.blockSignals(False)
+        self._update_template_search_enabled()
+
+    def _selected_template_volume(self) -> VolumeLayer | None:
+        volume_id = str(self._template_volume_combo.currentData() or "")
+        if not volume_id:
+            return None
+        for layer in self._reservoir_volume_layers():
+            if str(layer.volume_id) == volume_id:
+                return layer
+        return None
+
+    def _update_template_search_enabled(self) -> None:
+        ready = (
+            self._ai_service.state == AIServiceState.READY
+            and _has_remote_template_backend(self._ai_service)
+        )
+        has_template = bool(self._template) and len(self._template or []) >= 3
+        has_volume = self._template_volume_combo.count() > 0
+        self._template_search_button.setEnabled(ready and has_template and has_volume)
+
+    def _on_template_search_clicked(self) -> None:
+        self._refresh_template_volume_combo()
+        volume_layer = self._selected_template_volume()
+        if volume_layer is None:
+            QMessageBox.information(
+                self, "形态模板搜索", "请先加载并选择一个储层模型体（地震体不参与形态模板识别）。"
+            )
+            return
+        if not _has_remote_template_backend(self._ai_service):
+            QMessageBox.information(self, "形态模板搜索", "形态模板搜索需要远程 SAM3 后端。")
+            return
+        if not self._template or len(self._template) < 3:
+            QMessageBox.information(self, "形态模板搜索", "请先用“绘制模板”在白板上画出一个形状。")
+            return
+        axis = str(self._axis_combo.currentData() or self._axis_combo.currentText())
+        index = int(self._slice_spin.value())
+        self._set_slice_spin_limit(volume_layer, axis)
+        index = min(index, self._slice_spin.maximum())
+        params = {
+            "axis": axis,
+            "slice_index": index,
+            "template": list(self._template),
+            "confidence_threshold": float(self._confidence_spin.value()),
+            "keep_top_k": int(self._template_top_k_spin.value()),
+            "target_type": self._target_type_combo.currentText().strip() or "unknown",
+            "name_prefix": "模板",
+        }
+        self._summary_label.setText("")
+        self._progress_bar.setValue(0)
+        self._template_search_button.setEnabled(False)
+        self._cancel_button.setEnabled(True)
+
+        task = RemoteSAM3TemplateMatchTask(
+            self._ai_service, params, {"volume": volume_layer}, parent=self
+        )
+        self._current_task = task
+        task.progress.connect(self._on_progress)
+        task.finished.connect(self._on_finished)
+        task.errored.connect(self._on_errored)
+        task.cancelled.connect(self._on_cancelled)
+        task.start()
+
     def _sync_from_volume(self) -> None:
         current_axis = str(self._axis_combo.currentData() or self._axis_combo.currentText())
         layer = _preferred_visible_volume_layer(self._layer_store)
@@ -358,6 +506,7 @@ class AIDock(QDockWidget):
         indices = layer.slice_indices or {}
         if current_axis in indices:
             self._slice_spin.setValue(int(indices[current_axis]))
+        self._refresh_template_volume_combo()
 
     # ------------------------------------------------------------------ run
 
@@ -502,6 +651,7 @@ class AIDock(QDockWidget):
             self._ai_service.state == AIServiceState.READY
             and _has_remote_track_backend(self._ai_service)
         )
+        self._update_template_search_enabled()
         self._cancel_button.setEnabled(False)
         self._current_task = None
 
@@ -608,6 +758,12 @@ def _has_remote_segment_backend(service: Any) -> bool:
 
 def _has_remote_track_backend(service: Any) -> bool:
     return _has_remote_segment_backend(service) and callable(getattr(service, "submit_track", None))
+
+
+def _has_remote_template_backend(service: Any) -> bool:
+    return _has_remote_segment_backend(service) and callable(
+        getattr(service, "submit_template_match", None)
+    )
 
 
 def _target_ids_from_layers(layers: list[Any]) -> list[str]:

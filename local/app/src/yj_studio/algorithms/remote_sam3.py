@@ -38,3 +38,31 @@ class RemoteSAM3SegmentAlgorithm(Algorithm):
 
     def run(self, ctx: AlgorithmContext) -> AlgorithmResult:
         return AlgorithmResult.failure("SAM3 分割只允许通过远程 /sam3/jobs 执行。")
+
+
+class RemoteSAM3TemplateMatchParams(BaseModel):
+    axis: Literal["inline", "xline", "z"] = Field(default="inline")
+    slice_index: int = Field(default=0, ge=0)
+    template: list[PointSpec] = Field(default_factory=list)
+    confidence_threshold: float = Field(default=0.4, ge=0.0, le=1.0)
+    keep_top_k: int = Field(default=8, ge=1, le=50)
+    grid: int | None = Field(default=None, ge=2, le=128)
+    target_type: str = "unknown"
+    name_prefix: str = "模板"
+
+
+class RemoteSAM3TemplateMatchAlgorithm(Algorithm):
+    id: ClassVar[str] = "ai.sam3.template_match"
+    category: ClassVar[str] = "ai"
+    label: ClassVar[str] = "SAM3 形态模板搜索"
+    description: ClassVar[str] = (
+        "AI 面板专用描述类；手绘形态模板的相似结构搜索，实际执行由 "
+        "RemoteSAM3TemplateMatchTask 提交到服务器 /sam3/jobs。"
+    )
+    input_schema: ClassVar[type[BaseModel]] = RemoteSAM3TemplateMatchParams
+    layer_inputs: ClassVar[dict[str, str]] = {"volume": "volume"}
+    runs_in_subprocess: ClassVar[bool] = False
+    supports_cancel: ClassVar[bool] = True
+
+    def run(self, ctx: AlgorithmContext) -> AlgorithmResult:
+        return AlgorithmResult.failure("形态模板搜索只允许通过远程 /sam3/jobs 执行。")
