@@ -70,6 +70,10 @@ class VolumeCache:
         if spec is None:
             return None
         rel = str(spec.get("path", ""))
+        if not rel:
+            # Virtual/composite volume (e.g. an rgt_overlay render): it has no
+            # file of its own — the app renders it from its source volumes.
+            return None
         if self._stage_dir is not None:
             staged = self._stage_dir / rel
             if staged.exists():
@@ -101,6 +105,12 @@ class VolumeCache:
                 current = self._status.get(volume_id, {})
                 if current.get("state") == "ready" and current.get("mode") == "ram":
                     continue
+            if self._path(volume_id) is None:
+                # Virtual/composite volume: nothing to load (rendered on demand).
+                with self._lock:
+                    self._status.setdefault(volume_id, {"volume_id": volume_id})
+                    self._status[volume_id].update(state="virtual", mode=None, error=None)
+                continue
             try:
                 arr, mode = self._load_one(volume_id, to_ram=self._preload_to_ram)
             except FileNotFoundError as exc:

@@ -42,6 +42,7 @@ from yj_studio.services.view_sync_service import ViewSyncService
 from yj_studio.ui.text import measurement_value_label, section_axis_label
 from yj_studio.view.highlight import highlight_color, is_layer_highlighted, selected_well_names
 from yj_studio.view.physical_axes import apply_section_axis_units
+from yj_studio.view.rgt_compose import compose_rgt_rgb, is_rgt_composite
 from yj_studio_core.volume_grid import local_to_seismic_index, seismic_to_local_index
 
 
@@ -150,12 +151,19 @@ class View2DSection(QWidget):
             self._update_navigation()
             self._draw_message("未加载体数据")
             return
+        composite = is_rgt_composite(volume_layer)
+        slice_volume_id = None
+        if composite:
+            slice_volume_id = (volume_layer.metadata.get("source_volumes") or {}).get(
+                "lithology", "model_lithology"
+            )
         try:
             section = extract_orthogonal_section(
                 self._volume_store,
                 volume_layer,
                 self.axis,
                 self.index,
+                slice_volume_id=slice_volume_id,
             )
         except Exception as exc:
             self._update_navigation()
@@ -165,17 +173,34 @@ class View2DSection(QWidget):
         self._update_navigation()
         self._current_extent = section.extent
         vmin, vmax = volume_layer.clim if volume_layer.clim is not None else (None, None)
-        display_mask = self._display_mask_section(
-            volume_layer,
-            section.axis,
-            section.index,
-            section.values.shape,
+        # Composite render has mud/no-data and the RGT colour baked in, so it
+        # carries no display mask.
+        display_mask = (
+            None
+            if composite
+            else self._display_mask_section(
+                volume_layer,
+                section.axis,
+                section.index,
+                section.values.shape,
+            )
         )
         # ``aspect="equal"`` locks one data unit on X to one data unit on Y so
         # the seismic slice keeps its shape when the user resizes the dock /
         # main window. The previous ``"auto"`` value let the image stretch to
         # fill whatever space the canvas had, which was visually noisy.
-        if _is_lithology_volume(volume_layer):
+        if composite:
+            # Identical pixels (and shared renderer) to the SAM3 image.
+            rgb = compose_rgt_rgb(self._volume_store, volume_layer, section.axis, section.index)
+            self._axes.imshow(
+                rgb,
+                origin="upper",
+                aspect="equal",
+                extent=section.extent,
+                interpolation="nearest",
+                resample=False,
+            )
+        elif _is_lithology_volume(volume_layer):
             self._axes.imshow(
                 _lithology_rgba(section.values, display_mask),
                 origin="upper",

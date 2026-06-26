@@ -44,13 +44,20 @@ def extract_orthogonal_section(
     layer: VolumeLayer,
     axis: SectionAxis,
     index: int,
+    *,
+    slice_volume_id: str | None = None,
 ) -> OrthogonalSection:
-    """Extract one orthogonal 2D section using the same orientation as the 3D slices."""
+    """Extract one orthogonal 2D section using the same orientation as the 3D slices.
+
+    ``slice_volume_id`` overrides which volume the pixels come from while keeping
+    the layer's grid (shape/extent). Used by the rgt_overlay composite, whose own
+    id has no raw slice — it borrows the lithology source's grid.
+    """
 
     if layer.shape is None:
         raise ValueError("体数据图层需要有效尺寸。")
     clipped_index = _clip_index(axis, index, layer.shape)
-    raw = volume_store.get_slice(layer.volume_id, axis, clipped_index)
+    raw = volume_store.get_slice(slice_volume_id or layer.volume_id, axis, clipped_index)
     values = np.asarray(raw, dtype=np.float32).T
     nx, ny, nz = layer.shape
     if axis == "inline":

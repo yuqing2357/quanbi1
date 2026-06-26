@@ -17,6 +17,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from yj_studio_core.volume_grid import grid_reference_from_mapping
 
 from yj_studio_core.masks import encode_sparse_mask
+from yj_studio_core.reservoir import (
+    INLINE as _RGT_INLINE,
+    XLINE as _RGT_XLINE,
+    RgtRenderParams,
+    compute_rgt_span,
+    extract_rgt_slice,
+    render_rgt_section,
+)
 from yj_studio_core.shapes import (
     match_template_in_foreground,
     rasterize_polygon,
@@ -87,6 +95,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         preload_to_ram=bool(dict(cfg.preload).get("volumes_to_ram", True)),
         stage_dir=dict(cfg.preload).get("stage_dir") or None,
     )
+    # Cache of fixed RGT stretch spans per rgt_field id (computed once on first
+    # use when not pinned in config). See _rgt_render_span.
+    app.state.rgt_span_cache = {}
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -105,7 +116,13 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
     @app.get("/volumes")
     def volumes() -> list[dict[str, Any]]:
-        return [_volume_payload(volume_id, spec, cfg.data_root) for volume_id, spec in cfg.volumes.items()]
+        payloads = []
+        for volume_id, spec in cfg.volumes.items():
+            payload = _volume_payload(volume_id, spec, cfg.data_root)
+            if _is_rgt_render(spec):
+                _augment_composite_payload(app, cfg, spec, payload)
+            payloads.append(payload)
+        return payloads
 
     @app.get("/slice")
     def volume_slice(
@@ -113,6 +130,19 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         axis: Literal["inline", "xline", "z"] = Query(...),
         index: int = Query(...),
     ) -> Response:
+        spec = cfg.volumes.get(volume_id)
+        if _is_rgt_render(spec):
+            # Composite render volume: it has no raw array of its own. Clients
+            # fetch its source volumes (lithology/porosity/rgt_field) and compose
+            # with shared reservoir.render_rgt_section, OR run SAM3 on it directly
+            # (the server renders the same image for SAM3 via _render_section_rgb).
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"'{volume_id}' is an rgt_overlay composite with no raw slice; "
+                    "fetch its source volumes or run a SAM3 job on it instead."
+                ),
+            )
         spec, path = _volume_spec_and_path(cfg, volume_id)
         arr, mode = app.state.volumes.get(volume_id)
         data, shape = _slice_array(arr, axis, index)
@@ -762,23 +792,36 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
 
 
 def _volume_payload(volume_id: str, spec: dict[str, Any], data_root: Path) -> dict[str, Any]:
-    path = data_root / str(spec.get("path", ""))
+    rel = str(spec.get("path", ""))
+    is_composite = _is_rgt_render(spec)
+    path = data_root / rel
+    has_file = bool(rel) and path.exists()
     grid_reference = _volume_grid_reference(spec, path, data_root)
     payload: dict[str, Any] = {
         "id": volume_id,
         "label": spec.get("label", volume_id),
-        "path": str(path),
-        "exists": path.exists(),
-        "size_bytes": path.stat().st_size if path.exists() else None,
+        "path": str(path) if rel else None,
+        # A composite has no file of its own but is "available" — it renders from
+        # its source volumes. The desktop should resolve its grid/shape from
+        # ``lithology_volume`` (carried below) and request it like any volume.
+        "exists": True if is_composite else has_file,
+        "size_bytes": path.stat().st_size if has_file else None,
         "cmap": spec.get("cmap"),
         "clim": spec.get("clim"),
         "mask_volume": spec.get("mask_volume"),
         "grid_reference": grid_reference,
     }
+    if is_composite:
+        payload["render"] = "rgt_overlay"
+        payload["source_volumes"] = {
+            "lithology": spec.get("lithology_volume", "model_lithology"),
+            "porosity": spec.get("porosity_volume", "model_porosity"),
+            "rgt": spec.get("rgt_volume", "rgt_field"),
+        }
     spacing, spacing_source = resolve_voxel_spacing(spec)
     payload["voxel_spacing"] = list(spacing)
     payload["voxel_spacing_source"] = spacing_source
-    if path.exists() and path.suffix == ".npy":
+    if has_file and path.suffix == ".npy":
         arr = np.load(path, mmap_mode="r")
         payload.update({"shape": list(arr.shape), "dtype": str(arr.dtype)})
     return payload
@@ -889,6 +932,14 @@ def _start_background_warmup(app: FastAPI, cfg: ServerConfig) -> None:
             name="sam3-warmup",
             daemon=True,
         ).start()
+    # Precompute rgt_overlay spans so the first /volumes (desktop discovery) is
+    # instant instead of computing the span inline.
+    threading.Thread(
+        target=_safe_warmup_rgt_spans,
+        args=(app, cfg),
+        name="rgt-span-warmup",
+        daemon=True,
+    ).start()
 
 
 def _safe_warmup_pool(app: FastAPI) -> None:
@@ -910,6 +961,17 @@ def _safe_preload_volumes(app: FastAPI, only: list[str] | None) -> None:
         logger.info("startup: volume preload complete: %s", app.state.volumes.status())
     except Exception:  # noqa: BLE001 - background thread must not crash the server
         logger.exception("startup: volume preload thread crashed")
+
+
+def _safe_warmup_rgt_spans(app: FastAPI, cfg: ServerConfig) -> None:
+    try:
+        for spec in cfg.volumes.values():
+            if not _is_rgt_render(spec) or spec.get("rgt_span"):
+                continue
+            params = RgtRenderParams.from_mapping(spec.get("params"))
+            _rgt_render_span(app, spec, params)  # computes + caches
+    except Exception:  # noqa: BLE001 - background thread must not crash the server
+        logger.exception("startup: rgt span warmup thread crashed")
 
 
 def _safe_warmup_model(app: FastAPI) -> None:
@@ -1275,13 +1337,10 @@ def _run_sam3_job(app: FastAPI, job_id: str) -> None:
         volume_axis = _volume_axis(axis)
         target_axis = _target_axis(axis)
 
-        spec, _path = _volume_spec_and_path(cfg, volume_id)
-        arr, _mode = app.state.volumes.get(volume_id)
-        data, shape = _slice_array(arr, volume_axis, index)
-        # Keep the same orientation as the desktop SAM3 path: image rows are samples/depth.
-        slice2d = np.asarray(data, dtype=np.float32).T
-        clim = _parse_clim(spec.get("clim"))
-        rgb = slice_to_rgb_image(slice2d, clim=clim)
+        # Single render source: grayscale stretch for a plain volume, or the
+        # shared reservoir/RGT composite for an rgt_overlay volume (identical to
+        # what the desktop displays). Rows are samples/depth either way.
+        rgb, shape = _render_section_rgb(app, cfg, volume_id, volume_axis, index)
 
         prompts = payload.get("prompts") or {}
         if not isinstance(prompts, dict):
@@ -1416,8 +1475,10 @@ def _run_template_match_job(app: FastAPI, job_id: str) -> None:
             raise ValueError(f"Unsupported axis: {axis}")
         volume_axis = _volume_axis(axis)
 
-        spec, _path = _volume_spec_and_path(cfg, volume_id)
-        arr, _mode = app.state.volumes.get(volume_id)
+        # Morphology search runs on the body silhouette, so use the section's
+        # primary grid (lithology for an rgt_overlay composite, else the volume
+        # itself) — colouring is irrelevant to the shape metric.
+        arr, _mode = app.state.volumes.get(_render_primary_id(cfg, volume_id))
         data, shape = _slice_array(arr, volume_axis, index)
         # Same orientation as the SAM3 segment/track path: rows are samples/depth.
         slice2d = np.asarray(data, dtype=np.float32).T
@@ -1657,12 +1718,13 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         confidence = float(payload.get("confidence", payload.get("confidence_threshold", 0.4)))
         keep_top_k = int(payload.get("keep_top_k", 3))
 
-        spec, _path = _volume_spec_and_path(cfg, volume_id)
-        clim = _parse_clim(spec.get("clim"))
-        arr, _mode = app.state.volumes.get(volume_id)
+        # The section grid (axis length, shape) comes from the primary volume
+        # (lithology for an rgt_overlay composite). Frame RGB is rendered through
+        # the single source below so every tracked frame matches the desktop.
+        arr, _mode = app.state.volumes.get(_render_primary_id(cfg, volume_id))
 
         # Window resolved against the real axis length.
-        seed_data, shape = _slice_array(arr, volume_axis, seed)
+        _seed_data, shape = _slice_array(arr, volume_axis, seed)
         axis_len = int(shape[axis_index])
         seed = max(0, min(seed, axis_len - 1))
         if auto_range:
@@ -1676,7 +1738,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
         idx_hi = min(axis_len - 1, seed + fwd)
 
         engine = app.state.sam3
-        seed_rgb = slice_to_rgb_image(np.asarray(seed_data, dtype=np.float32).T, clim=clim)
+        seed_rgb, _ = _render_section_rgb(app, cfg, volume_id, volume_axis, seed)
         seed_h, seed_w = int(seed_rgb.shape[0]), int(seed_rgb.shape[1])
 
         # Seed boxes: explicit prompt boxes, or derive them by text segmentation
@@ -1730,8 +1792,7 @@ def _run_track_job(app: FastAPI, job_id: str) -> None:
             chunk_dir = Path(tempfile.mkdtemp(prefix="chunk_", dir=tempdir))
             try:
                 for offset, idx in enumerate(chunk_indices):
-                    data, _shape = _slice_array(arr, volume_axis, idx)
-                    rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim)
+                    rgb, _ = _render_section_rgb(app, cfg, volume_id, volume_axis, idx)
                     Image.fromarray(rgb).save(chunk_dir / f"{offset:05d}.jpg", quality=92)
                 if pool is not None:
                     signal_dir = chunk_dir / "_signal"
@@ -2024,8 +2085,6 @@ def _run_batch_parallel(
 
     target_ids: list[str] = []
     errors: list[dict[str, Any]] = []
-    arr_cache: dict[str, np.ndarray] = {}
-    clim_cache: dict[str, Any] = {}
     total = max(1, len(frames))
     done = 0
 
@@ -2036,12 +2095,9 @@ def _run_batch_parallel(
         try:
             volume_axis = _volume_axis(axis)
             target_axis = _target_axis(axis)
-            if volume_id not in arr_cache:
-                spec, _ = _volume_spec_and_path(cfg, volume_id)
-                arr_cache[volume_id], _ = app.state.volumes.get(volume_id)
-                clim_cache[volume_id] = _parse_clim(spec.get("clim"))
-            data, _shape = _slice_array(arr_cache[volume_id], volume_axis, index)
-            rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim_cache[volume_id])
+            # Single render source (grayscale or rgt_overlay composite), same as
+            # the segment/track paths.
+            rgb, _shape = _render_section_rgb(app, cfg, volume_id, volume_axis, index)
         except Exception as exc:  # noqa: BLE001 - record and skip a bad frame
             errors.append({"volume_id": volume_id, "axis": axis, "index": index, "error": f"{type(exc).__name__}: {exc}"})
             return None
@@ -2304,6 +2360,146 @@ def _parse_clim(value: object) -> tuple[float, float] | None:
             return None
         return (float(first), float(second))
     return None
+
+
+def _is_rgt_render(spec: object) -> bool:
+    return isinstance(spec, dict) and str(spec.get("render", "")) == "rgt_overlay"
+
+
+def _render_primary_id(cfg: ServerConfig, volume_id: str) -> str:
+    """Volume whose 3D grid/shape defines a section for ``volume_id``.
+
+    For an rgt_overlay composite that is its lithology source (the section is in
+    model coordinates); for a plain volume it is the volume itself.
+    """
+    spec = cfg.volumes.get(volume_id) or {}
+    if _is_rgt_render(spec):
+        return str(spec.get("lithology_volume", "model_lithology"))
+    return volume_id
+
+
+def _rgt_render_span(
+    app: FastAPI,
+    spec: dict[str, Any],
+    params: RgtRenderParams,
+) -> tuple[float, float]:
+    """Fixed RGT stretch span for the composite (config-pinned or cached).
+
+    A fixed span keeps each horizon one colour across every tracked frame, which
+    per-slice rescaling would not (and that drift hurts SAM3 tracking).
+    """
+    configured = spec.get("rgt_span")
+    if (
+        isinstance(configured, (list, tuple))
+        and len(configured) >= 2
+        and configured[0] is not None
+        and configured[1] is not None
+    ):
+        return (float(configured[0]), float(configured[1]))
+    rgt_id = str(spec.get("rgt_volume", "rgt_field"))
+    cache = app.state.rgt_span_cache
+    if rgt_id in cache:
+        return cache[rgt_id]
+    arr, _mode = app.state.volumes.get(rgt_id)
+    # Sample a small set of FULL inlines (each contiguous in the .npy) rather than
+    # a strided ``arr[::4, ::4, ::4]`` — the latter scatters reads across the whole
+    # file (~GB) and stalls the first /volumes call. ~24 inlines is plenty for a
+    # stable 2/98 percentile and reads only tens of MB.
+    n0 = int(arr.shape[0])
+    n_take = min(n0, int(spec.get("rgt_span_sample_inlines", 24)))
+    idxs = np.unique(np.linspace(0, n0 - 1, n_take).astype(int))
+    sub = np.stack([np.asarray(arr[i], dtype=np.float32) for i in idxs])
+    span = compute_rgt_span(sub, percentile=params.rgt_percentile)
+    cache[rgt_id] = span
+    logger.info("rgt span for %s computed from %d sampled inlines: %s", rgt_id, len(idxs), span)
+    return span
+
+
+def _augment_composite_payload(
+    app: FastAPI,
+    cfg: ServerConfig,
+    spec: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    """Make an rgt_overlay composite self-describing in the /volumes catalogue.
+
+    Adds the section grid (shape/dtype from its lithology source — without it
+    the desktop drops the volume), the render params, and the resolved fixed RGT
+    span, so the desktop renders the exact image SAM3 sees.
+    """
+    lith_id = str(spec.get("lithology_volume", "model_lithology"))
+    lith_spec = cfg.volumes.get(lith_id) or {}
+    lith_path = cfg.data_root / str(lith_spec.get("path", ""))
+    if lith_path.suffix == ".npy" and lith_path.exists():
+        arr = np.load(lith_path, mmap_mode="r")
+        payload["shape"] = [int(v) for v in arr.shape]
+        payload["dtype"] = str(arr.dtype)
+    params = RgtRenderParams.from_mapping(spec.get("params"))
+    payload["render_params"] = {
+        "alpha": params.alpha,
+        "sigma_lateral": params.sigma_lateral,
+        "sigma_depth": params.sigma_depth,
+        "rgt_percentile": list(params.rgt_percentile),
+        "sand_rgb": list(params.sand_rgb),
+        "mud_rgb": list(params.mud_rgb),
+        "nodata_rgb": list(params.nodata_rgb),
+        "smooth": params.smooth,
+    }
+    try:
+        payload["rgt_span"] = list(_rgt_render_span(app, spec, params))
+    except Exception:  # noqa: BLE001 - catalogue must not fail if rgt is absent
+        configured = spec.get("rgt_span")
+        payload["rgt_span"] = list(configured) if configured else None
+
+
+def _render_section_rgb(
+    app: FastAPI,
+    cfg: ServerConfig,
+    volume_id: str,
+    volume_axis: str,
+    index: int,
+) -> tuple[np.ndarray, tuple[int, int, int]]:
+    """Render one section to (H, W, 3) uint8 RGB — the SINGLE image SAM3 sees.
+
+    Returns ``(rgb, primary_shape)`` where ``primary_shape`` is the 3D shape of
+    the volume that defines the section grid. For a plain volume this is the
+    grayscale stretch (unchanged legacy behaviour); for an rgt_overlay composite
+    it is the shared reservoir/RGT render — identical to the desktop/QC image.
+    """
+    spec = cfg.volumes.get(volume_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail=f"Unknown volume: {volume_id}")
+
+    if not _is_rgt_render(spec):
+        arr, _mode = app.state.volumes.get(volume_id)
+        data, shape = _slice_array(arr, volume_axis, index)
+        clim = _parse_clim(spec.get("clim"))
+        rgb = slice_to_rgb_image(np.asarray(data, dtype=np.float32).T, clim=clim)
+        return rgb, shape
+
+    lith_id = str(spec.get("lithology_volume", "model_lithology"))
+    poro_id = str(spec.get("porosity_volume", "model_porosity"))
+    lith_arr, _ = app.state.volumes.get(lith_id)
+    lith, shape = _slice_array(lith_arr, volume_axis, index)
+    poro_arr, _ = app.state.volumes.get(poro_id)
+    poro, _ = _slice_array(poro_arr, volume_axis, index)
+    params = RgtRenderParams.from_mapping(spec.get("params"))
+
+    if volume_axis in ("inline", "xline"):
+        rgt_id = str(spec.get("rgt_volume", "rgt_field"))
+        rgt_arr, _ = app.state.volumes.get(rgt_id)
+        rgt_axis = _RGT_INLINE if volume_axis == "inline" else _RGT_XLINE
+        rgt = extract_rgt_slice(rgt_arr, rgt_axis, index)
+        span = _rgt_render_span(app, spec, params)
+        rgb = render_rgt_section(lith, poro, rgt, params=params, rgt_span=span)
+        return rgb, shape
+
+    # z/timeslice has no RGT-stratigraphy axis to map; render the 3-region base
+    # (sand/mud/no-data) with a flat RGT field so the call never fails.
+    rgb = render_rgt_section(
+        lith, poro, np.zeros((1, 1), np.float32), params=params, rgt_span=(0.0, 1.0)
+    )
+    return rgb, shape
 
 
 def _list_of_float_lists(value: object) -> list[list[float]]:

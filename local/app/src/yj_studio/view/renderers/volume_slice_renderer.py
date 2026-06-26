@@ -10,6 +10,7 @@ from yj_studio.data.volume_store import SliceAxis, VolumeStore
 from yj_studio.scene.layers import VolumeLayer
 from yj_studio.view.display_coordinates import display_z
 from yj_studio.view.physical_axes import volume_axes_ranges
+from yj_studio.view.rgt_compose import compose_rgt_rgb, is_rgt_composite
 
 try:
     from matplotlib import colormaps
@@ -65,8 +66,19 @@ class VolumeSliceRenderer:
                 self.ACTOR_NAMES[axis], reset_camera=False, render=False
             )
             return
-        raw_slice = self._volume_store.get_slice(layer.volume_id, axis, index)
-        mask_slice = self._display_mask_slice(layer, axis, index)
+        composite_rgb = None
+        if is_rgt_composite(layer):
+            # Composite render: same shared renderer (and pixels) as SAM3. Use a
+            # source slice for geometry; the RGB itself comes from the composite.
+            lith_id = (layer.metadata.get("source_volumes") or {}).get(
+                "lithology", "model_lithology"
+            )
+            raw_slice = self._volume_store.get_slice(lith_id, axis, index)
+            composite_rgb = compose_rgt_rgb(self._volume_store, layer, axis, index)
+            mask_slice = None
+        else:
+            raw_slice = self._volume_store.get_slice(layer.volume_id, axis, index)
+            mask_slice = self._display_mask_slice(layer, axis, index)
         slice_image = build_slice_image(
             raw_slice,
             layer.shape,
@@ -76,6 +88,7 @@ class VolumeSliceRenderer:
             _display_cmap(layer),
             roi=roi,
             display_mask=mask_slice,
+            composite_rgb=composite_rgb,
         )
         mesh = _quad(slice_image.points)
         texture = pv.numpy_to_texture(slice_image.image)
@@ -155,11 +168,17 @@ def build_slice_image(
     cmap: str,
     roi: tuple[int, int, int, int, int, int] | None = None,
     display_mask: np.ndarray | None = None,
+    composite_rgb: np.ndarray | None = None,
 ) -> SliceImage:
     """Return a colorized image and its 3D quad points for one slice.
 
     ``roi`` is an optional clipping box ``(i0, i1, j0, j1, k0, k1)`` inclusive on
     both ends; when given, the slice is cropped and the quad shrunk accordingly.
+
+    ``composite_rgb`` is a pre-rendered (n_sample, n_long[, 3/4]) image in the
+    same orientation as ``raw_slice.T``; when given it replaces the colormap
+    output (used for the rgt_overlay composite, so the display equals the SAM3
+    image) and is cropped/flipped identically to ``values``.
     """
 
     nx, ny, nz = volume_shape
@@ -168,12 +187,16 @@ def build_slice_image(
     else:
         i0, i1, j0, j1, k0, k1 = roi
 
+    rgb = np.asarray(composite_rgb) if composite_rgb is not None else None
+
     if axis == "inline":
         values = np.asarray(raw_slice, dtype=np.float32).T  # shape (nz, ny)
         mask = _prepare_display_mask(display_mask)
         values = values[k0 : k1 + 1, j0 : j1 + 1]
         if mask is not None:
             mask = mask[k0 : k1 + 1, j0 : j1 + 1]
+        if rgb is not None:
+            rgb = rgb[k0 : k1 + 1, j0 : j1 + 1]
         # Spatial quad places shallow (k0) at the top after display_z flip, but
         # VTK's texture v-axis maps v=0 to the LAST image row; without flipping
         # the texture along sample axis the seismic image renders upside-down
@@ -181,6 +204,8 @@ def build_slice_image(
         values = values[::-1, :]
         if mask is not None:
             mask = mask[::-1, :]
+        if rgb is not None:
+            rgb = rgb[::-1, :]
         points = np.asarray(
             [
                 [index, j0, display_z(float(k0), nz)],
@@ -196,9 +221,13 @@ def build_slice_image(
         values = values[k0 : k1 + 1, i0 : i1 + 1]
         if mask is not None:
             mask = mask[k0 : k1 + 1, i0 : i1 + 1]
+        if rgb is not None:
+            rgb = rgb[k0 : k1 + 1, i0 : i1 + 1]
         values = values[::-1, :]  # match flipped display Z, see inline branch
         if mask is not None:
             mask = mask[::-1, :]
+        if rgb is not None:
+            rgb = rgb[::-1, :]
         points = np.asarray(
             [
                 [i0, index, display_z(float(k0), nz)],
@@ -214,6 +243,8 @@ def build_slice_image(
         values = values[j0 : j1 + 1, i0 : i1 + 1]
         if mask is not None:
             mask = mask[j0 : j1 + 1, i0 : i1 + 1]
+        if rgb is not None:
+            rgb = rgb[j0 : j1 + 1, i0 : i1 + 1]
         # VTK maps texture v=0 to the last image row.  On a z slice the image
         # rows are axis1/xline, so leaving them unchanged mirrors that world
         # direction on the horizontal plane.  Store axis1 in reverse image-row
@@ -221,12 +252,18 @@ def build_slice_image(
         values = values[::-1, :]
         if mask is not None:
             mask = mask[::-1, :]
+        if rgb is not None:
+            rgb = rgb[::-1, :]
         z_pos = display_z(float(index), nz)
         points = np.asarray(
             [[i0, j0, z_pos], [i1, j0, z_pos], [i1, j1, z_pos], [i0, j1, z_pos]],
             dtype=np.float32,
         )
-    return SliceImage(image=colorize_slice(values, clim, cmap, display_mask=mask), points=points)
+    if rgb is not None:
+        image = np.ascontiguousarray(rgb.astype(np.uint8, copy=False))
+    else:
+        image = colorize_slice(values, clim, cmap, display_mask=mask)
+    return SliceImage(image=image, points=points)
 
 
 def _prepare_display_mask(display_mask: np.ndarray | None) -> np.ndarray | None:

@@ -82,6 +82,14 @@ class HybridVolumeStore:
         specs, notes = self._remote.discover_specs()
         merged: dict[str, VolumeSpec] = {}
         for volume_id, spec in specs.items():
+            # A composite render (e.g. rgt_overlay) has no file of its own; it is
+            # rendered from its source volumes. Keep it remote/virtual and skip the
+            # local-file probe (which would otherwise rglob the data tree in vain).
+            if self._remote.info(volume_id).get("render"):
+                self._owner[volume_id] = "remote"
+                merged[volume_id] = spec
+                logger.info("Hybrid volume %s is a composite render (no raw slices)", volume_id)
+                continue
             local_path = resolve_local_volume_path(str(spec.path), self._local_data_root)
             if local_path is not None:
                 local_spec = VolumeSpec(

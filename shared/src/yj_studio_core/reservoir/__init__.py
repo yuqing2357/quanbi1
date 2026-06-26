@@ -7,6 +7,13 @@ from .native_render import (
     ReservoirGeometry,
     SectionResult,
 )
+from .rgt_overlay import (
+    DEFAULT_PARAMS,
+    RgtRenderParams,
+    compute_rgt_span,
+    extract_rgt_slice,
+    render_rgt_section,
+)
 
 __all__ = [
     "INLINE",
@@ -14,4 +21,9 @@ __all__ = [
     "NativeColumnRenderer",
     "ReservoirGeometry",
     "SectionResult",
+    "DEFAULT_PARAMS",
+    "RgtRenderParams",
+    "compute_rgt_span",
+    "extract_rgt_slice",
+    "render_rgt_section",
 ]

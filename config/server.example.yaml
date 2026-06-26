@@ -150,3 +150,51 @@ volumes:
       axis0: 6.25
       axis1: 6.25
       sample: 2.0
+
+  # Raw RGT (relative geologic time) field on the seismic-crop grid. It is the
+  # 2x-lateral / 5x-sample node-aligned coarsening of the reservoir model, so it
+  # co-registers by halving the inline/xline index (handled in the renderer). It
+  # is not viewed directly — it only feeds the model_rgt composite below.
+  # NOTE: this points at the corr~0.86 "rgt_out" set you uploaded. The set we
+  # tuned the render on is the better-aligned "rgt_out_native" (corr~0.94); if you
+  # upload that, switch the path to seismic/rgt_out_native/rgt_vol.npy.
+  rgt_field:
+    label: RGT 地质年代体
+    path: seismic/rgt_out/rgt_vol.npy
+
+  # Composite render: the reservoir section coloured by RGT stratigraphy. This is
+  # the SINGLE image that SAM3 sees (seed frame, tracked JPEG sequence, text
+  # segmentation) AND that the desktop displays — both call the same
+  # shared/.../reservoir/rgt_overlay.render_rgt_section, so "what you see" ==
+  # "what SAM3 eats". Has no file of its own; it is rendered from the three
+  # source volumes on demand.
+  model_rgt:
+    label: RGT 地层色带
+    render: rgt_overlay
+    lithology_volume: model_lithology   # body silhouette + the section grid/shape
+    porosity_volume: model_porosity     # NaN distinguishes mud from no-data
+    rgt_volume: rgt_field               # stratigraphic colour
+    metadata_path: reservoir/npy_625x625x2_v3/metadata.json
+    mask_volume: model_porosity
+    voxel_spacing_m:
+      axis0: 6.25
+      axis1: 6.25
+      sample: 2.0
+    # Fixed RGT stretch span [lo, hi]. Pin this so a horizon keeps ONE colour
+    # across every tracked frame (per-slice rescaling would make the same layer
+    # drift colour frame-to-frame and hurt SAM3 tracking). null -> the server
+    # computes a stable span once from a strided subsample of rgt_field at first
+    # use and caches it. To pin the exact tonal range used in the QC review, run
+    #   python server/scripts/compute_rgt_span.py
+    # and paste its [lo, hi] here.
+    rgt_span: null
+    # Render knobs — MUST match the desktop/QC values (the finalised spec).
+    params:
+      alpha: 0.7
+      sigma_lateral: 4.5
+      sigma_depth: 0.9
+      rgt_percentile: [2.0, 98.0]
+      sand_rgb: [255, 221, 0]
+      mud_rgb: [0, 0, 0]
+      nodata_rgb: [255, 255, 255]
+      smooth: true

@@ -60,6 +60,11 @@ def main() -> int:
         action="store_true",
         help="verify geometry and print the crop, but do not write the output",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing output after validating the source geometry",
+    )
     args = parser.parse_args()
 
     meta_path = args.metadata or (
@@ -85,6 +90,10 @@ def main() -> int:
                 f"geometry mismatch on {ax}: seismic span {span} refined to "
                 f"{refined} but model shape is {res_shape[i]}"
             )
+        print(
+            f"geometry {ax}: span={span} scale={scale[ax]} refined={refined} "
+            f"model={res_shape[i]} match={refined == res_shape[i]}"
+        )
         if hi + 1 > seis_shape_meta[i]:
             raise SystemExit(
                 f"{ax} upper bound {hi} exceeds seismic_shape {seis_shape_meta[i]}"
@@ -92,10 +101,15 @@ def main() -> int:
         slices.append(slice(lo, hi + 1))
 
     seismic = np.load(seismic_path, mmap_mode="r")
-    if tuple(seismic.shape) != seis_shape_meta:
+    if any(actual < expected for actual, expected in zip(seismic.shape, seis_shape_meta)):
         raise SystemExit(
-            f"seismic shape {tuple(seismic.shape)} != metadata seismic_shape "
+            f"seismic shape {tuple(seismic.shape)} does not contain metadata grid "
             f"{seis_shape_meta}; wrong file or stale metadata"
+        )
+    if tuple(seismic.shape) != seis_shape_meta:
+        print(
+            f"note: source shape {tuple(seismic.shape)} is a superset of metadata "
+            f"grid {seis_shape_meta}; only the recorded inclusive bounds are used"
         )
 
     out_shape = tuple(s.stop - s.start for s in slices)
@@ -109,6 +123,19 @@ def main() -> int:
     if args.dry_run:
         print("dry-run: geometry verified, no output written.")
         return 0
+
+    if out_path.exists() and not args.overwrite:
+        existing = np.load(out_path, mmap_mode="r")
+        if tuple(existing.shape) == out_shape and existing.dtype == seismic.dtype:
+            print(
+                f"existing output is already valid: {out_path} "
+                f"{tuple(existing.shape)} {existing.dtype}"
+            )
+            return 0
+        raise SystemExit(
+            f"output already exists with shape={existing.shape} dtype={existing.dtype}; "
+            "pass --overwrite to replace it"
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out = np.lib.format.open_memmap(

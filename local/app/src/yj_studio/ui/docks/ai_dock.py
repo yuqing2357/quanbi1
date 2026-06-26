@@ -430,10 +430,14 @@ class AIDock(QDockWidget):
         self._template_volume_combo.clear()
         for layer in self._reservoir_volume_layers():
             self._template_volume_combo.addItem(layer.name or layer.volume_id, layer.volume_id)
-        if previous:
+        # Keep the prior choice; otherwise default to the RGT composite so the
+        # template is drawn on the same image SAM3 runs on.
+        target = previous or "model_rgt"
+        idx = self._template_volume_combo.findData(target)
+        if idx < 0 and previous:
             idx = self._template_volume_combo.findData(previous)
-            if idx >= 0:
-                self._template_volume_combo.setCurrentIndex(idx)
+        if idx >= 0:
+            self._template_volume_combo.setCurrentIndex(idx)
         self._template_volume_combo.blockSignals(False)
         self._update_template_search_enabled()
 

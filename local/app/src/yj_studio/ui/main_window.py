@@ -726,9 +726,20 @@ class MainWindow(QMainWindow):
         if not self.volume_specs:
             self.statusBar().showMessage(self.tr("未找到默认体数据"))
             return
-        for volume_id in ("seismic", "model_lithology", "model_porosity"):
+        created: dict[str, VolumeLayer] = {}
+        for volume_id in ("seismic", "model_lithology", "model_porosity", "model_rgt"):
             if volume_id in self.volume_specs:
-                self._ensure_volume_layer(volume_id, visible=False)
+                layer = self._ensure_volume_layer(volume_id, visible=False)
+                if layer is not None:
+                    created[volume_id] = layer
+        # Auto-show ONLY the RGT stratigraphy composite ("RGT 地层色带") when the
+        # server exposes it — that is the intended default, and the active layer's
+        # volume_id is also what every SAM3 job runs on. When it is not available,
+        # leave all layers hidden (instant open; the user picks one), preserving
+        # the previous fast startup instead of eagerly rendering lithology.
+        rgt_layer = created.get("model_rgt")
+        if rgt_layer is not None:
+            self._activate_volume_layer(rgt_layer.id, make_visible=True)
 
     def load_default_volume(self) -> None:
         """Compatibility wrapper: create default volume layers without displaying them."""
@@ -775,6 +786,17 @@ class MainWindow(QMainWindow):
                 volume_metadata["grid_reference"] = dict(remote_info["grid_reference"])
             if remote_info.get("voxel_spacing") is not None:
                 volume_metadata["voxel_spacing"] = list(remote_info["voxel_spacing"])
+            # rgt_overlay composite: carry the render spec so the desktop renders
+            # the exact image SAM3 sees (same shared renderer, params, RGT span).
+            if remote_info.get("render"):
+                volume_metadata["render"] = str(remote_info["render"])
+                volume_metadata["source_volumes"] = dict(remote_info.get("source_volumes", {}))
+                if remote_info.get("render_params") is not None:
+                    volume_metadata["render_params"] = dict(remote_info["render_params"])
+                if remote_info.get("rgt_span") is not None:
+                    volume_metadata["rgt_span"] = list(remote_info["rgt_span"])
+                if remote_info.get("cmap"):
+                    volume_metadata["cmap"] = str(remote_info["cmap"])
         layer = VolumeLayer(
             name=spec.label,
             volume_id=volume_id,
@@ -811,7 +833,11 @@ class MainWindow(QMainWindow):
             layer.shape = shape
         if not layer.slice_indices:
             layer.slice_indices = _default_slice_indices(shape)
-        if layer.clim is None:
+        # A composite render (rgt_overlay) has no raw slice to sample and ignores
+        # clim entirely — its colours come from the shared renderer. Estimating a
+        # clim would fetch a raw slice and 400. Skip it.
+        is_composite = str(layer.metadata.get("render", "")) == "rgt_overlay"
+        if layer.clim is None and not is_composite:
             layer.clim = tuple(
                 estimate_volume_clim(layer.volume_id, volume, *layer.slice_indices.values())
             )

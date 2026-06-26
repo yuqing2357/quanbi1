@@ -111,3 +111,23 @@ def test_build_inline_slice_image_uses_display_z() -> None:
         result.points,
         np.asarray([[1, 0, 3], [1, 2, 3], [1, 2, 0], [1, 0, 0]], dtype=np.float32),
     )
+
+
+def test_build_slice_image_composite_rgb_passthrough() -> None:
+    """A composite RGB replaces the colormap output and is cropped/flipped like
+    the values (so the 3D display equals the SAM3 composite image)."""
+    raw_slice = np.zeros((3, 4), dtype=np.float32)  # (n_long=3, n_sample=4)
+    # composite_rgb is in (n_sample, n_long, 3) == raw_slice.T orientation.
+    composite = np.arange(4 * 3 * 3, dtype=np.uint8).reshape(4, 3, 3)
+    result = build_slice_image(
+        raw_slice,
+        (2, 3, 4),
+        "inline",
+        1,
+        None,
+        "lithology_binary",
+        composite_rgb=composite,
+    )
+    assert result.image.dtype == np.uint8
+    # inline branch flips rows ([::-1]); full extent so no crop.
+    np.testing.assert_array_equal(result.image, composite[::-1, :])

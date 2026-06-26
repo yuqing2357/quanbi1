@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from yj_studio.ai.adapters import stretch_to_uint8
+from yj_studio.view.rgt_compose import compose_rgt_rgb_from_meta, is_rgt_composite_meta
 from yj_studio_core.targets import GeoTarget, TargetFrame
 
 
@@ -627,6 +628,20 @@ def _source_frame_image(
 ) -> np.ndarray:
     if volume_store is None or not volume_id:
         return np.zeros((*shape, 3), dtype=np.uint8)
+    # rgt_overlay composite: render the same image SAM3 saw, via the shared
+    # renderer + catalogue params/span (so review matches training input).
+    info_fn = getattr(volume_store, "info", None)
+    if callable(info_fn):
+        try:
+            info = info_fn(volume_id) or {}
+        except Exception:  # noqa: BLE001 - fall back to the raw path
+            info = {}
+        if is_rgt_composite_meta(info):
+            try:
+                rgb = compose_rgt_rgb_from_meta(volume_store, info, axis, int(index))
+            except Exception:  # noqa: BLE001 - mask-only playback is still useful
+                return np.zeros((*shape, 3), dtype=np.uint8)
+            return rgb if rgb.shape[:2] == shape else np.zeros((*shape, 3), dtype=np.uint8)
     try:
         raw = np.asarray(volume_store.get_slice(volume_id, axis, int(index)), dtype=np.float32).T
     except Exception:  # noqa: BLE001 - mask-only playback is still useful
